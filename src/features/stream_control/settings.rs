@@ -900,6 +900,7 @@ pub(super) fn frame_rate_choice(fps: u32) -> FrameRateChoice {
         30 => FrameRateChoice::Fps30,
         60 => FrameRateChoice::Fps60,
         90 => FrameRateChoice::Fps90,
-        _ => FrameRateChoice::Fps144,
+        144 => FrameRateChoice::Fps144,
+        _ => FrameRateChoice::Fps165,
     }
 }

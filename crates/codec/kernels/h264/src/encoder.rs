@@ -69,7 +69,7 @@ impl Config {
             || self.height > 2160
             || self.width % 2 != 0
             || self.height % 2 != 0
-            || !(1..=144).contains(&self.fps)
+            || !(1..=165).contains(&self.fps)
             || !(1..=500_000_000).contains(&self.bitrate)
             || self.bitrate < self.fps.min(60)
         {

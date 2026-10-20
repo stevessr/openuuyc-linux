@@ -198,7 +198,7 @@ impl State {
                         identity: None,
                         width: virtual_size.0,
                         height: virtual_size.1,
-                        hz: 144,
+                        hz: 165,
                         dpi: 0,
                         kind: 3,
                         resolution_type: choice.max(1),

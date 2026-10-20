@@ -68,42 +68,152 @@ enum Route {
 
 /// 这一串触摸该走哪条路。
 ///
-/// 只有「合成器必然把这块触摸屏认到唯一那块屏上」时才敢用设备。合成器怎么给触摸屏
+/// 只有「合成器必然把这块触摸屏认到目标屏上」时才敢用设备。合成器怎么给触摸屏
 /// 和输出配对各家都不一样：Hyprland 找不到绑定就用当前聚焦的显示器（触点落在哪块屏
 /// 取决于被控端此刻的焦点），mutter 按 EDID 与物理尺寸匹配、都匹配不上就归给内置屏，
 /// KWin 又是另一套。猜错就是「主控看着这块屏、点下去落在另一块屏上」，比单指模拟更
 /// 差——模拟走绝对指针，落点总是对的。所以三件事都得成立：
 ///
-/// - 合成器布局拿得到（Wayland 会话），而且里面恰好一块输出；
-/// - 被控端也恰好一块屏（`geometry.screens` 是被控端全部的屏幕，不只是主控正在
-///   看的那块）；
-/// - 合成器里这块输出没被转过：转过的屏上触摸屏坐标转不转，取决于合成器和用户的
-///   配置。niri 和 KWin 总是按输出旋转；mutter 只在把触摸屏映射到某块屏时转，不
-///   映射时铺满整个舞台、不转；wlroots（sway）只在配了 `map_to_output` 时转；
-///   Hyprland 只在配了 `input:touchdevice:transform` 时转。这边看不出是哪一种，
-///   反算错了就落错地方。
-///
-/// 以后某个合成器的映射能确切知道了（按合成器逐个放开、或者读 niri 的
-/// `map-to-output`），再改这里。
-fn route_for(layout: Option<&CompositorLayout>, screens: &[Screen]) -> Result<Route, String> {
+/// niri 将 uinput 触摸屏作为真实 `wl_touch` 事件派发，但默认映射到第一个输出；
+/// 其 `input.touch.map-to-output` 可改这个目标。读取映射后，只在当前远端屏恰好对应
+/// 该输出时才走原生触摸，否则保留绝对指针回退，避免触点落到错误显示器。
+fn route_for(
+    layout: Option<&CompositorLayout>,
+    screens: &[Screen],
+    current: i32,
+    niri_output: Option<&str>,
+) -> Result<Route, String> {
     let Some(layout) = layout else {
         return Err("读不到合成器的输出布局".into());
     };
-    let [output] = layout.outputs.as_slice() else {
-        return Err(format!("合成器有 {} 块屏", layout.outputs.len()));
+    let screen = screens.iter().find(|screen| screen.id == current)
+        .ok_or_else(|| format!("当前触摸屏幕 {current} 已失效"))?;
+    let is_niri = niri_output.is_some();
+    let output = if is_niri {
+        let name = niri_output.map(str::to_owned).or_else(|| layout.outputs.first().and_then(|o| o.name.clone()))
+            .ok_or_else(|| "niri 没有可用输出".to_owned())?;
+        layout.output(&name).ok_or_else(|| format!("niri 触摸映射输出 {name} 不存在"))?
+    } else {
+        let [output] = layout.outputs.as_slice() else {
+            return Err(format!("合成器有 {} 块屏", layout.outputs.len()));
+        };
+        if screens.len() != 1 || screen.id != screens[0].id {
+            return Err(format!("被控端有 {} 块屏", screens.len()));
+        }
+        output
     };
-    let [screen] = screens else {
-        return Err(format!("被控端有 {} 块屏", screens.len()));
+    if !is_niri && output.rotation != Rotation::Normal {
+        return Err(format!("输出旋转为 {:?}", output.rotation));
+    }
+    let logical = screen.logical.ok_or_else(|| "触摸屏与合成器输出未配对".to_owned())?;
+    let rect = Rect {
+        left: output.left,
+        top: output.top,
+        right: output.left.saturating_add(output.width as i32),
+        bottom: output.top.saturating_add(output.height as i32),
     };
-    // 旋转看合成器里这块输出自己的，不看 `screen`：屏幕和输出是按名字配对的，
-    // XWayland 起的名字和 `wl_output` 的对不上时，屏幕那边就只剩默认的不旋转。
-    if output.rotation != Rotation::Normal {
-        return Err(format!("屏幕转过 {:?}", output.rotation));
+    if logical != rect {
+        return Err("niri 触摸设备映射到另一块输出".into());
     }
     Ok(Route::Touchscreen {
         rotation: output.rotation,
         width: f64::from(screen.width).max(1.0),
     })
+}
+
+fn niri_touch_mapping() -> Option<String> {
+    static MAPPING: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    MAPPING.get_or_init(read_niri_touch_mapping).clone()
+}
+
+/// Niri does not expose `input.touch.map-to-output` over IPC. Read the user's
+/// KDL include tree (read-only) so native touch is used only on its mapped output.
+fn read_niri_touch_mapping() -> Option<String> {
+    let socket = std::env::var_os("NIRI_SOCKET")?;
+    let socket_name = std::path::Path::new(&socket).file_name()?.to_string_lossy();
+    let pid = socket_name.strip_suffix(".sock")?.rsplit_once('.')?.1.parse::<u32>().ok()?;
+    let args = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args = args.split(|b| *b == 0).map(|v| String::from_utf8_lossy(v).into_owned()).collect::<Vec<_>>();
+    let root = args.iter().position(|a| a == "--config").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from)
+        .or_else(|| args.iter().find_map(|a| a.strip_prefix("--config=").map(std::path::PathBuf::from)))
+        .or_else(|| Some(std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
+            .join("niri/config.kdl")))?;
+    let mut tokens = Vec::new();
+    expand_niri_config(&root, &mut std::collections::HashSet::new(), &mut tokens, 0);
+    let mut mapping = None;
+    let mut i = 0;
+    while i + 1 < tokens.len() {
+        if tokens[i] == "input" && tokens[i + 1] == "{" {
+            let end = kdl_block_end(&tokens, i + 1)?;
+            let mut child = i + 2;
+            while child + 1 < end {
+                if tokens[child] == "touch" && tokens[child + 1] == "{" {
+                    let touch_end = kdl_block_end(&tokens, child + 1)?;
+                    let mut property = child + 2;
+                    while property + 1 < touch_end {
+                        if tokens[property] == "map-to-output" {
+                            mapping = Some(tokens[property + 1].clone());
+                            break;
+                        }
+                        property += 1;
+                    }
+                    child = touch_end + 1;
+                } else { child += 1; }
+            }
+            i = end + 1;
+        } else { i += 1; }
+    }
+    mapping
+}
+
+fn expand_niri_config(path: &std::path::Path, seen: &mut std::collections::HashSet<std::path::PathBuf>, out: &mut Vec<String>, depth: usize) {
+    if depth > 16 { return; }
+    let Ok(path) = std::fs::canonicalize(path) else { return; };
+    if !seen.insert(path.clone()) { return; }
+    let Ok(source) = std::fs::read_to_string(&path) else { return; };
+    let tokens = kdl_tokens(&source);
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "include" && let Some(include) = tokens.get(i + 1) {
+            expand_niri_config(&path.parent().unwrap_or(std::path::Path::new(".")).join(include), seen, out, depth + 1);
+            i += 2;
+        } else { out.push(tokens[i].clone()); i += 1; }
+    }
+}
+
+fn kdl_block_end(tokens: &[String], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        match token.as_str() {
+            "{" => depth += 1,
+            "}" => { depth = depth.checked_sub(1)?; if depth == 0 { return Some(index); } }
+            _ => (),
+        }
+    }
+    None
+}
+
+fn kdl_tokens(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() || bytes[i] == b';' { i += 1; continue; }
+        if bytes[i..].starts_with(b"//") { while i < bytes.len() && bytes[i] != b'\n' { i += 1; } continue; }
+        if bytes[i..].starts_with(b"/*") { i += 2; while i + 1 < bytes.len() && !bytes[i..].starts_with(b"*/") { i += 1; } i = (i + 2).min(bytes.len()); continue; }
+        if matches!(bytes[i], b'{' | b'}') { out.push((bytes[i] as char).to_string()); i += 1; continue; }
+        if bytes[i] == b'"' {
+            i += 1; let mut value = Vec::new();
+            while i < bytes.len() && bytes[i] != b'"' { if bytes[i] == b'\\' && i + 1 < bytes.len() { i += 1; } value.push(bytes[i]); i += 1; }
+            if i < bytes.len() { i += 1; }
+            out.push(String::from_utf8_lossy(&value).into_owned()); continue;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'{' | b'}' | b';') { i += 1; }
+        if start < i { out.push(String::from_utf8_lossy(&bytes[start..i]).into_owned()); } else { i += 1; }
+    }
+    out
 }
 
 impl Engine {
@@ -374,9 +484,12 @@ impl Engine {
     /// 选这一串触摸走哪条路，判定变化时记一条日志（和 `aim_space` 一样只记一次）。
     fn choose_route(&mut self) -> Route {
         let decision = if self.injector.has_touchscreen() {
+            let niri_mapping = std::env::var_os("NIRI_SOCKET").map(|_| niri_touch_mapping());
             route_for(
                 crate::platform::display::compositor_layout().as_deref(),
                 &self.geometry.screens,
+                self.geometry.current,
+                niri_mapping.as_ref().and_then(|mapping| mapping.as_deref()),
             )
         } else {
             Err("没有虚拟触摸屏".into())
@@ -708,7 +821,7 @@ mod tests {
         };
         let screens = vec![screen(0, (0, 0, 1920, 1080), layout.outputs.first())];
         assert_eq!(
-            route_for(Some(&layout), &screens),
+            route_for(Some(&layout), &screens, 0, None),
             Ok(Route::Touchscreen {
                 rotation: Rotation::Normal,
                 width: 1920.0
@@ -725,16 +838,16 @@ mod tests {
             outputs: vec![output(Some("DP-1"), 0, 0, 1920, 1080)],
         };
         let one = vec![screen(0, (0, 0, 1920, 1080), single.outputs.first())];
-        assert!(route_for(None, &one).is_err(), "没有布局");
-        assert!(route_for(Some(&scaled()), &one).is_err(), "合成器两块屏");
+        assert!(route_for(None, &one, 0, None).is_err(), "没有布局");
+        assert!(route_for(Some(&scaled()), &one, 0, None).is_err(), "合成器两块屏");
 
         let mut two = one.clone();
         two.push(screen(1, (0, 0, 1920, 1080), single.outputs.first()));
-        assert!(route_for(Some(&single), &two).is_err(), "被控端两块屏");
+        assert!(route_for(Some(&single), &two, 0, None).is_err(), "被控端两块屏");
 
         let mut turned = single.clone();
         turned.outputs[0].rotation = Rotation::Rotate90;
-        assert!(route_for(Some(&turned), &one).is_err(), "屏幕转过 90 度");
+        assert!(route_for(Some(&turned), &one, 0, None).is_err(), "屏幕转过 90 度");
     }
 
     /// 旋转只看合成器那块输出：屏幕的名字和 `wl_output` 的没配上时，屏幕这边看不出
@@ -747,8 +860,23 @@ mod tests {
         layout.outputs[0].rotation = Rotation::Rotate90;
         let unpaired = vec![screen(0, (0, 0, 1080, 1920), None)];
         assert!(unpaired[0].logical.is_none());
-        let error = route_for(Some(&layout), &unpaired).unwrap_err();
-        assert!(error.contains("Rotate90"), "{error}");
+        let error = route_for(Some(&layout), &unpaired, 0, None).unwrap_err();
+        assert!(error.contains("未配对"), "{error}");
+    }
+
+    #[test]
+    fn niri_native_touch_uses_configured_output_in_multi_monitor_setup() {
+        let mut layout = scaled();
+        layout.outputs[1].rotation = Rotation::Rotate90;
+        let screens = [
+            screen(1, (0, 0, 1600, 2560), layout.output("DP-3")),
+            screen(2, (1000, 0, 5120, 2160), layout.output("DP-1")),
+        ];
+        assert_eq!(
+            route_for(Some(&layout), &screens, 2, Some("DP-1")),
+            Ok(Route::Touchscreen { rotation: Rotation::Rotate90, width: 5120.0 })
+        );
+        assert!(route_for(Some(&layout), &screens, 1, Some("DP-1")).is_err());
     }
 
     #[test]

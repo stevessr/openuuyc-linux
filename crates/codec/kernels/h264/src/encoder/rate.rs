@@ -13,7 +13,7 @@ fn round(n: i64, d: i64) -> i64 {
     if d > 0 { (n + d / 2) / d } else { n }
 }
 fn frame_budget(cfg: Config) -> i64 {
-    // The public encoder accepts up to 144fps. Capping this divisor at 60
+    // The public encoder accepts up to 165fps. Capping this divisor at 60
     // silently doubles the allowed bitrate when configured for 120fps.
     let fps = cfg.fps as f32;
     ((cfg.bitrate as f32 + 0.5 * fps) / fps) as i64

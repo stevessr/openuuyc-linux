@@ -1,13 +1,14 @@
 use anyhow::{Result, bail};
 
-const FPS_CHOICES: [FrameRateChoice; 5] = [
+const FPS_CHOICES: [FrameRateChoice; 6] = [
     FrameRateChoice::Auto,
+    FrameRateChoice::Fps165,
     FrameRateChoice::Fps144,
     FrameRateChoice::Fps90,
     FrameRateChoice::Fps60,
     FrameRateChoice::Fps30,
 ];
-const FPS_LEVELS_ASCENDING: [u32; 4] = [30, 60, 90, 144];
+const FPS_LEVELS_ASCENDING: [u32; 5] = [30, 60, 90, 144, 165];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LocalDisplayInfo {
@@ -28,6 +29,7 @@ impl LocalDisplayInfo {
 #[serde(rename_all = "snake_case")]
 pub enum FrameRateChoice {
     Auto,
+    Fps165,
     Fps144,
     Fps90,
     Fps60,
@@ -38,6 +40,7 @@ impl FrameRateChoice {
     pub fn value(self, display: LocalDisplayInfo) -> u32 {
         match self {
             Self::Auto => max_frame_rate_level(display.refresh_hz),
+            Self::Fps165 => 165,
             Self::Fps144 => 144,
             Self::Fps90 => 90,
             Self::Fps60 => 60,
@@ -73,6 +76,7 @@ impl std::str::FromStr for FrameRateChoice {
     fn from_str(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
+            "165" | "165fps" => Ok(Self::Fps165),
             "144" | "144fps" => Ok(Self::Fps144),
             "90" | "90fps" => Ok(Self::Fps90),
             "60" | "60fps" => Ok(Self::Fps60),
@@ -253,7 +257,25 @@ fn max_frame_rate_level(refresh_hz: u32) -> u32 {
     FPS_LEVELS_ASCENDING
         .into_iter()
         .find(|level| refresh_hz <= *level)
-        .unwrap_or(144)
+        .unwrap_or(165)
 }
 
 pub use openuuyc_codec::Codec as VideoCodec;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fps_165_is_available_and_parseable_as_a_cli_choice() {
+        let display = LocalDisplayInfo {
+            width: 2560,
+            height: 1440,
+            refresh_hz: 165,
+        };
+        assert_eq!(FrameRateChoice::Fps165.value(display), 165);
+        assert_eq!(FrameRateChoice::Auto.value(display), 165);
+        assert!(FrameRateChoice::available(display).contains(&FrameRateChoice::Fps165));
+        assert_eq!("165fps".parse::<FrameRateChoice>().unwrap(), FrameRateChoice::Fps165);
+    }
+}

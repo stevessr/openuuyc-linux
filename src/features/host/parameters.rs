@@ -75,7 +75,7 @@ fn standard(format: Format, quality: i32, source: (u32, u32), fps: u32) -> Bound
     };
     // Like Moonlight's default-rate curve, high FPS grows sublinearly: adjacent
     // frames share more information. No 30/60/90/120 tier discontinuities.
-    let ratio = f64::from(fps.clamp(1, 144)) / 60.0;
+    let ratio = f64::from(fps.clamp(1, 165)) / 60.0;
     let color = if format.chroma == 3 { 2.0 } else { 1.0 };
     let rate = (base * 1_000_000.0 * color * if fps <= 60 { ratio } else { ratio.sqrt() })
         .round()

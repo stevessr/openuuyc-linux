@@ -82,7 +82,7 @@ impl Drop for Heartbeat {
 /// 认下它」，所以刷新率由我们自己定；和 Windows 那条路（写死 144）保持一致，好让
 /// 主控协商出来的码率在两边含义相同。
 #[cfg(not(windows))]
-const VIRTUAL_HZ: u32 = 144;
+const VIRTUAL_HZ: u32 = 165;
 
 struct State {
     journal: Journal,
@@ -360,7 +360,7 @@ impl Session {
                 identity: None,
                 width: size.0,
                 height: size.1,
-                hz: 144,
+                hz: 165,
                 dpi,
                 kind: 1,
                 resolution_type: 1,
@@ -929,7 +929,7 @@ impl State {
             identity: None,
             width: size.0,
             height: size.1,
-            hz: 144,
+            hz: 165,
             dpi,
             kind: 2,
             resolution_type: if use_saved

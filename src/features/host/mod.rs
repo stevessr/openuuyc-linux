@@ -83,7 +83,7 @@ impl Default for VideoConfig {
         Self {
             fps: 30,
             requested_fps: 30,
-            fps_limit: 144,
+            fps_limit: 165,
             bitrate: 8_000_000,
             quality: 2,
             auto_quality: 2,
@@ -93,7 +93,7 @@ impl Default for VideoConfig {
             color: format::Color::Sdr,
             requested_maximum: None,
             maximum: (3840, 2160),
-            maximum_fps: 144,
+            maximum_fps: 165,
             maximum_quality: 4,
             sending: true,
             capturing: true,

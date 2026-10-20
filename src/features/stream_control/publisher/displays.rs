@@ -349,7 +349,7 @@ pub(crate) async fn receive_session(
                                 .as_ref()
                                 .context("缺少超级屏帧率")?
                                 .fps_count;
-                            anyhow::ensure!((1..=144).contains(&fps), "无效超级屏帧率");
+                            anyhow::ensure!((1..=165).contains(&fps), "无效超级屏帧率");
                         }
                         code = 501;
                         // The official controller omits manual/FPS expansion

@@ -151,7 +151,7 @@ impl Negotiated {
                                     capability.format.codec.media(),
                                 )
                             } else {
-                                144
+                                165
                             },
                         ),
                     });

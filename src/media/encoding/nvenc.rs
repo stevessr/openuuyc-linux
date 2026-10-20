@@ -205,7 +205,7 @@ impl Session {
             "NVENC 尺寸必须为正偶数"
         );
         ensure!(
-            (1..=144).contains(&fps) && bitrate > 0,
+            (1..=165).contains(&fps) && bitrate > 0,
             "NVENC 编码参数无效"
         );
         let api = Api::load()?;
@@ -491,7 +491,7 @@ impl Session {
 
     pub fn configure_rate(&mut self, rate: Rate) -> Result<bool> {
         ensure!(
-            (1..=144).contains(&rate.fps) && rate.target > 0,
+            (1..=165).contains(&rate.fps) && rate.target > 0,
             "NVENC 重配参数无效"
         );
         let Some(update) = self.frame_rate.decide(rate) else {

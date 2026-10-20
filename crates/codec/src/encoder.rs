@@ -16,7 +16,7 @@ pub const fn maximum_size(codec: Codec) -> (u32, u32) {
 }
 pub const fn maximum_fps(codec: Codec) -> u32 {
     match codec {
-        Codec::H264 => 144,
+        Codec::H264 => 165,
         Codec::Av1 | Codec::H265 => 0,
     }
 }

@@ -151,7 +151,7 @@ impl Peer {
         };
         let initial_fps = initial
             .fps
-            .min(screen.as_ref().map_or(144, |s| s.fps))
+            .min(screen.as_ref().map_or(165, |s| s.fps))
             .max(1);
         let size = screen.as_ref().map_or((0, 0), |s| (s.width, s.height));
         let initial_bounds = if screen.is_none() {

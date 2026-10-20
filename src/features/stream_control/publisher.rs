@@ -249,7 +249,8 @@ impl DecoderCapability {
         // S DB77E0 -> DB72A0 converts a numeric rate to the protocol's tiers;
         // this is distinct from CaptureParams' 1/2/3/4 frame-rate enum.
         match self.fps as u32 {
-            117.. => 144,
+            165.. => 165,
+            117..=164 => 144,
             75..=116 => 90,
             45..=74 => 60,
             _ => 30,
@@ -525,7 +526,11 @@ fn fps(level: i32, count: i32) -> u32 {
         _ => 30,
     };
     if count > 0 {
-        requested.min(count as u32)
+        if level == 4 && (145..=165).contains(&count) {
+            count as u32
+        } else {
+            requested.min(count as u32)
+        }
     } else {
         requested
     }
@@ -897,4 +902,14 @@ pub(crate) fn clipboard_permission(enabled: bool) -> Vec<u8> {
         ..Default::default()
     }
     .encode_to_vec()
+}
+
+#[cfg(test)]
+mod fps_tests {
+    #[test]
+    fn extended_165_rate_uses_numeric_fps_count_under_legacy_tier() {
+        assert_eq!(super::fps(4, 165), 165);
+        assert_eq!(super::fps(4, 144), 144);
+        assert_eq!(super::fps(3, 165), 90);
+    }
 }

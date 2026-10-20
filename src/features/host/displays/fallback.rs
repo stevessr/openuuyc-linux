@@ -112,10 +112,10 @@ pub(super) fn ensure(
     let record = saved.unwrap_or(Record {
         width: width.clamp(2, 16384),
         height: height.clamp(2, 16384),
-        hz: 144,
+        hz: 165,
     });
     validate_modes(&[(record.width, record.height)])?;
-    ensure!((1..=144).contains(&record.hz), "无效兜底屏刷新率");
+    ensure!((1..=165).contains(&record.hz), "无效兜底屏刷新率");
     store::write(&path()?, &record)?; // Intent survives an owner/driver restart.
     if let Some(screen) = screen(driver)? {
         return Ok(Some(screen));
@@ -520,7 +520,7 @@ pub(super) fn resize(identity: &str, width: u32, height: u32) -> Result<capture:
         crate::platform::display::topology::output_name(identity),
         width,
         height,
-        Some(144),
+        Some(165),
     )?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -533,7 +533,7 @@ pub(super) fn resize(identity: &str, width: u32, height: u32) -> Result<capture:
             let mut record = store::read::<Record>(&path()?)?.unwrap_or(Record {
                 width,
                 height,
-                hz: 144,
+                hz: 165,
             });
             record.width = width;
             record.height = height;
@@ -590,10 +590,10 @@ pub(super) fn ensure(
     let record = store::read::<Record>(&path()?)?.unwrap_or(Record {
         width: width.clamp(2, 16384),
         height: height.clamp(2, 16384),
-        hz: 144,
+        hz: 165,
     });
     validate_modes(&[(record.width, record.height)])?;
-    ensure!((1..=144).contains(&record.hz), "无效兜底屏刷新率");
+    ensure!((1..=165).contains(&record.hz), "无效兜底屏刷新率");
     let mut session = crate::platform::virtual_display::Session::open()?;
     let connector = session.create(record.width, record.height, record.hz)?;
     let identity = crate::platform::display::topology::identity(&connector);

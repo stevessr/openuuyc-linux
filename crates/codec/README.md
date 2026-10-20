@@ -21,7 +21,7 @@ support as unavailable. Shared bitstream parsing remains architecture-independen
   SIMD and optimization settings; the application depends only on `openuuyc-codec`.
 
 GPU resources, capture, transport and UI belong to the application. Software
-encoding supports H.264 up to 3840×2160 / 144 FPS; these are negotiated upper
+encoding supports H.264 up to 3840×2160 / 165 FPS; these are negotiated upper
 bounds, not a guarantee of real-time throughput. Software decoding keeps its
 existing resolution support. The application still allows one software
 playback window at a time.
