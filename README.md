@@ -236,8 +236,10 @@ sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-
 
 #### 硬件解码 / 编码
 
-- **解码**：H.264 走 VA-API。AMD 用 `mesa`，Intel 用 `intel-media-driver`，NVIDIA 用 `libva-nvidia-driver`（Ubuntu 为 `nvidia-vaapi-driver`；并设 `NVD_BACKEND=direct`）；libva 2.15 以前认不出 NVIDIA 显卡对应的驱动，程序会自行指定，无需设置 `LIBVA_DRIVER_NAME`。
-- **编码**（被控）：Linux 已支持 NVIDIA NVENC（H.264 / H.265；AV1 需 RTX 40 系及以上），运行时直接加载 NVIDIA 驱动的 CUDA/NVENC 库，不需要 CUDA Toolkit。确保 NVIDIA 驱动正常（`nvidia-smi` 可用），混合显卡机器 NVENC 使用桌面所在的 NVIDIA GPU；AMD 与 Intel 经 VA-API 编码 H.264（Intel 需 `intel-media-driver` 或 `libva-intel-driver`，AMD 用 `mesa`），都不可用时回退软件编码。NVIDIA 解码目前依赖 VA-API 转接驱动 `libva-nvidia-driver`（Ubuntu 为 `nvidia-vaapi-driver`，设 `NVD_BACKEND=direct`）。
+- **解码**：H.264 走 VA-API。AMD 用 `mesa`，Intel 用 `intel-media-driver`，NVIDIA 用 `libva-nvidia-driver`（Ubuntu 为 `nvidia-vaapi-driver`；并设 `NVD_BACKEND=direct`）；libva 2.15 以前认不出 NVIDIA 显卡对应的驱动，程序会自行指定，无需设置 `LIBVA_DRIVER_NAME`。**AV1 目前走 Rust 软件解码**（x86/x86_64）：支持 8/10-bit、4:2:0 / 4:4:4；10-bit P010 直接上传到 GPU 的 R16/RG16 纹理，避免在上传时先截断为 8-bit；AYUV/Y410 4:4:4 在 CPU 转换为 RGBA8。VA-API AV1 / HEVC 硬解仍未实现，不会错误通告其硬解能力。
+- **编码**（被控）：Linux 已支持 NVIDIA NVENC（H.264 / H.265；AV1 需 RTX 40 系及以上），运行时直接加载 NVIDIA 驱动的 CUDA/NVENC 库，不需要 CUDA Toolkit。确保 NVIDIA 驱动正常（`nvidia-smi` 可用），混合显卡机器 NVENC 使用桌面所在的 NVIDIA GPU；AMD 与 Intel 经 VA-API 编码 H.264（Intel 需 `intel-media-driver` 或 `libva-intel-driver`，AMD 用 `mesa`），都不可用时回退软件编码。当前采集仍输出 8-bit SDR BGRA，不会把 8-bit 数据伪装成 10-bit HDR；真正的 HDR 采集和 VA-API AV1 编码仍待实现。
+- **HDR 显示**：Linux 端可接收 AV1 P010 10-bit 图片，并在 16-bit 纹理上按 YUV 矩阵转换；接收到 PQ / BT.2020 HDR 元数据时在 GPU 做 HDR→SDR 色调映射。**这还不是原生 HDR 输出**：窗口交换链仍按 SDR 输出，显示器 HDR 模式的查询与 HDR swapchain 待完善。普通 SDR 10-bit 内容不走 PQ 色调映射。
+- **触摸与终端**：Wayland 被控端已有基于 uinput 的最多 10 点 Type-B 多点触摸，需按上文设置 `/dev/uinput` 权限；被控终端使用 PTY，须被控端用户在访问权限中主动开启，可在「终端会话」页接入，默认不向远端开放本机会话。
 - **老 Intel GPU / 虚拟机**：Haswell/Broadwell 的 Vulkan 驱动未通过一致性认证，程序仍会使用它（设 `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=0` 恢复 wgpu 默认的隐藏行为）；驱动无法向 Wayland surface 呈现时，可安装 `vulkan-swrast`（lavapipe）并用 `OPENUUYC_BACKEND=gl` 或 `OPENUUYC_BACKEND=vulkan` 指定界面后端。
 
 #### 运行前提与开关
