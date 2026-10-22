@@ -825,6 +825,24 @@ fn p010_layout(width: u32, height: u32, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(test, not(windows)))]
+mod p010_tests {
+    use super::p010_layout;
+
+    #[test]
+    fn accepts_exact_two_by_two_p010() {
+        // Four 16-bit Y samples followed by two interleaved 16-bit UV samples.
+        assert!(p010_layout(2, 2, &[0; 12]).is_ok());
+    }
+
+    #[test]
+    fn rejects_short_and_odd_p010() {
+        assert!(p010_layout(2, 2, &[0; 11]).is_err());
+        assert!(p010_layout(3, 2, &[0; 24]).is_err());
+        assert!(p010_layout(0, 2, &[]).is_err());
+    }
+}
+
 fn i444_to_rgba_pixels(
     width: u32,
     height: u32,
