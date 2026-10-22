@@ -33,6 +33,8 @@ struct Uniform {
     rotation: [f32; 4],
     /// Affine YUV to RGB rows, one per colour component.
     transform: [[f32; 4]; 3],
+    /// HDR input peak luminance, zero for SDR; aligned with WGSL vec4.
+    hdr: [f32; 4],
 }
 
 /// A pipeline and the bind group layout its frames are bound with.
@@ -46,6 +48,7 @@ enum Planes {
     Nv12 {
         luma: wgpu::Texture,
         chroma: wgpu::Texture,
+        depth: u8,
     },
 }
 
@@ -164,6 +167,13 @@ impl Frame {
     const fn is_nv12(&self) -> bool {
         matches!(self.planes, Planes::Nv12 { .. })
     }
+
+    const fn plane_depth(&self) -> Option<u8> {
+        match &self.planes {
+            Planes::Nv12 { depth, .. } => Some(*depth),
+            Planes::Rgba(_) => None,
+        }
+    }
 }
 
 pub(crate) struct VideoLayer {
@@ -189,6 +199,7 @@ impl VideoLayer {
                 extent: [1.0, 1.0],
                 rotation: [1.0, 0.0, 0.0, 1.0],
                 transform: [[0.0; 4]; 3],
+                hdr: [0.0; 4],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -273,6 +284,7 @@ impl VideoLayer {
             planes: Planes::Nv12 {
                 luma: planes.luma,
                 chroma: planes.chroma,
+                depth: 8,
             },
             bind_group,
             width,
@@ -339,8 +351,7 @@ impl VideoLayer {
         Ok(())
     }
 
-    /// `data` is packed NV12: a `width * height` luma plane followed by an
-    /// interleaved CbCr plane at half resolution.
+    /// Packed 8-bit NV12, uploaded as R8 and RG8 sampling textures.
     pub(crate) fn upload_nv12(
         &mut self,
         device: &wgpu::Device,
@@ -349,31 +360,71 @@ impl VideoLayer {
         height: u32,
         data: &[u8],
     ) -> Result<()> {
-        let chroma_height = height.div_ceil(2);
-        let chroma_width = width.div_ceil(2);
-        let luma_bytes = width as usize * height as usize;
+        self.upload_yuv420(device, queue, width, height, data, 8)
+    }
+
+    /// Packed high-aligned 10-bit P010, uploaded as R16 and RG16.
+    /// The shader receives all 10 bits instead of truncating to RGB8 on CPU.
+    pub(crate) fn upload_p010(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Result<()> {
+        self.upload_yuv420(device, queue, width, height, data, 10)
+    }
+
+    fn upload_yuv420(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        depth: u8,
+    ) -> Result<()> {
+        anyhow::ensure!(matches!(depth, 8 | 10), "不支持的平面位深");
         anyhow::ensure!(
-            width > 0
-                && height > 0
-                && data.len() >= luma_bytes + chroma_width as usize * chroma_height as usize * 2,
+            width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2),
+            "YUV420 视频尺寸必须为正偶数"
+        );
+        let bytes_per_sample: u32 = if depth == 10 { 2 } else { 1 };
+        let chroma_width = width / 2;
+        let chroma_height = height / 2;
+        let luma_bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|size| size.checked_mul(bytes_per_sample as usize))
+            .ok_or_else(|| anyhow::anyhow!("视频帧尺寸溢出"))?;
+        let chroma_bytes = luma_bytes / 2;
+        anyhow::ensure!(
+            data.len() >= luma_bytes + chroma_bytes,
             "视频帧尺寸与数据不匹配"
         );
         let reuse = matches!(
             &self.frame,
-            Some(frame) if frame.is_nv12() && frame.width == width && frame.height == height
+            Some(frame) if frame.plane_depth() == Some(depth)
+                && frame.width == width && frame.height == height
+                && frame.lease.is_none()
         );
         if !reuse {
-            let luma = plane(device, width, height, wgpu::TextureFormat::R8Unorm);
-            let chroma = plane(
-                device,
-                chroma_width,
-                chroma_height,
-                wgpu::TextureFormat::Rg8Unorm,
-            );
+            let y_format = if depth == 10 {
+                wgpu::TextureFormat::R16Unorm
+            } else {
+                wgpu::TextureFormat::R8Unorm
+            };
+            let uv_format = if depth == 10 {
+                wgpu::TextureFormat::Rg16Unorm
+            } else {
+                wgpu::TextureFormat::Rg8Unorm
+            };
+            let luma = plane(device, width, height, y_format);
+            let chroma = plane(device, chroma_width, chroma_height, uv_format);
             let luma_view = luma.create_view(&wgpu::TextureViewDescriptor::default());
             let chroma_view = chroma.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("openuuyc-video-nv12"),
+                label: Some("openuuyc-video-yuv420"),
                 layout: &self.nv12.layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -395,7 +446,7 @@ impl VideoLayer {
                 ],
             });
             self.frame = Some(Frame {
-                planes: Planes::Nv12 { luma, chroma },
+                planes: Planes::Nv12 { luma, chroma, depth },
                 bind_group,
                 width,
                 height,
@@ -403,20 +454,20 @@ impl VideoLayer {
             });
         }
         let Some(Frame {
-            planes: Planes::Nv12 { luma, chroma },
+            planes: Planes::Nv12 { luma, chroma, .. },
             ..
         }) = self.frame.as_ref()
         else {
             anyhow::bail!("视频纹理不可用");
         };
-        write_plane(queue, luma, width, height, 1, &data[..luma_bytes]);
+        write_plane(queue, luma, width, height, bytes_per_sample, &data[..luma_bytes]);
         write_plane(
             queue,
             chroma,
             chroma_width,
             chroma_height,
-            2,
-            &data[luma_bytes..],
+            bytes_per_sample * 2,
+            &data[luma_bytes..luma_bytes + chroma_bytes],
         );
         Ok(())
     }
@@ -428,6 +479,7 @@ impl VideoLayer {
         target: (u32, u32),
         placement: VideoPlacement,
         transform: [[f32; 4]; 3],
+        hdr_peak_nits: Option<u16>,
     ) {
         let (Some(frame), true) = (self.frame.as_ref(), target.0 > 0 && target.1 > 0) else {
             return;
@@ -446,6 +498,7 @@ impl VideoLayer {
                 extent: [placement.width / width, placement.height / height],
                 rotation,
                 transform,
+                hdr: [hdr_peak_nits.unwrap_or(0) as f32, 0.0, 0.0, 0.0],
             }),
         );
         let program = if frame.is_nv12() {
@@ -623,6 +676,7 @@ struct Uniform {
     transform0: vec4<f32>,
     transform1: vec4<f32>,
     transform2: vec4<f32>,
+    hdr: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> settings: Uniform;
@@ -669,6 +723,29 @@ fn fs_nv12(in: VertexOutput) -> @location(0) vec4<f32> {
         dot(settings.transform1, yuv),
         dot(settings.transform2, yuv),
     );
+    if (settings.hdr.x > 0.0) {
+        // PQ (ST 2084) -> linear BT.2020 light in nits.
+        let p = pow(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)),
+                    vec3<f32>(1.0 / (2523.0 / 32.0)));
+        let num = max(p - vec3<f32>(3424.0 / 4096.0), vec3<f32>(0.0));
+        let den = max(vec3<f32>(2413.0 / 128.0) - p * (2392.0 / 128.0),
+                      vec3<f32>(1e-6));
+        let nits = pow(num / den, vec3<f32>(1.0 / (2610.0 / 16384.0))) * 10000.0;
+        // BT.2020 -> BT.709, then compress highlights into SDR luminance.
+        let linear = max(vec3<f32>(
+            1.6605 * nits.r - 0.5876 * nits.g - 0.0728 * nits.b,
+           -0.1246 * nits.r + 1.1329 * nits.g - 0.0083 * nits.b,
+           -0.0182 * nits.r - 0.1006 * nits.g + 1.1187 * nits.b
+        ), vec3<f32>(0.0));
+        let peak = max(settings.hdr.x, 203.0);
+        let white = peak / (peak + 203.0);
+        let mapped = clamp(linear / (linear + vec3<f32>(203.0)) / white,
+                           vec3<f32>(0.0), vec3<f32>(1.0));
+        let srgb = select(mapped * 12.92,
+                          1.055 * pow(mapped, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+                          mapped > vec3<f32>(0.0031308));
+        return vec4<f32>(srgb, 1.0);
+    }
     return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 "#;

@@ -270,6 +270,13 @@ impl Shell {
                         data,
                         color.transform(8),
                     )?,
+                    RenderSurface::CpuP010 { data, color } => self.presenter.upload_video_p010(
+                        frame.width,
+                        frame.height,
+                        data,
+                        color.transform(10),
+                        color.hdr_peak_nits,
+                    )?,
                     RenderSurface::Dmabuf {
                         frame: dmabuf,
                         color,
