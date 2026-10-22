@@ -19,6 +19,12 @@ pub(crate) use vaapi::{encoder_available, shared_display};
 pub enum CpuFormat {
     Nv12,
     I444,
+    /// AV1 10-bit 4:2:0, little-endian samples aligned to the high 10 bits.
+    P010,
+    /// AV1 8-bit 4:4:4, packed V, U, Y, A pixels.
+    Ayuv,
+    /// AV1 10-bit 4:4:4, little-endian U:10, Y:10, V:10, A:2 pixels.
+    Y410,
 }
 
 pub struct CpuVideoFrame {
@@ -187,8 +193,9 @@ impl LinuxVideoDecoder {
             let format = match frame.format {
                 openuuyc_codec::PixelFormat::Nv12 => CpuFormat::Nv12,
                 openuuyc_codec::PixelFormat::I444 => CpuFormat::I444,
-                // 10-bit and packed 4:4:4 AV1 are never advertised here.
-                _ => return Err(DecodeError::Unsupported),
+                openuuyc_codec::PixelFormat::P010 => CpuFormat::P010,
+                openuuyc_codec::PixelFormat::Ayuv => CpuFormat::Ayuv,
+                openuuyc_codec::PixelFormat::Y410 => CpuFormat::Y410,
             };
             // AV1 pads odd NV12 sizes to even ones, repeating the edge pixels;
             // the packed planes are laid out at the coded size.
