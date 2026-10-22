@@ -56,7 +56,7 @@ jobs:
 
       - name: Test Linux video conversion and native multitouch
         run: |
-          cargo test --locked --lib media::decoder::linux_packed
+          cargo test --locked --lib media::decoder
           cargo test --locked --lib platform::linux::input
 
       - name: Test the virtual display helper
