@@ -31,6 +31,7 @@ struct Bridge {
     control: Mutex<Option<StreamControlHandle>>,
     keyframe: Mutex<Option<Arc<Packet>>>,
     active: std::sync::atomic::AtomicBool,
+    screen_id: std::sync::atomic::AtomicI32,
 }
 
 static BRIDGE: OnceLock<Arc<Bridge>> = OnceLock::new();
@@ -65,6 +66,7 @@ pub(super) fn attach(session: &NativeViewerSession) {
             control: Mutex::new(None),
             keyframe: Mutex::new(None),
             active: std::sync::atomic::AtomicBool::new(false),
+            screen_id: std::sync::atomic::AtomicI32::new(0),
         });
         let copy = Arc::clone(&bridge);
         std::thread::spawn(move || {
@@ -78,6 +80,13 @@ pub(super) fn attach(session: &NativeViewerSession) {
         bridge
     });
     *lock(&bridge.control) = Some(session.stream_control.clone());
+    bridge.screen_id.store(session.screen_id(), std::sync::atomic::Ordering::Release);
+}
+
+pub(super) fn select_screen(screen_id: i32) {
+    if let Some(bridge) = BRIDGE.get() {
+        bridge.screen_id.store(screen_id, std::sync::atomic::Ordering::Release);
+    }
 }
 
 pub(super) fn publish(frame: &EncodedVideoFrame) {
@@ -143,7 +152,8 @@ fn apply_request(bridge: &Bridge, request: Request, control_enabled: &mut bool, 
             if !u.is_finite() || !v.is_finite() || !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
                 return;
             }
-            if let Some(screen) = target.snapshot().screens.iter().find(|s| s.id >= 0) {
+            let selected = bridge.screen_id.load(std::sync::atomic::Ordering::Acquire);
+            if let Some(screen) = target.snapshot().screens.iter().find(|s| s.id == selected && s.id >= 0) {
                 input.absolute(OWNER, screen.id, u.min(0.999_999), v.min(0.999_999));
                 if *button != down {
                     input.button(OWNER, 1, down);
