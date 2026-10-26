@@ -5,7 +5,7 @@
 //! Video is the already-negotiated H.264 UU bitstream, not a screen re-encode.
 
 use super::NativeViewerSession;
-use crate::features::remote_input::{MouseMode, RemoteInput};
+use crate::features::remote_input::MouseMode;
 use crate::features::stream_control::StreamControlHandle;
 use crate::media::VideoCodec;
 use crate::transport::rtc::EncodedVideoFrame;
@@ -134,6 +134,7 @@ fn apply_request(bridge: &Bridge, request: Request, control_enabled: &mut bool, 
                 }
             } else {
                 input.pause_owner(OWNER);
+                input.disable();
                 *control_enabled = false;
             }
             *button = false;
@@ -165,6 +166,7 @@ impl Drop for ActiveClient {
     fn drop(&mut self) {
         if let Some(control) = lock(&self.0.control).clone() {
             control.mouse().pause_owner(OWNER);
+            control.mouse().disable();
         }
         self.0.active.store(false, std::sync::atomic::Ordering::Release);
     }
@@ -197,7 +199,8 @@ async fn client(stream: TcpStream, bridge: Arc<Bridge>) -> Result<()> {
     let (mut sender, mut receiver) = ws.split();
     let (responses, mut responses_rx) = mpsc::unbounded_channel::<Message>();
     let mut frames = bridge.frames.subscribe();
-    if let Some(keyframe) = lock(&bridge.keyframe).clone() {
+    let cached_keyframe = { lock(&bridge.keyframe).clone() };
+    if let Some(keyframe) = cached_keyframe {
         sender.send(Message::Binary(keyframe.bytes.clone().to_vec().into())).await?;
     }
     let writer = tokio::spawn(async move {
