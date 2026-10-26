@@ -64,6 +64,8 @@ internal class UuDirectSession(
     private var pendingBinaryName: String? = null
     private var currentScreen: Int? = null
     private var inputReady = false
+    private var captureRequested = false
+    private var pbConnected = false
     private var pressed = false
     private var signalingConnected = false
     private val appControlId = UUID.randomUUID().toString()
@@ -306,7 +308,10 @@ internal class UuDirectSession(
                                 controlChannel = channel
                                 sendControl(UuWire.echoRequest())
                             }
-                            "TEXT_DATA_CHANNEL" -> textChannel = channel
+                            "TEXT_DATA_CHANNEL" -> {
+                                textChannel = channel
+                                maybeStartCapture()
+                            }
                         }
                     }
                 }
@@ -320,20 +325,36 @@ internal class UuDirectSession(
                 if (bytes.isNotEmpty() && bytes[0] == '{'.code.toByte()) return
                 try {
                     val payload = UuWire.decodeEnvelope(bytes)
-                    if (payload.echoRequest && channel.label() == "CONTROL_DATA_CHANNEL") {
-                        sendControl(UuWire.echoResponse(payload.seq, payload.timestamp))
+                    if (channel.label() == "CONTROL_DATA_CHANNEL") {
+                        pbConnected = true
+                        if (payload.echoRequest) {
+                            sendControl(UuWire.echoResponse(payload.seq, payload.timestamp))
+                        }
                     }
-                    if (payload.screenId != null && payload.screenId >= 0) currentScreen = payload.screenId
-                    if (channel.label() == "CONTROL_DATA_CHANNEL" &&
+                    if (payload.screenId != null && payload.screenId >= 0)
+                        currentScreen = payload.screenId
+                    maybeStartCapture()
+                    inputReady = pbConnected && captureRequested &&
+                        currentScreen != null &&
                         controlChannel?.state() == DataChannel.State.OPEN &&
-                        textChannel?.state() == DataChannel.State.OPEN) {
-                        inputReady = true
-                    }
+                        textChannel?.state() == DataChannel.State.OPEN
                 } catch (_: IllegalArgumentException) {
                     // Vendor extensions may be opaque; never reflect them back.
                 }
             }
         })
+    }
+
+    @Synchronized private fun maybeStartCapture() {
+        if (captureRequested || !pbConnected || currentScreen == null) return
+        if (controlChannel?.state() != DataChannel.State.OPEN ||
+            textChannel?.state() != DataChannel.State.OPEN) return
+        // UU runtime CaptureSetting RPC is a protobuf payload with SCTP TEXT PPID.
+        val payload = UuWire.captureSetting()
+        captureRequested = textChannel?.send(
+            DataChannel.Buffer(ByteBuffer.wrap(payload), false)
+        ) == true
+        if (captureRequested) emit("UU 屏幕控制已协商，申请远端 H.264 画面")
     }
 
     @Synchronized private fun sendControl(data: ByteArray): Boolean {

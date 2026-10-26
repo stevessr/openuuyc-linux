@@ -113,6 +113,37 @@ internal object UuWire {
     /** Socket.IO binary attachment MUST start with an Engine.IO message byte. */
     fun attachment(bytes: ByteArray): ByteArray = byteArrayOf(4) + bytes
 
+    /**
+     * Runtime video CaptureSetting RPC, src/features/stream_control/settings.rs.
+     * The request targets existing negotiated tracks (-2) instead of resizing
+     * the controlled computer's physical display. Must use TEXT_DATA_CHANNEL
+     * with a text PPID, not the CONTROL_DATA_CHANNEL.
+     */
+    fun captureSetting(sequence: Long = 1L): ByteArray {
+        val capture = message { out ->
+            integer(out, 1, 2) // FPS 60
+            integer(out, 2, 5) // auto quality
+            integer(out, 3, 1) // capture remote cursor
+            integer(out, 4, -2) // existing tracks
+            integer(out, 5, -1) // do not change physical resolution
+            integer(out, 6, -1)
+            integer(out, 7, 1) // H264 8bit 4:2:0
+            integer(out, 10, 1) // unchanged resolution
+            integer(out, 12, 2) // auto quality general
+            integer(out, 13, 1) // H264
+            integer(out, 18, 60)
+        }
+        val rpc = message { out ->
+            bytes(out, 1, message { header -> integer(header, 1, sequence) })
+            bytes(out, 2, capture)
+        }
+        return message { out ->
+            integer(out, 1, sequence)
+            integer(out, 2, System.currentTimeMillis())
+            bytes(out, 21, rpc)
+        }
+    }
+
     fun echoRequest(): ByteArray {
         // PbControlMessage.payload = SimpleAction(field3)
         val action = message { simple ->

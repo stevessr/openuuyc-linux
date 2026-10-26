@@ -24,6 +24,14 @@ class UuProtocolTest {
         assertTrue(options.toList().containsAll(UuContract.VERSION.toByteArray().toList()))
     }
 
+    @Test fun captureSettingUsesUuRpcAndDoesNotRequestPhysicalResize() {
+        val capture = UuWire.captureSetting(81)
+        assertTrue(capture.size > 40)
+        assertEquals(81L, UuWire.decodeEnvelope(capture).seq)
+        // Top-level protobuf field 21, length-delimited, uses two-byte tag AA 01.
+        assertTrue(capture.toList().windowed(2).any { it[0] == 0xAA.toByte() && it[1] == 0x01.toByte() })
+    }
+
     @Test fun echoFramesCanBeDecoded() {
         val request = UuWire.decodeEnvelope(UuWire.echoRequest())
         assertTrue(request.echoRequest)

@@ -24,7 +24,7 @@ PICO 在本机进行 UU 登录，获取设备列表和加入房间；**不需要
 | Socket.IO 握手及控制请求、WebRTC ICE/SDP | 实现代码，需真实 UU 信令服务器联测 |
 | WebRTC H.264 -> EglRenderer -> OpenXR Android Surface | 实现代码，需实机帧呈现验证 |
 | 远程鼠标绝对坐标、按键 | 使用 UU CONTROL_DATA_CHANNEL 原生 JSON 格式；发送前检查控制通道和屏幕 ID |
-| 完整 UU protobuf CaptureSetting/屏幕/心跳、Mixed KCP、音频、键盘、文件传输 | **尚未实现完整互通** |
+| UU CaptureSetting 初始化请求、PB ECHO、屏幕列表解析 | 已添加协议代码，仍需真实对端联测 |\n| Mixed KCP、音频、键盘、文件传输和完整异常恢复 | **尚未实现完整互通** |
 
 ## CI
 
