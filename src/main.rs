@@ -225,12 +225,11 @@ fn main() -> Result<()> {
         transport: None,
     });
     #[cfg(target_os = "linux")]
-    let _pico_vr_overlay = match &command {
-        Commands::PicoVr {
-            command: PicoVrCommand::Launch { no_dashboard },
-        } => Some(pico_vr::launch(*no_dashboard)?),
-        _ => None,
-    };
+    if let Commands::PicoVr {
+        command: PicoVrCommand::Launch { no_dashboard },
+    } = &command {
+        pico_vr::launch(*no_dashboard)?;
+    }
     // Route VR launching through the normal GUI instance/activation path.
     // This preserves existing login, window reuse, transport and cleanup.
     #[cfg(target_os = "linux")]
