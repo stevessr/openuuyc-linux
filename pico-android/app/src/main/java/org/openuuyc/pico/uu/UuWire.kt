@@ -316,7 +316,7 @@ internal object UuWire {
         val separator = if (sdp.contains("\r\n")) "\r\n" else "\n"
         val lines = sdp.lines().map { it.trimEnd('\r') }.filter { it.isNotEmpty() }.toMutableList()
         require(lines.any { it.startsWith("m=application ") }) { "UU SDP missing application channel" }
-        lines.removeAll { it.startsWith("a=msid-semantic:") }
+        lines.removeAll { it.startsWith("a=msid-semantic:") || it == "a=extmap-allow-mixed" }
         val firstMedia = lines.indexOfFirst { it.startsWith("m=") }
         require(firstMedia >= 0)
         val bundle = lines.subList(0, firstMedia).indexOfFirst { it.startsWith("a=group:BUNDLE") }
