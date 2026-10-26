@@ -1,239 +1,234 @@
 package org.openuuyc.pico
 
 import android.app.Activity
-import android.media.MediaCodec
-import android.media.MediaFormat
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Surface
 import android.view.ViewGroup
 import android.widget.Button
-import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import okio.ByteString
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.MultiFormatWriter
+import org.openuuyc.pico.uu.UuDirectSession
+import org.openuuyc.pico.uu.UuNrdApi
+import org.openuuyc.pico.uu.UuDevice
+import org.openuuyc.pico.uu.UuQr
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
+/**
+ * Direct PICO UU client: account QR -> device list -> UU room -> Socket.IO ->
+ * WebRTC -> OpenXR compositor. Does not require a desktop proxy or USB.
+ */
 class PicoActivity : Activity() {
     private external fun nativeRun(activity: PicoActivity)
     private external fun nativeStop()
-    private val http = OkHttpClient.Builder().pingInterval(15, TimeUnit.SECONDS).build()
-    private val main = Handler(Looper.getMainLooper())
+
+    private val ui = Handler(Looper.getMainLooper())
+    private val worker = Executors.newSingleThreadExecutor()
+    private val loginAlive = AtomicBoolean(true)
     private val running = AtomicBoolean(false)
-    private val connected = AtomicBoolean(false)
+    private var session: UuDirectSession? = null
     private var xrThread: Thread? = null
-    private var socket: WebSocket? = null
-    private var decoder: AvcDecoder? = null
     private var xrSurface: Surface? = null
     private lateinit var status: TextView
-    private lateinit var token: EditText
+    private lateinit var qrImage: ImageView
+    private lateinit var devices: LinearLayout
+    private lateinit var api: UuNrdApi
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         System.loadLibrary("openuuyc_pico")
-        val layout = LinearLayout(this).apply {
+        api = UuNrdApi(this)
+        val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(24, 24, 24, 24)
         }
-        status = TextView(this).apply { text = "PICO OpenXR · USB ADB reverse tcp:18765 tcp:18765" }
-        token = EditText(this).apply {
-            hint = "Enter Linux bridge token (32+ characters)"
-            isSingleLine = true
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        status = TextView(this).apply {
+            text = "OpenUUYC PICO · UU 协议直连\n请用 UU 官方客户端扫码登录"
+            textSize = 18f
         }
-        val connect = Button(this).apply {
-            text = "Connect headset / start OpenXR"
-            setOnClickListener { startSession() }
+        qrImage = ImageView(this).apply {
+            adjustViewBounds = true
+            visibility = ImageView.GONE
         }
-        val stop = Button(this).apply {
-            text = "Disconnect"
+        devices = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(status)
+        root.addView(Button(this).apply {
+            text = "使用 UU 二维码登录"
+            setOnClickListener { login() }
+        })
+        root.addView(Button(this).apply {
+            text = "刷新 UU 设备列表"
+            setOnClickListener { refresh() }
+        })
+        root.addView(Button(this).apply {
+            text = "断开当前会话"
             setOnClickListener { stopSession() }
-        }
-        layout.addView(status)
-        layout.addView(token, ViewGroup.LayoutParams(-1, -2))
-        layout.addView(connect)
-        layout.addView(stop)
-        setContentView(layout)
+        })
+        root.addView(qrImage, ViewGroup.LayoutParams(-1, 440))
+        root.addView(devices)
+        val scroll = ScrollView(this)
+        scroll.addView(root)
+        setContentView(scroll)
     }
 
-    private fun startSession() {
+    private fun message(text: String) {
+        ui.post {
+            if (!isFinishing && !isDestroyed) status.text = text
+        }
+    }
+
+    private fun login() {
+        loginAlive.set(false)
+        loginAlive.set(true)
+        worker.submit {
+            try {
+                api.initializeDevice()
+                var qr = api.createQr()
+                var statusValue = 1
+                var deadline = System.currentTimeMillis() + 300_000
+                while (loginAlive.get()) {
+                    ui.post {
+                        qrImage.setImageBitmap(qrBitmap(qr.url))
+                        qrImage.visibility = ImageView.VISIBLE
+                    }
+                    message("请用手机 UU 客户端扫码确认，二维码有效期 5 分钟")
+                    while (loginAlive.get() && System.currentTimeMillis() < deadline) {
+                        val state = api.queryQr(qr, statusValue)
+                        when (state) {
+                            1, 2 -> {
+                                statusValue = state
+                                if (state == 2) message("已扫码，等待手机确认")
+                            }
+                            3 -> break // refresh cancelled login ticket
+                            4 -> {
+                                api.confirmQr(qr)
+                                message("UU 登录成功，可从设备列表直接发起 PICO 远控")
+                                ui.post { qrImage.visibility = ImageView.GONE }
+                                refresh()
+                                return@submit
+                            }
+                            else -> throw IllegalArgumentException("未知的 UU 登录状态：$state")
+                        }
+                    }
+                    if (!loginAlive.get()) return@submit
+                    qr = api.createQr()
+                    statusValue = 1
+                    deadline = System.currentTimeMillis() + 300_000
+                }
+            } catch (e: Exception) {
+                message("UU 原生登录失败：${e.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private fun qrBitmap(url: String): Bitmap {
+        require(url.startsWith("https://"))
+        val size = 384
+        val bits = MultiFormatWriter().encode(url, BarcodeFormat.QR_CODE, size, size)
+        val pixels = IntArray(size * size)
+        for (y in 0 until size) for (x in 0 until size) {
+            pixels[y * size + x] = if (bits.get(x, y)) Color.BLACK else Color.WHITE
+        }
+        return Bitmap.createBitmap(pixels, size, size, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun refresh() {
+        worker.submit {
+            try {
+                val list = api.devices()
+                ui.post {
+                    devices.removeAllViews()
+                    if (list.isEmpty()) {
+                        message("UU 账号下没有可连接设备")
+                    }
+                    list.forEach { device ->
+                        devices.addView(Button(this).apply {
+                            text = "${device.alias} · " +
+                                (if (device.online) "在线" else "离线") +
+                                (if (device.occupants > 0) " · 已占用" else "")
+                            isEnabled = device.online && device.controllable && device.occupants == 0
+                            setOnClickListener { connect(device) }
+                        })
+                    }
+                }
+            } catch (e: Exception) {
+                message("UU 设备列表失败：${e.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private fun connect(device: UuDevice) {
         if (running.get()) return
-        val secret = token.text.toString()
-        if (secret.length < 32 || secret.length > 256) {
-            status.text = "Token must contain 32–256 characters"
-            return
+        message("加入 UU 远控房间：${device.alias}")
+        worker.submit {
+            try {
+                // Actual UU join/by_device authorization, not a Linux relay token.
+                val room = api.join(device)
+                if (isFinishing || isDestroyed) return@submit
+                val direct = UuDirectSession(applicationContext, room, api.identity, ::message)
+                session = direct
+                running.set(true)
+                xrThread = Thread({
+                    try { nativeRun(this) }
+                    finally {
+                        ui.post {
+                            if (!isDestroyed) stopSession()
+                            xrSurface?.release()
+                            xrSurface = null
+                        }
+                    }
+                }, "OpenUUYC-PICO-OpenXR").also { it.start() }
+            } catch (e: Exception) {
+                message("UU 设备连接失败：${e.javaClass.simpleName}")
+            }
         }
-        running.set(true)
-        status.text = "Initializing PICO OpenXR..."
-        xrThread = Thread({ nativeRun(this) }, "OpenUUYC-OpenXR").also { it.start() }
     }
 
-    // Invoked from native OpenXR thread when the runtime's compositor gives
-    // us an Android Surface-backed quad swapchain.
     @Suppress("unused")
     fun onXrSurface(surface: Surface) {
-        main.post {
+        ui.post {
             if (!running.get()) { surface.release(); return@post }
             xrSurface = surface
-            val secret = token.text.toString()
-            connectBridge(secret, surface)
+            try { session?.start(surface) }
+            catch (e: Exception) {
+                message("UU 直连启动失败：${e.javaClass.simpleName}")
+                stopSession()
+            }
         }
     }
 
     @Suppress("unused")
-    fun onXrError(message: String) {
-        main.post { status.text = "OpenXR: $message"; stopSession() }
-    }
-
-    // Called from the native tracking thread; u,v are normalized quad hit
-    // coordinates, not raw 6DoF samples or local desktop coordinates.
-    @Suppress("unused")
     fun onPointer(u: Float, v: Float, down: Boolean) {
-        if (!connected.get()) return
-        socket?.send(JSONObject().apply {
-            put("type", "pointer")
-            put("u", u.toDouble())
-            put("v", v.toDouble())
-            put("down", down)
-        }.toString())
+        session?.pointer(u, v, down)
     }
 
-    private fun connectBridge(secret: String, surface: Surface) {
-        status.text = "Opening USB loopback bridge..."
-        val request = Request.Builder().url("ws://127.0.0.1:18765").build()
-        socket = http.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(ws: WebSocket, response: Response) {
-                ws.send(JSONObject().put("type", "auth").put("token", secret).toString())
-            }
-            override fun onMessage(ws: WebSocket, text: String) {
-                val obj = JSONObject(text)
-                when (obj.optString("type")) {
-                    "hello" -> {
-                        if (obj.optInt("version") != 1 || obj.optString("codec") != "h264") {
-                            ws.close(1003, "unsupported video bridge")
-                            return
-                        }
-                        connected.set(true)
-                        ws.send("""{"type":"control","enabled":true}""")
-                        main.post { status.text = "Connected · aim controller and press trigger" }
-                    }
-                    "error" -> main.post { status.text = "Bridge busy / denied" }
-                }
-            }
-            override fun onMessage(ws: WebSocket, bytes: ByteString) {
-                if (!connected.get()) return
-                val payload = bytes.toByteArray()
-                if (payload.size > 2 && payload[0] == 1.toByte()) {
-                    main.post {
-                        if (running.get()) {
-                            if (decoder == null) decoder = AvcDecoder(surface)
-                            decoder?.feed(payload, 2, payload.size - 2, payload[1] == 1.toByte())
-                        }
-                    }
-                }
-            }
-            override fun onClosing(ws: WebSocket, code: Int, reason: String) { ws.close(code, reason) }
-            override fun onClosed(ws: WebSocket, code: Int, reason: String) { disconnected() }
-            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                disconnected()
-                main.post { status.text = "Bridge: ${t.message}" }
-            }
-        })
-    }
-
-    private fun disconnected() {
-        connected.set(false)
-        main.post { decoder?.close(); decoder = null }
+    @Suppress("unused")
+    fun onXrError(reason: String) {
+        message("OpenXR：$reason")
+        ui.post { stopSession() }
     }
 
     private fun stopSession() {
-        connected.set(false)
-        socket?.send("""{"type":"control","enabled":false}""")
-        socket?.close(1000, "headset session ended")
-        socket = null
-        running.set(false)
-        nativeStop()
-        decoder?.close()
-        decoder = null
-        xrSurface?.release()
-        xrSurface = null
-        status.text = "Stopped"
+        loginAlive.set(false)
+        session?.close()
+        session = null
+        if (running.getAndSet(false)) nativeStop()
+        message("会话已断开")
     }
 
     override fun onDestroy() {
         stopSession()
-        http.dispatcher.executorService.shutdown()
+        worker.shutdownNow()
+        api.close()
         super.onDestroy()
-    }
-}
-
-/** MediaCodec to compositor Surface: no CPU pixel readback/copy. */
-internal class AvcDecoder(private val surface: Surface) {
-    private var codec: MediaCodec? = null
-    private var sps: ByteArray? = null
-    private var pps: ByteArray? = null
-    private var ptsUs: Long = 0
-    private val info = MediaCodec.BufferInfo()
-    private var waitForIdr = true
-
-    fun feed(bytes: ByteArray, offset: Int, length: Int, keyframe: Boolean) {
-        if (length <= 0 || length > 4 * 1024 * 1024) return
-        for (nal in AnnexB.nals(bytes, offset, length)) {
-            when (bytes[nal.first].toInt() and 0x1f) {
-                7 -> sps = bytes.copyOfRange(nal.first - nal.startCode, nal.last + 1)
-                8 -> pps = bytes.copyOfRange(nal.first - nal.startCode, nal.last + 1)
-            }
-        }
-        if (codec == null) {
-            val sequence = sps ?: return
-            val picture = pps ?: return
-            codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-                val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080)
-                format.setByteBuffer("csd-0", java.nio.ByteBuffer.wrap(sequence))
-                format.setByteBuffer("csd-1", java.nio.ByteBuffer.wrap(picture))
-                configure(format, surface, null, 0)
-                start()
-            }
-        }
-        if (!keyframe && waitForIdr) return
-        val dec = codec ?: return
-        try {
-            val index = dec.dequeueInputBuffer(0)
-            if (index >= 0) {
-                val input = dec.getInputBuffer(index) ?: return
-                if (input.capacity() < length) { dec.queueInputBuffer(index, 0, 0, ptsUs, 0); return }
-                input.clear()
-                input.put(bytes, offset, length)
-                dec.queueInputBuffer(index, 0, length, ptsUs, if (keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
-                ptsUs += 16_667 // Monotonic presentation order; XR compositor owns display timing.
-                if (keyframe) waitForIdr = false
-            }
-            var out = dec.dequeueOutputBuffer(info, 0)
-            while (out >= 0) {
-                dec.releaseOutputBuffer(out, true)
-                out = dec.dequeueOutputBuffer(info, 0)
-            }
-        } catch (error: IllegalStateException) {
-            close()
-        }
-    }
-
-    fun close() {
-        val value = codec
-        codec = null
-        if (value != null) {
-            runCatching { value.stop() }
-            runCatching { value.release() }
-        }
-        waitForIdr = true
     }
 }
 
