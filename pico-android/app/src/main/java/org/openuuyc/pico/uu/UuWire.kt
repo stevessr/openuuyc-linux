@@ -242,7 +242,7 @@ internal object UuWire {
         var echo = false
         var echoAck = false
         var screen: Int? = null
-        var videoTrack: Int? = null
+        val tracksByScreen = mutableMapOf<Int, Int>()
         while(!top.done()) {
             val tag = top.long().toInt()
             require(tag > 0)
@@ -271,16 +271,19 @@ internal object UuWire {
                         if (field ushr 3 == 2) screen = sources.long().toInt()
                         else if (field ushr 3 == 1) {
                             val entry = Reader(sources.len())
+                            var entryId: Int? = null
+                            var entryTrack: Int? = null
                             while (!entry.done()) {
                                 val screenField = entry.long().toInt()
                                 when(screenField ushr 3) {
-                                    1 -> {
-                                        val value = entry.long().toInt()
-                                        if (screen == null) screen = value
-                                    }
-                                    12 -> videoTrack = entry.long().toInt()
+                                    1 -> entryId = entry.long().toInt()
+                                    12 -> entryTrack = entry.long().toInt()
                                     else -> entry.skip(screenField and 7)
                                 }
+                            }
+                            if (entryId != null && entryTrack != null && entryId >= 0 && entryTrack >= 0) {
+                                tracksByScreen[entryId] = entryTrack
+                                if (screen == null) screen = entryId
                             }
                         } else sources.skip(field and 7)
                     }
@@ -288,7 +291,7 @@ internal object UuWire {
                 else -> top.skip(tag and 7)
             }
         }
-        return Envelope(sequence, timestamp, echo, screen, videoTrack, echoAck)
+        return Envelope(sequence, timestamp, echo, screen, screen?.let(tracksByScreen::get), echoAck)
     }
 
     fun signalEndpoint(endpoint: String): String {
