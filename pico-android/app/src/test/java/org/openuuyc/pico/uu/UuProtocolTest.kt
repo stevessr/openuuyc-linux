@@ -24,6 +24,20 @@ class UuProtocolTest {
         assertTrue(options.toList().containsAll(UuContract.VERSION.toByteArray().toList()))
     }
 
+    @Test fun videoTrackBindingRespectsSelectedScreenNotLastScreen() {
+        // PB ScreenSources: screen 1 -> track 10; screen 2 -> track 11;
+        // current_screen_id is 1 and must not inherit the last screen's track.
+        val packet = byteArrayOf(
+            0x3a, 0x0e,
+            0x0a, 0x04, 0x08, 0x01, 0x60, 0x0a,
+            0x0a, 0x04, 0x08, 0x02, 0x60, 0x0b,
+            0x10, 0x01
+        )
+        val decoded = UuWire.decodeEnvelope(packet)
+        assertEquals(1, decoded.screenId)
+        assertEquals(10, decoded.videoTrackIndex)
+    }
+
     @Test fun videoTrackRegistrationAndCaptureUseUuProtobuf() {
         val register = UuWire.registerVideoTrack(9, 0)
         val capture = UuWire.startVideoCapture(10, 2)
