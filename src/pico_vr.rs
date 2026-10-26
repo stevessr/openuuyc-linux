@@ -5,7 +5,7 @@
 //! interaction into desktop pointer/keyboard input. This module does not
 //! pretend to be a standalone PICO OS client or a stereoscopic video decoder.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -50,7 +50,7 @@ fn running_process(name: &str) -> bool {
                 .is_some_and(|arg0| {
                     Path::new(OsStr::from_bytes(arg0))
                         .file_name()
-                        .is_some_and(|filename| filename == name)
+                        .is_some_and(|filename| filename == OsStr::new(name))
                 })
         })
     })
