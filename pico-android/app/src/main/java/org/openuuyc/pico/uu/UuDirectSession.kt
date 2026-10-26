@@ -80,6 +80,8 @@ internal class UuDirectSession(
     private var pendingTrackSeq: Long? = null
     private var pressed = false
     private var signalingConnected = false
+    private var answerInstalled = false
+    private val pendingRemoteCandidates = ArrayList<IceCandidate>()
     private val appControlId = UUID.randomUUID().toString()
 
     @Synchronized fun start(xrSurface: Surface) {
@@ -187,7 +189,13 @@ internal class UuDirectSession(
             "answer", "restart_ice" -> {
                 val sdp = if (compressed != null) UuWire.ungzip(compressed) else data.optString("sdp")
                 if (sdp.isBlank()) return
+                answerInstalled = false
                 peer?.setRemoteDescription(sdpObserver(onSuccess = {
+                    synchronized(this@UuDirectSession) {
+                        answerInstalled = true
+                        pendingRemoteCandidates.forEach { peer?.addIceCandidate(it) }
+                        pendingRemoteCandidates.clear()
+                    }
                     emit("UU WebRTC SDP 已接受")
                 }), SessionDescription(SessionDescription.Type.ANSWER, sdp))
             }
@@ -195,8 +203,10 @@ internal class UuDirectSession(
                 val ice = data.optJSONObject("candidate") ?: return
                 val candidate = ice.optString("candidate")
                 if (candidate.isNotBlank()) {
-                    peer?.addIceCandidate(IceCandidate(ice.optString("sdpMid", "0"),
-                        ice.optInt("sdpMLineIndex", 0), candidate))
+                    val next = IceCandidate(ice.optString("sdpMid", "0"),
+                        ice.optInt("sdpMLineIndex", 0), candidate)
+                    if (answerInstalled) peer?.addIceCandidate(next)
+                    else if (pendingRemoteCandidates.size < 128) pendingRemoteCandidates.add(next)
                 }
             }
         }
@@ -432,6 +442,8 @@ internal class UuDirectSession(
         if (pressed) sendControl("""{"action":"mouse_release","button":1}""".toByteArray())
         pressed = false
         inputReady = false
+        answerInstalled = false
+        pendingRemoteCandidates.clear()
         renderer?.let { video?.removeSink(it) }
         video = null
         channels.forEach { runCatching { it.close() } }
