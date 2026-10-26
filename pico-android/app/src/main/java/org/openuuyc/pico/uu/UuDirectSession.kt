@@ -135,24 +135,7 @@ internal class UuDirectSession(
                 emit("UU 房间已登录，发送原生控制握手")
             }
             frame.startsWith("432") -> {
-                val array = JSONArray(frame.removePrefix("432"))
-                val response = array.optJSONObject(0) ?: throw IllegalArgumentException("control ACK missing")
-                val clientId = response.optString("client_id")
-                val iceId = response.optString("ice_id")
-                if (clientId.isBlank() || iceId.isBlank()) throw IllegalArgumentException("invalid control ACK")
-                val servers = mutableListOf<ServerIce>()
-                val raw = response.optJSONArray("iceServers")
-                if (raw != null) for (i in 0 until raw.length()) {
-                    val obj = raw.optJSONObject(i) ?: continue
-                    val rawUrls = obj.opt("urls")
-                    val urls = when(rawUrls) {
-                        is String -> listOf(rawUrls)
-                        is JSONArray -> (0 until rawUrls.length()).map { rawUrls.getString(it) }
-                        else -> emptyList()
-                    }
-                    if (urls.isNotEmpty()) servers.add(ServerIce(urls, obj.optString("username"), obj.optString("credential")))
-                }
-                controlInfo = ControlReply(clientId, iceId, appControlId, servers)
+                controlInfo = UuWire.parseControlAck(frame, appControlId)
                 emit("UU 控制握手已确认，启动设备直连 WebRTC")
                 createPeer(controlInfo!!)
             }
@@ -279,7 +262,8 @@ internal class UuDirectSession(
         }
         connection.createOffer(sdpObserver(onCreated = { desc ->
             connection.setLocalDescription(sdpObserver(onSuccess = {
-                val zip = UuWire.gzip(desc.description.toByteArray(StandardCharsets.UTF_8))
+                val wireSdp = UuWire.uuOfferSdp(desc.description)
+                val zip = UuWire.gzip(wireSdp.toByteArray(StandardCharsets.UTF_8))
                 socket?.send(UuWire.offerHeader(info))
                 socket?.send(ByteString.of(*UuWire.attachment(zip)))
                 emit("UU WebRTC offer 已通过原生 Socket.IO 发送")

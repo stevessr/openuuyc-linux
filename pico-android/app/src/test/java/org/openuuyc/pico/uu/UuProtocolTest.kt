@@ -55,6 +55,38 @@ class UuProtocolTest {
         assertEquals(sdp, UuWire.ungzip(UuWire.attachment(UuWire.gzip(sdp.toByteArray()))))
     }
 
+    @Test fun controlAckRequiresSuccessThenValidIceConfiguration() {
+        val ice = JSONObject().put("urls", "stun:stun.example.org:3478")
+        val info = JSONObject()
+            .put("code", 0)
+            .put("client_id", "controller-id")
+            .put("ice_id", "ice-id")
+            .put("iceServers", org.json.JSONArray().put(ice))
+        val frame = "432" + org.json.JSONArray().put("success").put(info)
+        val control = UuWire.parseControlAck(frame, "session-id")
+        assertEquals("controller-id", control.clientId)
+        assertEquals("ice-id", control.iceId)
+        assertEquals("session-id", control.appControlId)
+        assertEquals(1, control.iceServers.size)
+        assertThrows(IllegalArgumentException::class.java) {
+            UuWire.parseControlAck("432" + org.json.JSONArray().put(info), "session-id")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            UuWire.parseControlAck("432" + org.json.JSONArray().put("failed").put(info), "session-id")
+        }
+    }
+
+    @Test fun uuOfferAddsTransportExtensionsOnlyToSignalingCopy() {
+        val source = "v=0\r\na=group:BUNDLE 0 1\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\na=sendrecv\r\n"
+        val out = UuWire.uuOfferSdp(source)
+        assertTrue(out.contains("a=msid-semantic: WMS audio_0\r\n"))
+        assertTrue(out.contains("a=max-message-size:524288\r\n"))
+        assertTrue(out.contains("a=extmap-allow-mixed"))
+        assertFalse(out.contains("a=sendrecv"))
+        assertEquals(source, source)
+        assertEquals(out, UuWire.uuOfferSdp(out))
+    }
+
     @Test fun controlWireHasBinaryPlaceholderAndValidJson() {
         val (header, frame) = UuWire.controlEvent("abcdefghijklmnop", "control-id")
         assertTrue(header.startsWith("451-2"))

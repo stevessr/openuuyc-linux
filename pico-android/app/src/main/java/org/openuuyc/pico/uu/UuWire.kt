@@ -259,6 +259,63 @@ internal object UuWire {
     fun event(name: String, payload: JSONObject) =
         "42" + JSONArray().put(name).put(payload).toString()
 
+    /**
+     * The desktop Rust client modifies only the signaling-copy of SDP.
+     * UU's application section requires ordered SCTP message-size and optional
+     * mix-KCP attributes; the local WebRTC SDP must stay unchanged.
+     */
+    fun uuOfferSdp(sdp: String, streams: String = "audio_0"): String {
+        val separator = if (sdp.contains("\r\n")) "\r\n" else "\n"
+        val lines = sdp.lines().map { it.trimEnd('\r') }.filter { it.isNotEmpty() }.toMutableList()
+        require(lines.any { it.startsWith("m=application ") }) { "UU SDP missing application channel" }
+        lines.removeAll { it.startsWith("a=msid-semantic:") }
+        val firstMedia = lines.indexOfFirst { it.startsWith("m=") }
+        require(firstMedia >= 0)
+        val bundle = lines.subList(0, firstMedia).indexOfFirst { it.startsWith("a=group:BUNDLE") }
+        val insertAt = if (bundle >= 0) bundle + 1 else firstMedia
+        val attrs = listOf("a=extmap-allow-mixed", "a=msid-semantic: WMS $streams")
+        attrs.asReversed().forEach { if (it !in lines.subList(0, firstMedia)) lines.add(insertAt, it) }
+        val app = lines.indexOfFirst { it.startsWith("m=application ") }
+        var end = (app + 1 until lines.size).firstOrNull { lines[it].startsWith("m=") } ?: lines.size
+        for (i in end - 1 downTo app + 1) {
+            if (lines[i] == "a=sendrecv" || lines[i].startsWith("a=x-uuremote-mix-kcp:")) {
+                lines.removeAt(i)
+            }
+        }
+        end = (app + 1 until lines.size).firstOrNull { lines[it].startsWith("m=") } ?: lines.size
+        val sctp = (app + 1 until end).firstOrNull { lines[it].startsWith("a=sctp-port:") }
+        val attrAt = if (sctp != null) sctp + 1 else end
+        val messageSize = "a=max-message-size:524288"
+        if (messageSize !in lines.subList(app + 1, end)) lines.add(attrAt, messageSize)
+        // Disable mixed KCP until Android libwebrtc has a compatible transport.
+        return lines.joinToString(separator, postfix = separator)
+    }
+
+    /** Desktop-compatible Socket.IO control ACK: ["success", ControlSessionInfo]. */
+    fun parseControlAck(frame: String, appControlId: String): ControlReply {
+        require(frame.startsWith("432")) { "incorrect UU control ACK id" }
+        val arr = JSONArray(frame.removePrefix("432"))
+        require(arr.length() >= 2 && arr.optString(0) == "success") { "UU controller was not accepted" }
+        val response = arr.optJSONObject(1) ?: throw IllegalArgumentException("UU control config missing")
+        require(response.optInt("code", -1) == 0) { "UU control rejected" }
+        val clientId = response.optString("client_id")
+        val iceId = response.optString("ice_id")
+        require(clientId.isNotBlank() && iceId.isNotBlank()) { "UU control IDs missing" }
+        val servers = mutableListOf<ServerIce>()
+        val raw = response.optJSONArray("iceServers")
+        if (raw != null) for (index in 0 until raw.length()) {
+            val item = raw.optJSONObject(index) ?: continue
+            val urls = when(val value = item.opt("urls")) {
+                is String -> listOf(value)
+                is JSONArray -> (0 until value.length()).mapNotNull { value.optString(it).takeIf(String::isNotBlank) }
+                else -> emptyList()
+            }
+            if (urls.isNotEmpty()) servers.add(ServerIce(urls, item.optString("username"), item.optString("credential")))
+        }
+        require(servers.isNotEmpty()) { "UU control did not provide ICE servers" }
+        return ControlReply(clientId, iceId, appControlId, servers)
+    }
+
     fun offerHeader(info: ControlReply): String {
         val envelope = JSONObject()
             .put("client_id", info.clientId)
