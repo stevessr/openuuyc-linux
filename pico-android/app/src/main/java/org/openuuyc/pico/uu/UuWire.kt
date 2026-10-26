@@ -144,6 +144,34 @@ internal object UuWire {
         }
     }
 
+    /** Register the negotiated RTP video track before requesting capture. */
+    fun registerVideoTrack(sequence: Long, index: Int): ByteArray {
+        require(index in 0..64) { "invalid UU video-track index" }
+        val tracks = message { out -> integer(out, 1, index.toLong()) }
+        val rpc = message { out ->
+            bytes(out, 1, message { header -> integer(header, 1, sequence) })
+            bytes(out, 15, tracks)
+        }
+        return message { out ->
+            integer(out, 1, sequence)
+            integer(out, 2, System.currentTimeMillis())
+            bytes(out, 21, rpc)
+        }
+    }
+
+    /** Request capture through UU SimpleAction 8, same as the desktop controller. */
+    fun startVideoCapture(sequence: Long, screenId: Int): ByteArray {
+        require(screenId >= 0) { "missing remote screen" }
+        val action = message { out ->
+            integer(out, 1, 8)
+            bytes(out, 2, JSONObject().put("screen_id", screenId).toString().utf8())
+        }
+        return message { out ->
+            integer(out, 1, sequence)
+            bytes(out, 3, action)
+        }
+    }
+
     fun echoRequest(): ByteArray {
         // PbControlMessage.payload = SimpleAction(field3)
         val action = message { simple ->
@@ -166,7 +194,14 @@ internal object UuWire {
         }
     }
 
-    data class Envelope(val seq: Long, val timestamp: Long, val echoRequest: Boolean, val screenId: Int?)
+    data class Envelope(
+        val seq: Long,
+        val timestamp: Long,
+        val echoRequest: Boolean,
+        val screenId: Int?,
+        val videoTrackIndex: Int? = null,
+        val echoResponse: Boolean = false
+    )
     private class Reader(private val data: ByteArray) {
         var offset = 0
         fun long(): Long {
@@ -205,7 +240,9 @@ internal object UuWire {
         var sequence = 0L
         var timestamp = 0L
         var echo = false
+        var echoAck = false
         var screen: Int? = null
+        var videoTrack: Int? = null
         while(!top.done()) {
             val tag = top.long().toInt()
             require(tag > 0)
@@ -217,7 +254,12 @@ internal object UuWire {
                     while(!sub.done()) {
                         val field = sub.long().toInt()
                         when(field ushr 3) {
-                            1 -> echo = sub.long() == 0L
+                            1 -> {
+                                when (sub.long()) {
+                                    0L -> echo = true
+                                    1L -> echoAck = true
+                                }
+                            }
                             else -> sub.skip(field and 7)
                         }
                     }
@@ -231,8 +273,14 @@ internal object UuWire {
                             val entry = Reader(sources.len())
                             while (!entry.done()) {
                                 val screenField = entry.long().toInt()
-                                if (screenField ushr 3 == 1 && screen == null) screen = entry.long().toInt()
-                                else entry.skip(screenField and 7)
+                                when(screenField ushr 3) {
+                                    1 -> {
+                                        val value = entry.long().toInt()
+                                        if (screen == null) screen = value
+                                    }
+                                    12 -> videoTrack = entry.long().toInt()
+                                    else -> entry.skip(screenField and 7)
+                                }
                             }
                         } else sources.skip(field and 7)
                     }
@@ -240,7 +288,7 @@ internal object UuWire {
                 else -> top.skip(tag and 7)
             }
         }
-        return Envelope(sequence, timestamp, echo, screen)
+        return Envelope(sequence, timestamp, echo, screen, videoTrack, echoAck)
     }
 
     fun signalEndpoint(endpoint: String): String {

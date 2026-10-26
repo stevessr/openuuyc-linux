@@ -24,6 +24,15 @@ class UuProtocolTest {
         assertTrue(options.toList().containsAll(UuContract.VERSION.toByteArray().toList()))
     }
 
+    @Test fun videoTrackRegistrationAndCaptureUseUuProtobuf() {
+        val register = UuWire.registerVideoTrack(9, 0)
+        val capture = UuWire.startVideoCapture(10, 2)
+        assertEquals(9L, UuWire.decodeEnvelope(register).seq)
+        assertEquals(10L, UuWire.decodeEnvelope(capture).seq)
+        assertThrows(IllegalArgumentException::class.java) { UuWire.registerVideoTrack(11, -1) }
+        assertThrows(IllegalArgumentException::class.java) { UuWire.startVideoCapture(12, -2) }
+    }
+
     @Test fun captureSettingUsesUuRpcAndDoesNotRequestPhysicalResize() {
         val capture = UuWire.captureSetting(81)
         assertTrue(capture.size > 40)

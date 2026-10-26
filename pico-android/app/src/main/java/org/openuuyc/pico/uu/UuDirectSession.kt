@@ -66,6 +66,9 @@ internal class UuDirectSession(
     private var inputReady = false
     private var captureRequested = false
     private var pbConnected = false
+    private var selectedTrackIndex: Int? = null
+    private var nextRequestSeq = 2L
+    private var trackRequested = false
     private var pressed = false
     private var signalingConnected = false
     private val appControlId = UUID.randomUUID().toString()
@@ -310,13 +313,16 @@ internal class UuDirectSession(
                 try {
                     val payload = UuWire.decodeEnvelope(bytes)
                     if (channel.label() == "CONTROL_DATA_CHANNEL") {
-                        pbConnected = true
                         if (payload.echoRequest) {
                             sendControl(UuWire.echoResponse(payload.seq, payload.timestamp))
+                            pbConnected = true
                         }
+                        if (payload.echoResponse) pbConnected = true
                     }
                     if (payload.screenId != null && payload.screenId >= 0)
                         currentScreen = payload.screenId
+                    if (payload.videoTrackIndex != null && payload.videoTrackIndex >= 0)
+                        selectedTrackIndex = payload.videoTrackIndex
                     maybeStartCapture()
                     inputReady = pbConnected && captureRequested &&
                         currentScreen != null &&
@@ -333,12 +339,22 @@ internal class UuDirectSession(
         if (captureRequested || !pbConnected || currentScreen == null) return
         if (controlChannel?.state() != DataChannel.State.OPEN ||
             textChannel?.state() != DataChannel.State.OPEN) return
-        // UU runtime CaptureSetting RPC is a protobuf payload with SCTP TEXT PPID.
-        val payload = UuWire.captureSetting()
-        captureRequested = textChannel?.send(
-            DataChannel.Buffer(ByteBuffer.wrap(payload), false)
-        ) == true
-        if (captureRequested) emit("UU 屏幕控制已协商，申请远端 H.264 画面")
+        val text = textChannel ?: return
+        val trackIndex = selectedTrackIndex ?: return
+        // UU's track registration precedes capture, both on reliable TEXT
+        // PPID. The selected track must come from the host's ScreenSources.
+        if (!trackRequested) {
+            val trackPacket = UuWire.registerVideoTrack(nextRequestSeq++, trackIndex)
+            trackRequested = text.send(DataChannel.Buffer(ByteBuffer.wrap(trackPacket), false))
+        }
+        if (!trackRequested) return
+        val capturePacket = UuWire.startVideoCapture(nextRequestSeq++, currentScreen!!)
+        if (!text.send(DataChannel.Buffer(ByteBuffer.wrap(capturePacket), false))) return
+        // UE CaptureSetting snapshot is a separate RPC, not a substitute for
+        // SimpleAction start-capture.
+        val payload = UuWire.captureSetting(nextRequestSeq++)
+        captureRequested = text.send(DataChannel.Buffer(ByteBuffer.wrap(payload), false))
+        if (captureRequested) emit("UU 视频轨道已注册，申请远端 H.264 画面")
     }
 
     @Synchronized private fun sendControl(data: ByteArray): Boolean {
