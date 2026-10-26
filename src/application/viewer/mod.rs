@@ -554,6 +554,8 @@ impl NativeViewerSession {
         let binding =
             (screen.id as u32 as u64) | ((screen.display.screen_type as u32 as u64) << 32);
         let changed = self.screen_binding.swap(binding, Ordering::AcqRel) != binding;
+        #[cfg(target_os = "linux")]
+        pico_bridge::select_screen(screen.id);
         if changed {
             mutex_lock(&self.frame_queue).take();
             self.manager_wake.unpark();
