@@ -3,6 +3,7 @@ package org.openuuyc.pico.uu
 import android.content.Context
 import android.os.Build
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -86,10 +87,8 @@ internal data class UuRoom(
         require(token.isNotBlank() && endpoints.isNotEmpty())
         require(endpoints.all {
             try {
-                val candidate = okhttp3.HttpUrl.Builder()
-                val url = okhttp3.HttpUrl.Companion.toHttpUrlOrNull(
-                    if (it.contains("://")) it.replaceFirst("wss://", "https://") else "https://$it"
-                )
+                val url = (if (it.contains("://")) it.replaceFirst("wss://", "https://") else "https://$it")
+                    .toHttpUrlOrNull()
                 url != null && url.scheme == "https" && !url.host.isBlank()
             } catch (_: Exception) { false }
         })
@@ -170,7 +169,7 @@ internal class UuNrdApi(private val context: Context) {
     }
 
     fun createQr(): UuQr {
-        val json = request("POST", "/api/v1/qrcode/gen/login", JSONObject())
+        val json = request("POST", "/api/v1/qrcode/gen/login")
         val url = json.getString("qrcode_jump_url")
         val token = json.getString("token")
         return UuQr(url, token, json.optString("status_query_ticket", token))

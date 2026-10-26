@@ -1,5 +1,6 @@
 package org.openuuyc.pico.uu
 
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -213,9 +214,7 @@ internal object UuWire {
 
     fun signalEndpoint(endpoint: String): String {
         val normalized = if (endpoint.contains("://")) endpoint else "wss://$endpoint"
-        val url = okhttp3.HttpUrl.Companion.toHttpUrlOrNull(
-            normalized.replaceFirst("wss://", "https://")
-        ) ?: throw IllegalArgumentException("invalid UU signal endpoint")
+        val url = normalized.replaceFirst("wss://", "https://").toHttpUrlOrNull() ?: throw IllegalArgumentException("invalid UU signal endpoint")
         require(url.scheme == "https" && url.username.isEmpty() && url.password.isEmpty())
         return url.newBuilder()
             .encodedPath(if (url.encodedPath == "/") "/socket.io/" else url.encodedPath)

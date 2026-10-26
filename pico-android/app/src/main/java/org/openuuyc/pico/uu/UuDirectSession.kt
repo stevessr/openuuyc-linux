@@ -84,10 +84,20 @@ internal class UuDirectSession(
                 ws.send("40") // Socket.IO namespace CONNECT
             }
             override fun onMessage(ws: WebSocket, text: String) {
-                if (text.length <= 1024 * 1024) synchronized(this@UuDirectSession) { parseMessage(text) }
+                if (text.length <= 1024 * 1024) synchronized(this@UuDirectSession) {
+                    runCatching { parseMessage(text) }.onFailure {
+                        emit("UU 信令帧解析失败")
+                        ws.close(1002, "invalid UU protocol frame")
+                    }
+                }
             }
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
-                if (bytes.size <= 1024 * 1024) synchronized(this@UuDirectSession) { parseBinary(bytes.toByteArray()) }
+                if (bytes.size <= 1024 * 1024) synchronized(this@UuDirectSession) {
+                    runCatching { parseBinary(bytes.toByteArray()) }.onFailure {
+                        emit("UU 二进制信令无效")
+                        ws.close(1002, "invalid UU binary frame")
+                    }
+                }
             }
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 emit("UU 信令连接失败：${t.javaClass.simpleName}")
@@ -279,7 +289,7 @@ internal class UuDirectSession(
         if (track !is VideoTrack) return
         synchronized(this) {
             if (video === track) return
-            video?.removeSink(renderer)
+            renderer?.let { video?.removeSink(it) }
             video = track
             renderer?.let { track.addSink(it) }
         }
@@ -351,7 +361,7 @@ internal class UuDirectSession(
         if (pressed) sendControl("""{"action":"mouse_release","button":1}""".toByteArray())
         pressed = false
         inputReady = false
-        video?.removeSink(renderer)
+        renderer?.let { video?.removeSink(it) }
         video = null
         channels.forEach { runCatching { it.close() } }
         channels.clear()

@@ -1,34 +1,37 @@
-# OpenUUYC PICO 原生头显客户端
+# OpenUUYC PICO — UU 协议直连开发版
 
-这一目录是 **Android/arm64 OpenXR 客户端（APK）**，不是 Linux WayVR 窗口映射。原生引擎通过 PICO OpenXR 运行时建立双眼空间四边形图层，`XR_KHR_android_surface_swapchain` 直接返回 Android Surface，MediaCodec 以 H.264 硬解码输出到图层；控制器通过 OpenXR Action（PICO 4/4S/Neo3、simple_controller 回退）获得 aim/trigger 并映射为屏幕绝对坐标与鼠标按键。
+## 架构
 
-## 支持的连接方式
+原生 Android APK 自主运行以下代码：`UuNrdApi.kt`（匹配桌面端 `src/account/api/mod.rs` 的 NRD REST/HMAC 和二维码登录）、`UuWire.kt`（Socket.IO v4、控制握手、UU protobuf ConnectOptions/ECHO、gzip SDP）、`UuDirectSession.kt`（原生 Android libwebrtc / UU DataChannel、ICE、视频接收、原生指针输入），以及 `xr_client.cpp`（PICO OpenXR/GLES 双眼空间四边形层）。
 
-现阶段桥接的 **UU 登录、设备发现、WebRTC/ICE、视频协商与输入发送均仍由 Linux OpenUUYC 主控端负责**。头显是 Linux 主控的原生 OpenXR 显示/交互终端，不是直接登录 UU 云的独立第三方客户端。
+PICO 在本机进行 UU 登录，获取设备列表和加入房间；**不需要运行 Linux OpenUUYC、不经过本机 WebSocket 桥接、无需 ADB reverse**。Android 和 PICO 头显本身通过 UU Socket.IO WebRTC 向被控主机连接。
 
-为了避免在 LAN 明文传输令牌、屏幕与控制事件，Linux 桥接程序固定仅监听 `127.0.0.1:18765`；**必须**通过 USB ADB reverse 或自行建立安全 TLS 隧道接入。不能直接用 PICO 的局域网 IP 访问桥接。不要在公共网络开放/映射 18765 端口。
+请注意：这里是 *协议实现开发版*，编译通过不代表已经与真实 UU Windows/Linux 主机完成互操作测试。
 
-### USB ADB 操作流程
+## 使用
 
-1. 在 Linux 上构建最新 OpenUUYC，运行 `OPENUUYC_PICO_BRIDGE_TOKEN="$(openssl rand -hex 32)" OpenUUYC gui --codec h264`。**注意保存这次生成的令牌**，头显端需要填写同一个令牌。更建议生成并以当前 shell 会话变量复用：
+1. 在 Actions 的 `PICO Android OpenXR` 工作流下载 arm64 debug APK，安装到 PICO。
+2. 连接互联网，打开应用，点击「使用 UU 二维码登录」，使用另一台设备的 UU 客户端扫码确认。
+3. 设备列表展示在线、可被控且无占用的设备；选择目标后将直接请求 NRD 房间，执行原生信令与 WebRTC 连接。
+4. 头显将显示双眼空间四边形窗口；使用已连接手柄瞄准和扳机进行远程鼠标控制。
 
-   ```sh
-   export OPENUUYC_PICO_BRIDGE_TOKEN="$(openssl rand -hex 32)"
-   printf 'PICO pairing token: %s\n' "$OPENUUYC_PICO_BRIDGE_TOKEN"
-   OpenUUYC gui --codec h264
-   ```
+## 功能状态
 
-2. 以原有 UU 登录与远控界面连接目标电脑、开启远端输入。初始化观看窗口时桥接服务器才会启动。服务监听 127.0.0.1:18765。
-3. 在 PICO 开发者模式开启 USB 调试并连接主机，`adb devices` 检查授权，再执行 `adb reverse tcp:18765 tcp:18765`。
-4. 从 [PICO Android OpenXR](../../.github/workflows/pico-android.yml) Actions 下载 `openuuyc-pico-debug-arm64` APK，`adb install -r app-debug.apk`。
-5. 在头显启动 **OpenUUYC PICO**，输入 Linux 上生成的令牌，点击开始。VR 内出现远控屏幕，用右手柄射线瞄准、扳机点击；无右手柄时可用左手柄。
+| 子系统 | 状态 |
+| --- | --- |
+| UU NRD 签名 REST / 设备身份注册 | 实现代码，CI 测试 HMAC/请求合约 |
+| 二维码登录、设备列表、加入房间 | 实现代码，需真实账号联测 |
+| Socket.IO 握手及控制请求、WebRTC ICE/SDP | 实现代码，需真实 UU 信令服务器联测 |
+| WebRTC H.264 -> EglRenderer -> OpenXR Android Surface | 实现代码，需实机帧呈现验证 |
+| 远程鼠标绝对坐标、按键 | 使用 UU CONTROL_DATA_CHANNEL 原生 JSON 格式；发送前检查控制通道和屏幕 ID |
+| 完整 UU protobuf CaptureSetting/屏幕/心跳、Mixed KCP、音频、键盘、文件传输 | **尚未实现完整互通** |
 
-开发者本机可直接 `cd pico-android && gradle :app:testDebugUnitTest :app:assembleDebug`，需要 JDK 17、Android SDK 35、NDK 27.2、CMake 3.22.1。CI 会编译 OpenXR C++、验证 Android H.264 Annex-B 解析与 Linux Rust 桥接层的单元测试，并上传可安装的 arm64 APK。无实体设备时 CI 不能证明 OpenXR 运行时、手柄映射、延迟、热插拔或 MediaCodec 视频播放正确。
+## CI
 
-## 边界与后续
+工作流 `.github/workflows/pico-android.yml` 包含 JVM 协议单测、Android Lint、arm64 JNI/OpenXR 构建和 Linux 对照端检查。Actions **无法模拟真实 UU 服务和 PICO 追踪环境**。QR 账号有效性、信令握手顺序、H264 播放和鼠标真正控制远端机器仍需要物理头显与主机双端联测。
 
-- **已有**：标准 OpenXR 实例/会话/生命周期、GLES3、Surface swapchain、立体空间层显示、MediaCodec H.264、控制器 6DoF 射线与 trigger 映射、认证/控制释放、桥接单连接、GitHub Actions 构建和测试。
-- **尚未有**：独立 PICO APK 直接向 UU 服务登录/建立 WebRTC、音频输出与麦克风回传、手部骨骼追踪、游戏手柄全按键、HDR/AV1/HEVC、无损全真彩与 PICO 原生低延迟调优、多窗口/VR 立体远端内容。独立直连需要拆出可移植 Rust UU 协议核心并建立 JNI/FFI；不应把这个桥接原型包装成以上功能已经完成。
-- 网络协议：首个文本消息 `{"type":"auth","token":"..."}`，验证后收到 `hello(version=1,codec=h264)`；二进制帧格式为字节 0 值 1、字节 1 为关键帧标记、后续为 H.264 Annex-B。控制消息 `control(enabled)`、`pointer(u,v,down)`、`key(vk,down)` 与 `scroll(delta)` 使用 UTF-8 JSON。远端输入本身继续经过既有 UU 控制通道和安全校验。
+## 安全
 
-兼容设备以官方 PICO OpenXR SDK 为准（Neo3、PICO 4 系列、4 Ultra，OS 5.13+ 为统一开发基线）。实际需针对不同固件检查与适配。
+NRD 登录只请求 https；信令仅使用 wss；应用通过 `usesCleartextTraffic=false` 禁止明文网络。授权令牌只保存在内存中、不写日志；当前版本退出应用需要重新扫码，不做明文自动登录。本实现仅提供已登录且可控设备的正常远程控制，不自动接管已有会话。
+
+保留的 Linux `pico_bridge.rs` 仅作为旧实验性桥接方案，不再是原生 APK 的默认架构。
