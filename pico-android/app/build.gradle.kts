@@ -8,6 +8,7 @@ android {
     defaultConfig {
         applicationId = "org.openuuyc.pico"
         minSdk = 29
+        ndkVersion = "27.2.12479018"
         targetSdk = 32
         versionCode = 1
         versionName = "0.1.0"
