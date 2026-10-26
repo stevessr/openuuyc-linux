@@ -76,6 +76,8 @@ internal class UuDirectSession(
     private var selectedTrackIndex: Int? = null
     private var nextRequestSeq = 2L
     private var trackRequested = false
+    private var trackRegistered = false
+    private var pendingTrackSeq: Long? = null
     private var pressed = false
     private var signalingConnected = false
     private val appControlId = UUID.randomUUID().toString()
@@ -331,6 +333,18 @@ internal class UuDirectSession(
                         currentScreen = payload.screenId
                     if (payload.videoTrackIndex != null && payload.videoTrackIndex >= 0)
                         selectedTrackIndex = payload.videoTrackIndex
+                    if (pendingTrackSeq != null && payload.trackAckId == pendingTrackSeq) {
+                        if (payload.trackAckError == 0) {
+                            trackRegistered = true
+                            emit("UU 视频轨道注册确认成功")
+                        } else {
+                            emit("UU 视频轨道注册被拒绝（错误码 ${payload.trackAckError}）")
+                            trackRequested = false
+                            trackRegistered = false
+                            pendingTrackSeq = null
+                            return
+                        }
+                    }
                     maybeStartCapture()
                     inputReady = pbConnected && captureRequested &&
                         currentScreen != null &&
@@ -373,10 +387,15 @@ internal class UuDirectSession(
         // UU's track registration precedes capture, both on reliable TEXT
         // PPID. The selected track must come from the host's ScreenSources.
         if (!trackRequested) {
-            val trackPacket = UuWire.registerVideoTrack(nextRequestSeq++, trackIndex)
+            val sequence = nextRequestSeq++
+            val trackPacket = UuWire.registerVideoTrack(sequence, trackIndex)
             trackRequested = text.send(DataChannel.Buffer(ByteBuffer.wrap(trackPacket), false))
+            if (trackRequested) pendingTrackSeq = sequence
+            return
         }
-        if (!trackRequested) return
+        // Wait for the real SendVideoTrackRsp; sending start-capture before
+        // the host acknowledges the track can yield a permanent black screen.
+        if (!trackRegistered) return
         val capturePacket = UuWire.startVideoCapture(nextRequestSeq++, currentScreen!!)
         if (!text.send(DataChannel.Buffer(ByteBuffer.wrap(capturePacket), false))) return
         // UE CaptureSetting snapshot is a separate RPC, not a substitute for

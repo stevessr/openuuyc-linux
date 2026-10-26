@@ -24,6 +24,19 @@ class UuProtocolTest {
         assertTrue(options.toList().containsAll(UuContract.VERSION.toByteArray().toList()))
     }
 
+    @Test fun videoTrackRegistrationResponseBindsRequestId() {
+        // PbControlMessage.RpcResponse(22) { header(1) request_id=7,
+        // SendVideoTrackRsp(11) { error_code=0 } }.
+        val packet = byteArrayOf(
+            0xb2.toByte(), 0x01, 0x08,
+            0x0a, 0x02, 0x08, 0x07,
+            0x5a, 0x02, 0x08, 0x00
+        )
+        val decoded = UuWire.decodeEnvelope(packet)
+        assertEquals(7L, decoded.trackAckId)
+        assertEquals(0, decoded.trackAckError)
+    }
+
     @Test fun videoTrackBindingRespectsSelectedScreenNotLastScreen() {
         // PB ScreenSources: screen 1 -> track 10; screen 2 -> track 11;
         // current_screen_id is 1 and must not inherit the last screen's track.

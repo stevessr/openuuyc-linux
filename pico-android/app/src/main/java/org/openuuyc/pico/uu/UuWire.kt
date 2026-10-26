@@ -200,7 +200,9 @@ internal object UuWire {
         val echoRequest: Boolean,
         val screenId: Int?,
         val videoTrackIndex: Int? = null,
-        val echoResponse: Boolean = false
+        val echoResponse: Boolean = false,
+        val trackAckId: Long? = null,
+        val trackAckError: Int? = null
     )
     private class Reader(private val data: ByteArray) {
         var offset = 0
@@ -243,6 +245,8 @@ internal object UuWire {
         var echoAck = false
         var screen: Int? = null
         val tracksByScreen = mutableMapOf<Int, Int>()
+        var registeredRequest: Long? = null
+        var registrationError: Int? = null
         while(!top.done()) {
             val tag = top.long().toInt()
             require(tag > 0)
@@ -288,10 +292,44 @@ internal object UuWire {
                         } else sources.skip(field and 7)
                     }
                 }
+                22 -> {
+                    val rpc = Reader(top.len())
+                    var requestId: Long? = null
+                    var error: Int? = null
+                    var hasTrackReply = false
+                    while (!rpc.done()) {
+                        val tag2 = rpc.long().toInt()
+                        when(tag2 ushr 3) {
+                            1 -> {
+                                val header = Reader(rpc.len())
+                                while (!header.done()) {
+                                    val tag3 = header.long().toInt()
+                                    if (tag3 ushr 3 == 1) requestId = header.long()
+                                    else header.skip(tag3 and 7)
+                                }
+                            }
+                            11 -> {
+                                hasTrackReply = true
+                                val reply = Reader(rpc.len())
+                                error = 0
+                                while (!reply.done()) {
+                                    val tag3 = reply.long().toInt()
+                                    if (tag3 ushr 3 == 1) error = reply.long().toInt()
+                                    else reply.skip(tag3 and 7)
+                                }
+                            }
+                            else -> rpc.skip(tag2 and 7)
+                        }
+                    }
+                    if (hasTrackReply) {
+                        registeredRequest = requestId
+                        registrationError = error
+                    }
+                }
                 else -> top.skip(tag and 7)
             }
         }
-        return Envelope(sequence, timestamp, echo, screen, screen?.let(tracksByScreen::get), echoAck)
+        return Envelope(sequence, timestamp, echo, screen, screen?.let(tracksByScreen::get), echoAck, registeredRequest, registrationError)
     }
 
     fun signalEndpoint(endpoint: String): String {
