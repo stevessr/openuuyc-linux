@@ -32,5 +32,7 @@ android {
 dependencies {
     implementation("org.khronos.openxr:openxr_loader_for_android:1.1.63")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("io.github.webrtc-sdk:android:150.7871.01")
+    implementation("com.google.zxing:core:3.5.3")
     testImplementation("junit:junit:4.13.2")
 }
