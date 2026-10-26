@@ -28,6 +28,8 @@ import org.webrtc.VideoTrack
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -49,6 +51,11 @@ internal class UuDirectSession(
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
     private val closed = AtomicBoolean(false)
+    private val heartbeatExecutor = Executors.newSingleThreadScheduledExecutor { task ->
+        Thread(task, "OpenUUYC-UU-PB").apply { isDaemon = true }
+    }
+    private var echoRetry: ScheduledFuture<*>? = null
+    private var echoAttempts = 0
     private var socket: WebSocket? = null
     private var peer: PeerConnection? = null
     private var factory: PeerConnectionFactory? = null
@@ -293,7 +300,7 @@ internal class UuDirectSession(
                         when(channel.label()) {
                             "CONTROL_DATA_CHANNEL" -> {
                                 controlChannel = channel
-                                sendControl(UuWire.echoRequest())
+                                startPbHandshake()
                             }
                             "TEXT_DATA_CHANNEL" -> {
                                 textChannel = channel
@@ -318,6 +325,7 @@ internal class UuDirectSession(
                             pbConnected = true
                         }
                         if (payload.echoResponse) pbConnected = true
+                        if (pbConnected) echoRetry?.cancel(false)
                     }
                     if (payload.screenId != null && payload.screenId >= 0)
                         currentScreen = payload.screenId
@@ -333,6 +341,27 @@ internal class UuDirectSession(
                 }
             }
         })
+    }
+
+    /** Official desktop PB bootstrap retransmits ECHO every 500ms (at most 30). */
+    @Synchronized private fun startPbHandshake() {
+        echoRetry?.cancel(false)
+        echoAttempts = 0
+        echoRetry = heartbeatExecutor.scheduleAtFixedRate({
+            synchronized(this) {
+                if (closed.get() || pbConnected) {
+                    echoRetry?.cancel(false)
+                    return@synchronized
+                }
+                if (echoAttempts >= 30) {
+                    echoRetry?.cancel(false)
+                    emit("UU PB 握手超时，无法建立控制")
+                    return@synchronized
+                }
+                echoAttempts++
+                sendControl(UuWire.echoRequest())
+            }
+        }, 0, 500, TimeUnit.MILLISECONDS)
     }
 
     @Synchronized private fun maybeStartCapture() {
@@ -379,6 +408,8 @@ internal class UuDirectSession(
 
     @Synchronized override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        echoRetry?.cancel(false)
+        heartbeatExecutor.shutdownNow()
         if (pressed) sendControl("""{"action":"mouse_release","button":1}""".toByteArray())
         pressed = false
         inputReady = false
