@@ -29,6 +29,8 @@ mod display_transition;
 mod fullscreen_chrome;
 mod input_gate;
 mod polling_warning;
+#[cfg(target_os = "linux")]
+mod pico_bridge;
 
 #[cfg(windows)]
 mod windows_cursor;
@@ -448,6 +450,8 @@ impl NativeViewerSession {
                 idle: decode_idle,
             }),
         };
+        #[cfg(target_os = "linux")]
+        pico_bridge::attach(&session);
         Ok(session)
     }
 
