@@ -173,11 +173,9 @@ impl Drop for ActiveClient {
 }
 
 async fn client(stream: TcpStream, bridge: Arc<Bridge>) -> Result<()> {
-    let config = WebSocketConfig {
-        max_message_size: Some(MAX_FRAME + 2),
-        max_frame_size: Some(MAX_FRAME + 2),
-        ..Default::default()
-    };
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(MAX_FRAME + 2);
+    config.max_frame_size = Some(MAX_FRAME + 2);
     let mut ws = tokio_tungstenite::accept_async_with_config(stream, Some(config)).await?;
     let auth = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
         .await.context("auth timeout")?.context("client disconnected")??;
