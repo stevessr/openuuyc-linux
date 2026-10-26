@@ -10,25 +10,10 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 const WIVRN_DASHBOARD: &str = "wivrn-dashboard";
 const WAYVR: &str = "wayvr";
-
-/// Keep the overlay alive while the desktop viewer runs. We only terminate a
-/// WayVR child started by *this* invocation, never a pre-existing instance.
-pub(crate) struct OverlayGuard {
-    overlay: Option<Child>,
-}
-
-impl Drop for OverlayGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.overlay.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
 
 fn find_executable(name: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH")?)
@@ -92,11 +77,9 @@ fn runtime_manifest() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-fn runtime_name(manifest: &Path) -> Result<String> {
-    let contents = fs::read(manifest)
-        .with_context(|| format!("无法读取 OpenXR runtime: {}", manifest.display()))?;
-    let value: serde_json::Value = serde_json::from_slice(&contents)
-        .with_context(|| format!("无效的 OpenXR runtime JSON: {}", manifest.display()))?;
+fn parse_runtime_name(contents: &[u8]) -> Result<String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(contents).context("无效的 OpenXR runtime JSON")?;
     let runtime = value.get("runtime").context("OpenXR manifest 缺少 runtime 字段")?;
     let library = runtime
         .get("library_path")
@@ -106,8 +89,15 @@ fn runtime_name(manifest: &Path) -> Result<String> {
     Ok(runtime
         .get("name")
         .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
         .unwrap_or(library)
         .to_owned())
+}
+
+fn runtime_name(manifest: &Path) -> Result<String> {
+    let contents = fs::read(manifest)
+        .with_context(|| format!("无法读取 OpenXR runtime: {}", manifest.display()))?;
+    parse_runtime_name(&contents).with_context(|| format!("清单路径: {}", manifest.display()))
 }
 
 pub(crate) fn doctor() -> Result<()> {
@@ -157,7 +147,7 @@ pub(crate) fn setup() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn launch(no_dashboard: bool) -> Result<OverlayGuard> {
+pub(crate) fn launch(no_dashboard: bool) -> Result<()> {
     let wayvr = find_executable(WAYVR)
         .context("找不到 WayVR；请安装 wayvr，运行 OpenUUYC pico-vr doctor 检查环境")?;
     if !no_dashboard {
@@ -171,21 +161,21 @@ pub(crate) fn launch(no_dashboard: bool) -> Result<OverlayGuard> {
     }
     if running_process(WAYVR) {
         println!("WayVR 已在运行，将沿用现有 OpenXR 桌面映射。");
-        return Ok(OverlayGuard { overlay: None });
+        return Ok(());
     }
     // '--wait' is explicitly supported by WayVR: it waits for an available
     // runtime, so launching before the headset has connected is safe.
-    let child = Command::new(&wayvr)
+    Command::new(&wayvr)
         .arg("--wait")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("无法启动 {}", wayvr.display()))?;
+    // Intentionally do not kill WayVR when this CLI invocation exits: an
+    // existing OpenUUYC GUI may receive an activation and outlive us.
     println!("WayVR 已启动，OpenUUYC 窗口将通过桌面映射在头显内可用。");
-    Ok(OverlayGuard {
-        overlay: Some(child),
-    })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -194,10 +184,26 @@ mod tests {
 
     #[test]
     fn valid_openxr_manifest_reports_runtime_name() {
-        let value: serde_json::Value = serde_json::from_str(
-            r#"{"file_format_version":"1.0.0","runtime":{"name":"WiVRn","library_path":"libopenxr_wivrn.so"}}"#,
-        ).unwrap();
-        assert_eq!(value["runtime"]["name"], "WiVRn");
+        assert_eq!(
+            parse_runtime_name(
+                br#"{"file_format_version":"1.0.0","runtime":{"name":"WiVRn","library_path":"libopenxr_wivrn.so"}}"#
+            ).unwrap(),
+            "WiVRn"
+        );
+    }
+
+    #[test]
+    fn runtime_manifest_uses_library_when_name_is_absent() {
+        assert_eq!(
+            parse_runtime_name(br#"{"runtime":{"library_path":"libopenxr_runtime.so"}}"#).unwrap(),
+            "libopenxr_runtime.so"
+        );
+    }
+
+    #[test]
+    fn runtime_manifest_rejects_missing_library_and_invalid_json() {
+        assert!(parse_runtime_name(br#"{"runtime":{"name":"WiVRn"}}"#).is_err());
+        assert!(parse_runtime_name(b"not json").is_err());
     }
 
     #[test]
