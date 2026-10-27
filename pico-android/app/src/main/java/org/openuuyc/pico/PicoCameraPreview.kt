@@ -81,6 +81,13 @@ internal class PicoCameraPreview(
             if (selected == null) { fail("系统列出了 Camera2 ID，但没有可预览的摄像头"); return }
             val (id, size) = selected
             preview.surfaceTexture?.setDefaultBufferSize(size.width, size.height)
+            // TextureView readiness is asynchronous: CAMERA permission can be
+            // revoked between start() and this Open callback.
+            if (activity.checkSelfPermission(Manifest.permission.CAMERA) !=
+                PackageManager.PERMISSION_GRANTED) {
+                fail("摄像头权限在预览建立前已被撤销")
+                return
+            }
             manager.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
                     if (ticket != epoch || !active) { device.close(); return }
