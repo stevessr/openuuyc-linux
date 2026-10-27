@@ -35,6 +35,8 @@ class PicoActivity : Activity() {
     private external fun nativeRun(activity: PicoActivity)
     private external fun nativeStop()
     private external fun nativeSetWindowVisible(index: Int, visible: Boolean)
+    private external fun nativeSetPassthroughEnabled(enabled: Boolean)
+    private var passthroughEnabled = true
 
     private val ui = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
@@ -69,6 +71,14 @@ class PicoActivity : Activity() {
         }
         devices = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(status)
+        root.addView(Button(this).apply {
+            text = "现实透视背景：开（PICO 4 Ultra）"
+            setOnClickListener {
+                passthroughEnabled = !passthroughEnabled
+                nativeSetPassthroughEnabled(passthroughEnabled)
+                text = "现实透视背景：" + if (passthroughEnabled) "开" else "关"
+            }
+        })
         root.addView(Button(this).apply {
             text = "使用 UU 二维码登录"
             setOnClickListener { login() }
@@ -254,6 +264,12 @@ class PicoActivity : Activity() {
     @Suppress("unused")
     fun onScroll(delta: Int) {
         session?.scroll(delta)
+    }
+
+    @Suppress("unused")
+    fun onPassthroughSupported(supported: Boolean) {
+        if (!supported && passthroughEnabled) message("当前 PICO OpenXR 运行时不支持 Alpha Blend 透视模式，已使用普通 VR 背景")
+        else if (supported) message("PICO 系统视频透视可用；远程窗口可叠加在现实环境上")
     }
 
     @Suppress("unused")

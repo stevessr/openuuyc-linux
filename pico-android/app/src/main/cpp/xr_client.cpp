@@ -20,6 +20,7 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "OpenUUYC-PICO", __VA_ARGS__)
 static std::atomic<bool> stop_requested{false};
 static std::atomic<uint32_t> window_visible_mask{1u};
+static std::atomic<bool> passthrough_requested{true};
 
 static XrPosef identity_pose(float z = 0.f) {
     XrPosef pose{};
@@ -277,6 +278,11 @@ Java_org_openuuyc_pico_PicoActivity_nativeSetWindowVisible(JNIEnv *, jobject, ji
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetPassthroughEnabled(JNIEnv *, jobject, jboolean enabled) {
+    passthrough_requested.store(enabled == JNI_TRUE, std::memory_order_release);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject activity) {
     stop_requested.store(false, std::memory_order_release);
     window_visible_mask.store(1u, std::memory_order_release);
@@ -284,6 +290,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     jmethodID ready = env->GetMethodID(klass, "onXrSurface", "(ILandroid/view/Surface;)V");
     jmethodID pointer = env->GetMethodID(klass, "onPointer", "(IFFZ)V");
     jmethodID scroll_method = env->GetMethodID(klass, "onScroll", "(I)V");
+    jmethodID passthrough_report = env->GetMethodID(klass, "onPassthroughSupported", "(Z)V");
     JavaVM *vm = nullptr;
     env->GetJavaVM(&vm);
 
@@ -352,6 +359,20 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         if (!xr_ok(xrGetSystem(instance, &get_system, &system), "get HMD")) {
             failure = "No OpenXR headset runtime"; break;
         }
+        bool supports_alpha_passthrough = false;
+        uint32_t mode_count = 0;
+        if (XR_SUCCEEDED(xrEnumerateEnvironmentBlendModes(instance, system,
+                XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &mode_count, nullptr)) && mode_count > 0) {
+            std::vector<XrEnvironmentBlendMode> modes(mode_count);
+            if (XR_SUCCEEDED(xrEnumerateEnvironmentBlendModes(instance, system,
+                    XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, mode_count, &mode_count, modes.data()))) {
+                supports_alpha_passthrough = std::find(modes.begin(), modes.end(),
+                    XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) != modes.end();
+            }
+        }
+        if (passthrough_report)
+            env->CallVoidMethod(activity, passthrough_report,
+                                supports_alpha_passthrough ? JNI_TRUE : JNI_FALSE);
         PFN_xrGetOpenGLESGraphicsRequirementsKHR requirements = nullptr;
         xrGetInstanceProcAddr(instance, "xrGetOpenGLESGraphicsRequirementsKHR",
                               reinterpret_cast<PFN_xrVoidFunction *>(&requirements));
@@ -462,7 +483,13 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             }
             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
             end.displayTime = state.predictedDisplayTime;
-            end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+            // PICO uses ALPHA_BLEND (mode 3) to compose OS-owned video
+            // passthrough behind the remote desktop quads; the application
+            // does not capture or expose private camera frames.
+            end.environmentBlendMode = supports_alpha_passthrough &&
+                passthrough_requested.load(std::memory_order_acquire)
+                    ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                    : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             end.layerCount = state.shouldRender ? layer_count : 0u;
             end.layers = end.layerCount ? layers : nullptr;
             if (action_ready && input_focused && state.shouldRender) {
