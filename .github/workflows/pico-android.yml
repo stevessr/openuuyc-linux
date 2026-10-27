@@ -16,6 +16,13 @@ on:
 permissions:
   contents: read
 
+# Keep only the newest commit in each push/PR validation lane. Native Rust,
+# Android SDK/NDK and Gradle jobs are expensive; stale parallel builds would
+# otherwise delay the APK and protocol reports needed for this PR.
+concurrency:
+  group: pico-openxr-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   android:
     name: OpenXR APK + Unit Tests (arm64)
