@@ -6,11 +6,14 @@ package org.openuuyc.pico.uu
  * after room control begins it would risk resurrecting an invalid session.
  */
 internal class UuSignalEndpoints(raw: List<String>) {
-    private val endpoints = raw.map(UuWire::signalEndpoint).distinct()
+    // Deduplicate raw authorized room endpoints before adding the ephemeral
+    // Engine.IO t query parameter. Generating t during construction would
+    // make duplicates nondeterministic across millisecond boundaries.
+    private val endpoints = raw.distinct()
     private var index = 0
     init { require(endpoints.isNotEmpty()) }
 
-    val current: String get() = endpoints[index]
+    val current: String get() = UuWire.signalEndpoint(endpoints[index])
     val position: Int get() = index + 1
     val count: Int get() = endpoints.size
 
