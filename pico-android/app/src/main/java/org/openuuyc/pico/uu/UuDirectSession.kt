@@ -85,6 +85,7 @@ internal class UuDirectSession(
     private val channels = mutableListOf<DataChannel>()
     private var video: VideoTrack? = null
     private val videoTrackRouter = UuVideoTrackRouter<VideoTrack>()
+    private var negotiatedVideoTracks: List<Int> = emptyList()
     private var remoteAudio: AudioTrack? = null
     private var audioFocusHeld = false
     private var audioFocusRequested = false
@@ -288,16 +289,25 @@ internal class UuDirectSession(
                     if (!restart) return // Duplicate answer, do not reset ICE.
                     remoteIce.resetForRenegotiation()
                 }
+                val acceptedTracks = UuWire.acceptedVideoTrackIndices(sdp)
+                if (acceptedTracks.isEmpty()) {
+                    emit("UU SDP 拒绝全部视频轨道，无法接收远端画面")
+                    terminateUnexpectedly()
+                    return
+                }
                 peer?.setRemoteDescription(sdpObserver(onSuccess = {
                     synchronized(this@UuDirectSession) {
                         if (closed.get()) return@synchronized
+                        negotiatedVideoTracks = acceptedTracks
                         if (!remoteIce.activate { peer?.addIceCandidate(it) == true }) {
                             emit("UU ICE 候选地址无法安装，已终止会话")
                             terminateUnexpectedly()
                             return@synchronized
                         }
                     }
-                    emit("UU WebRTC SDP 已接受")
+                        maybeStartCapture()
+                    }
+                    emit("UU WebRTC SDP 已接受（${acceptedTracks.size} 条视频轨道）")
                 }), SessionDescription(SessionDescription.Type.ANSWER, sdp))
             }
             "candidate" -> {
@@ -589,6 +599,7 @@ internal class UuDirectSession(
     }
 
     @Synchronized private fun maybeStartCapture() {
+        if (negotiatedVideoTracks.isEmpty()) return
         val controlOpen = controlChannel?.state() == DataChannel.State.OPEN
         val textOpen = textChannel?.state() == DataChannel.State.OPEN
         val action = captureGate.next(controlOpen, textOpen)
@@ -597,7 +608,7 @@ internal class UuDirectSession(
         val sequence = nextRequestSeq++
         val packet = when (action) {
             UuCaptureGate.Action.REGISTER_TRACK ->
-                UuWire.registerVideoTrack(sequence, captureGate.selectedTrack ?: return)
+                UuWire.registerVideoTracks(sequence, negotiatedVideoTracks)
             UuCaptureGate.Action.START_VIDEO ->
                 UuWire.startVideoCapture(sequence, captureGate.selectedScreen ?: return)
             UuCaptureGate.Action.CAPTURE_SETTING -> UuWire.captureSetting(sequence)
@@ -661,6 +672,7 @@ internal class UuDirectSession(
         remoteIce.close()
         bindDisplayedVideo(null)
         videoTrackRouter.reset()
+        negotiatedVideoTracks = emptyList()
         remoteAudio?.setEnabled(false)
         remoteAudio = null
         if (audioFocusRequested) {

@@ -144,10 +144,15 @@ internal object UuWire {
         }
     }
 
-    /** Register the negotiated RTP video track before requesting capture. */
-    fun registerVideoTrack(sequence: Long, index: Int): ByteArray {
-        require(index in 0..64) { "invalid UU video-track index" }
-        val tracks = message { out -> integer(out, 1, index.toLong()) }
+    /** Register *all* accepted m=video tracks, matching desktop controller. */
+    fun registerVideoTrack(sequence: Long, index: Int): ByteArray =
+        registerVideoTracks(sequence, listOf(index))
+
+    fun registerVideoTracks(sequence: Long, indexes: List<Int>): ByteArray {
+        require(indexes.isNotEmpty() && indexes.size <= 5 &&
+            indexes.distinct().size == indexes.size &&
+            indexes.all { it in 0..4 }) { "invalid or duplicate UU video-track index" }
+        val tracks = message { out -> indexes.forEach { integer(out, 1, it.toLong()) } }
         val rpc = message { out ->
             bytes(out, 1, message { header -> integer(header, 1, sequence) })
             bytes(out, 15, tracks)
@@ -375,6 +380,27 @@ internal object UuWire {
      * UU's application section requires ordered SCTP message-size and optional
      * mix-KCP attributes; the local WebRTC SDP must stay unchanged.
      */
+    /**
+     * Map the peer's accepted video m-lines to UU 0..4 track indices.
+     * A rejected m-line (port 0) must never be registered for capture.
+     */
+    fun acceptedVideoTrackIndices(sdp: String): List<Int> {
+        val result = mutableListOf<Int>()
+        var videoIndex = 0
+        for (line in sdp.lineSequence()) {
+            if (!line.trimEnd('\r').startsWith("m=video ")) continue
+            require(videoIndex < 5) { "UU peer offered too many video sections" }
+            val parts = line.trim().split(Regex("\\s+"))
+            val port = parts.getOrNull(1)?.toIntOrNull()
+                ?: throw IllegalArgumentException("invalid video SDP port")
+            require(port in 0..65535) { "invalid SDP video port" }
+            if (port != 0) result.add(videoIndex)
+            videoIndex++
+        }
+        require(videoIndex > 0) { "no UU video m-lines in SDP answer" }
+        return result
+    }
+
     fun uuOfferSdp(sdp: String, streams: String = "audio_0"): String {
         val separator = if (sdp.contains("\r\n")) "\r\n" else "\n"
         val lines = sdp.lines().map { it.trimEnd('\r') }.filter { it.isNotEmpty() }.toMutableList()

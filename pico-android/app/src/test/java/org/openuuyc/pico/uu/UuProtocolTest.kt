@@ -132,4 +132,33 @@ class UuProtocolTest {
         assertTrue(args.getJSONObject(1).getJSONObject("app_data").getBoolean("_placeholder"))
         assertTrue(frame.isNotEmpty())
     }
+    @Test fun videoNegotiationKeepsOnlyAcceptedTracks() {
+        val answer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" +
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n" +
+            "m=video 0 UDP/TLS/RTP/SAVPF 96\r\n" +
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n" +
+            "m=video 0 UDP/TLS/RTP/SAVPF 96\r\n" +
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n" +
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
+        val accepted = UuWire.acceptedVideoTrackIndices(answer)
+        assertEquals(listOf(0, 2, 4), accepted)
+        val registration = UuWire.registerVideoTracks(91, accepted)
+        assertEquals(91L, UuWire.decodeEnvelope(registration).seq)
+        assertTrue(registration.size > UuWire.registerVideoTrack(91, 0).size)
+    }
+
+    @Test fun rejectsInvalidVideoMlinesAndTrackRegistration() {
+        assertThrows(IllegalArgumentException::class.java) {
+            UuWire.acceptedVideoTrackIndices("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            UuWire.acceptedVideoTrackIndices("v=0\r\nm=video invalid UDP/TLS/RTP/SAVPF 96\r\n")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            UuWire.registerVideoTracks(90, listOf(0, 0))
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            UuWire.registerVideoTracks(90, listOf(0, 5))
+        }
+    }
 }
