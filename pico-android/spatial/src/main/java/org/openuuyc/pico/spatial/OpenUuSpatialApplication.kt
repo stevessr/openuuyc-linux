@@ -11,4 +11,7 @@ class OpenUuSpatialApplication : Application() {
         launch(::openUuSpatialApp)
     }
 }
-class OpenUuSpatialLaunchActivity : SpatialLaunchActivity()
+class OpenUuSpatialLaunchActivity : SpatialLaunchActivity() {
+    override fun onResume() {super.onResume();org.openuuyc.pico.uu.UuDirectSession.setApplicationFocused(true)}
+    override fun onPause() {org.openuuyc.pico.uu.UuDirectSession.setApplicationFocused(false);super.onPause()}
+}

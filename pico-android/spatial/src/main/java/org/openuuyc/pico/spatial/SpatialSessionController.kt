@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicLong
 /** Shared UU wire implementation; the OS 6 shell only owns window/session lifecycle. */
 internal class SpatialSessionController(context: Context) : AutoCloseable {
     private val app=context.applicationContext
+    fun context(): Context=app
     private val api=UuNrdApi(app)
     private val worker=Executors.newSingleThreadExecutor()
     private val ui=Handler(Looper.getMainLooper())

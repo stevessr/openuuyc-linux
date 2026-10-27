@@ -6,6 +6,7 @@
 #include "xr_panel_geometry.h"
 #include "xr_pose_math.h"
 #include "xr_pointer_feedback.h"
+#include "xr_video_resolution.h"
 #include "xr_panel_depth.h"
 #include "xr_menu_click.h"
 #include "xr_grip_hold.h"
@@ -303,7 +304,9 @@ static bool intersect_quad(const XrPosef &aim, float &u, float &v, int &pane) {
         const float w=panels[i].width,h=w*panels[i].aspect;
         if(frame_available && y>h*.5f && y<h*.58f && x>w*.24f && x<w*.37f) {pane=43+i;u=x;v=y;return true;}
         if(frame_available && y>h*.5f && y<h*.58f) {
-            if(x>-w*.44f && x<-w*.12f) {pane=49+i;u=x;v=y;return true;}
+            if(x>-w*.44f && x<-w*.26f) {pane=49+i;u=x;v=y;return true;}
+            if(x>-w*.23f && x<-w*.18f) {pane=67+i;u=x;v=y;return true;}
+            if(x>-w*.17f && x<-w*.12f) {pane=73+i;u=x;v=y;return true;}
             if(x>-w*.10f && x<w*.23f) {pane=55+i;u=x;v=y;return true;}
             if(x>w*.39f && x<w*.44f) {pane=61+i;u=x;v=y;return true;}
         }
@@ -492,7 +495,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
             if(follow_click_valid) follow_click_offset=offset.pose;
             env->CallVoidMethod(activity,menu_method,u,v);
         }
-        if(pane>=49 && pane<67 && !grip_dragging) {
+        if(pane>=49 && pane<79 && !grip_dragging) {
             if(down && state.changedSinceLastSync && window_menu)
                 env->CallVoidMethod(activity,window_menu,(pane-49)%6,(pane-49)/6+1);
             last_down=down;last_pane=pane;return;
@@ -792,8 +795,12 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         action_ready = actions.create(instance, session);
         XrSystemProperties properties{XR_TYPE_SYSTEM_PROPERTIES};
         uint32_t max_layers = 1;
-        if (XR_SUCCEEDED(xrGetSystemProperties(instance, system, &properties)))
+        uint32_t video_edge=1920;
+        if (XR_SUCCEEDED(xrGetSystemProperties(instance, system, &properties))) {
             max_layers = std::min(16u, properties.graphicsProperties.maxLayerCount);
+            video_edge=xr_video_edge(properties.graphicsProperties.maxSwapchainImageWidth,properties.graphicsProperties.maxSwapchainImageHeight);
+        }
+        if(video_edge==0) {failure="Runtime reports no usable video Surface size";break;}
         const uint32_t ray_budget=max_layers>4?std::min(2u,max_layers-4):0;
         const uint32_t panel_count=max_layers>=4?std::max(1u,std::min(6u,(max_layers-2-ray_budget)/2)):1u;
         PFN_xrCreateSwapchainAndroidSurfaceKHR create_surface = nullptr;
@@ -808,8 +815,8 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         for (uint32_t slot = 0; slot < panel_count + (max_layers>=2?1:0) + (max_layers>=3?1:0); ++slot) {
             // Reserve the second runtime layer for the toolbar, then extra video.
             const uint32_t pane = slot == 0 ? 0 : slot == 1 ? 6 : slot == 2 ? 7 : slot-2;
-            swapchain_info.width = pane == 7 ? 2400 : pane == 6 ? 1200 : 1920;
-            swapchain_info.height = pane == 6 ? 400 : pane == 7 ? 3232 : 1080;
+            swapchain_info.width = pane == 7 ? 2400 : pane == 6 ? 1200 : video_edge;
+            swapchain_info.height = pane == 6 ? 400 : pane == 7 ? 3232 : video_edge;
             jobject surface = nullptr;
             if (!xr_ok(create_surface(session, &swapchain_info, &swapchains[pane], &surface),
                        "create pane swapchain") || !surface) {
@@ -980,7 +987,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 quad.size.width = index == 6 ? menu_panel.width : panels[index].width;
                 quad.size.height = index == 6 ? menu_panel.width*menu_panel.aspect : quad.size.width * panels[index].aspect;
                 quad.subImage.swapchain = swapchains[index];
-                quad.subImage.imageRect = index == 6 ? XrRect2Di{{0,0},{1200,400}} : XrRect2Di{{0,0},{1920,1080}};
+                quad.subImage.imageRect = index == 6 ? XrRect2Di{{0,0},{1200,400}} : XrRect2Di{{0,0},{static_cast<int32_t>(video_edge),static_cast<int32_t>(video_edge)}};
                 quad.subImage.imageArrayIndex = 0;
                 layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad);
             }

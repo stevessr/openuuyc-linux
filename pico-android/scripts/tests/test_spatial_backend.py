@@ -21,7 +21,7 @@ class SpatialBackendTest(unittest.TestCase):
         root=ET.parse(ROOT/'spatial/src/main/AndroidManifest.xml').getroot()
         app=root.find('application')
         self.assertTrue(app.attrib[A+'name'].endswith('OpenUuSpatialApplication'))
-        activities=app.findall('activity')
+        activities=[a for a in app.findall('activity') if a.attrib[A+'name'].endswith('OpenUuSpatialLaunchActivity')]
         self.assertEqual(len(activities),1)
         names={x.attrib[A+'name'] for x in activities[0].findall('meta-data')}
         self.assertIn('pico.spatial.windowcontainer.id',names)

@@ -16,6 +16,7 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.HorizontalScrollView
 import android.widget.ScrollView
 import android.widget.TextView
 import com.google.zxing.BarcodeFormat
@@ -63,6 +64,22 @@ open class PicoActivity : Activity() {
     @Volatile private var xrActivePane=0
     @Volatile private var xrSettingsSession: UuDirectSession?=null
     private fun currentXrSession()=xrSettingsSession ?: xrExtraSessions[xrActivePane] ?: session
+
+    private var panelMicButton: Button?=null
+    private var panelClipboardButton: Button?=null
+    private fun toggleMicrophone(target: UuDirectSession?) {
+        if(target==null) {message("请先打开串流");return}
+        if(target.microphoneEnabled) {target.setMicrophoneEnabled(false);return}
+        if(!target.microphoneNegotiated) {message("当前连接未协商麦克风回传，请等待连接完成或检查主机支持");return}
+        if(!org.openuuyc.pico.uu.UuMicrophonePermissionActivity.request(this) {granted ->
+            if(granted) target.setMicrophoneEnabled(true) else message("未授予麦克风权限，未开启录音")
+        }) message("无法发起麦克风授权，请稍后重试")
+    }
+    private fun refreshSharingButtons() {
+        panelMicButton?.text=if(session?.microphoneActive==true) "麦克风：开" else if(session?.microphoneEnabled==true) "麦克风…" else "麦克风：关"
+        panelClipboardButton?.text=if(session?.clipboardEnabled==true) "剪贴板：开" else "剪贴板：关"
+        for(pane in 0..5) {val target=xrExtraSessions[pane] ?: session;xrWindowFrame?.sharing(pane,target?.microphoneEnabled==true,target?.clipboardEnabled==true)}
+    }
 
     private var xrFollowing = false
     private var xrTouchMode=false
@@ -197,7 +214,7 @@ open class PicoActivity : Activity() {
         ui.post {
             if (!isFinishing && !isDestroyed) {
                 if (!text.startsWith("会话已断开")) lastSessionMessage = text
-                status.text = text; loginView?.setStatus(text); panelVideo?.showStatus(text)
+                status.text = text; loginView?.setStatus(text); panelVideo?.showStatus(text);refreshSharingButtons()
             }
             Log.i("OpenUUYC-PICO", text)
         }
@@ -342,6 +359,24 @@ open class PicoActivity : Activity() {
         }
     }
 
+    private var panelDeviceLoading=false
+    private fun openPanelDeviceMenu(anchor: android.view.View) {
+        if(panelDeviceLoading) return
+        panelDeviceLoading=true
+        worker.execute {
+            try {
+                if(!::api.isInitialized) api=UuNrdApi(this)
+                if(api.account==null) api.restoreSavedLogin()
+                check(api.account!=null) {"登录尚未恢复"}
+                val devices=api.devices()
+                ui.post {if(!isDestroyed) PicoDeviceMenu.show(this,anchor,devices,xrDeviceId,{openPanelDeviceMenu(anchor)}) {device ->
+                    setResult(RESULT_OK,Intent().putExtra("next_device",device.id).putExtra("session_status","正在切换到 ${device.alias}"));finish()
+                }}
+            } catch(error: Exception) {message("设备列表加载失败：${error.javaClass.simpleName}")}
+            finally {ui.post {panelDeviceLoading=false}}
+        }
+    }
+
     private fun startPanelSession(room: UuRoom, identity: UuIdentity, alias: String) {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(PicoTheme.BG)
@@ -351,10 +386,13 @@ open class PicoActivity : Activity() {
             gravity = android.view.Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(8), dp(16), dp(8)); setBackgroundColor(PicoTheme.SIDEBAR)
         }
-        toolbar.addView(TextView(this).apply {
-            text = "$alias · 普通窗口控制"; textSize = 17f; setTextColor(PicoTheme.TEXT)
-            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
-        }, LinearLayout.LayoutParams(0, -2, 1f))
+        toolbar.addView(Button(this).apply {
+            text="$alias ▾";textSize=16f;isAllCaps=false;setTextColor(PicoTheme.TEXT)
+            maxLines=1;ellipsize=android.text.TextUtils.TruncateAt.END
+            setOnClickListener {openPanelDeviceMenu(this)}
+        },LinearLayout.LayoutParams(minOf(dp(220),resources.displayMetrics.widthPixels/3),dp(44)))
+        val controls=LinearLayout(this).apply {gravity=android.view.Gravity.CENTER_VERTICAL}
+        toolbar.addView(HorizontalScrollView(this).apply {isHorizontalScrollBarEnabled=false;addView(controls)},LinearLayout.LayoutParams(0,-2,1f))
         toolbar.addView(Button(this).apply {
             text = "断开"; setTextColor(PicoTheme.TEXT)
             setOnClickListener { panelVideo?.releasePointer(); stopSession(); finish() }
@@ -378,7 +416,7 @@ open class PicoActivity : Activity() {
             } }
             fun action(label: String, run: () -> Unit): Button {
                 val button=Button(this).apply { text=label;setTextColor(PicoTheme.TEXT);setOnClickListener { run() } }
-                toolbar.addView(button,LinearLayout.LayoutParams(dp(84),dp(44)))
+                controls.addView(button,LinearLayout.LayoutParams(dp(84),dp(44)))
                 return button
             }
             lateinit var screenButton: Button
@@ -387,10 +425,18 @@ open class PicoActivity : Activity() {
                     panelVideo?.releasePointer();keyboard.releaseKeys();direct.releaseInputs()
                 },::message)
             }
+            screenButton.layoutParams.width=dp(220)
+            direct.windowInfoListener={pane,_,name,_,_-> if(pane==0) ui.post {if(!isDestroyed) screenButton.text="▣ $name ▾"}}
+            action("＋") {
+                android.app.AlertDialog.Builder(this).setTitle("创建虚拟显示器？").setMessage("将在远端请求创建1920×1080显示器。")
+                    .setNegativeButton("取消",null).setPositiveButton("确认") {_,_-> try {check(direct.createVirtualDisplay());message("请求已发送，等待远端屏幕列表")} catch(error: Exception) {message(error.message ?: "虚拟屏未创建")} }.show()
+            }
             action("设置") { PicoRemoteSettingsDialog.show(this, direct, smartIme, { enabled ->
                 smartIme = enabled; getPreferences(MODE_PRIVATE).edit().putBoolean("smart_ime", enabled).apply()
             }, ::message) }
             action("键盘") { keyboard.hide();PicoKeyboardPopup.show(this,toolbar,direct,keyboard::show) }
+            panelMicButton=action("麦克风：关") {toggleMicrophone(direct)}
+            panelClipboardButton=action("剪贴板：关") {direct.setClipboardEnabled(!direct.clipboardEnabled)}
             val inputMode = Button(this).apply {
                 text = "鼠标模式"; setTextColor(PicoTheme.TEXT)
                 setOnClickListener {
@@ -398,7 +444,7 @@ open class PicoActivity : Activity() {
                     panelVideo?.let { it.touchMode = !it.touchMode; text = if (it.touchMode) "触摸模式" else "鼠标模式" }
                 }
             }
-            toolbar.addView(inputMode, LinearLayout.LayoutParams(dp(100), dp(44)))
+            controls.addView(inputMode, LinearLayout.LayoutParams(dp(100), dp(44)))
             root.addView(keyboard, LinearLayout.LayoutParams(1, 1))
             val display = PicoPanelVideoView(this,
                 { surface -> if (running.get()) direct.attachMainSurface(surface) },
@@ -546,6 +592,12 @@ open class PicoActivity : Activity() {
         if (requestCode == XR_REQUEST) {
             pendingViewer.set(null)
             joinGate.stop()
+            val nextDevice=data?.getStringExtra("next_device")
+            if(nextDevice!=null && this !is PanelViewerActivity && this !is XrActivity) worker.execute {
+                try {val device=api.devices().firstOrNull {it.id==nextDevice && it.online && it.controllable} ?: error("目标设备不可连接")
+                    ui.post {if(!isDestroyed && !isFinishing) connect(device,PicoViewerMode.WINDOW)}
+                } catch(error: Exception) {message("切换设备失败：${error.javaClass.simpleName}")}
+            }
             message(data?.getStringExtra("session_status") ?: "会话已断开，可重新连接")
             // The server processes leave asynchronously; do not keep an old
             // occupants count on the launcher after a successful disconnect.
@@ -571,8 +623,7 @@ open class PicoActivity : Activity() {
             val result=runCatching {
                 when(action) {
                     "regenerate" -> {check(!xrAppearance.custom && PicoBackgroundPattern.find(xrAppearance.presetId).procedural) {"请先选择程序生成背景"};xrAppearance.regenerate()}
-                    "brightness" -> xrAppearance.cycleBrightness()
-                    else -> xrAppearance.selectPreset(action)
+                    else -> if(action.startsWith("brightness:")) xrAppearance.setBrightness(action.substringAfter(":").toInt()) else xrAppearance.selectPreset(action)
                 }
             }
             ui.post {if(!isDestroyed) {
@@ -639,6 +690,8 @@ open class PicoActivity : Activity() {
             1 -> openXrHome()
             2 -> xrToolbar?.openScreens()
             3 -> xrToolbar?.confirmVirtualScreen()
+            4 -> toggleMicrophone(target)
+            5 -> target?.setClipboardEnabled(!target.clipboardEnabled)
             else -> target?.windowScreen(if(extra!=null) 0 else pane)?.let {xrToolbar?.openScreenSettings(it)}
         }
     }}
@@ -716,7 +769,10 @@ open class PicoActivity : Activity() {
         if (!hasFocus) { panelVideo?.releasePointer(); remoteKeyboard?.releaseKeys(); xrToolbar?.releaseKeyboardKeys(); session?.releaseInputs() }
     }
 
+    override fun onResume() {super.onResume();UuDirectSession.setApplicationFocused(true)}
+
     override fun onPause() {
+        UuDirectSession.setApplicationFocused(false)
         panelVideo?.releasePointer(); remoteKeyboard?.releaseKeys(); xrToolbar?.releaseKeyboardKeys(); session?.releaseInputs()
         if (::cameraPreview.isInitialized) cameraPreview.stop()
         super.onPause()

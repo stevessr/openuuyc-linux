@@ -192,6 +192,18 @@ private fun StreamSubwindow(controller: SpatialSessionController,window: Spatial
         Toolbar {
             ChoiceButton("设备列表",onClick=home)
             ChoiceButton(if(touch) "触摸" else "鼠标",touch) {window.session.releaseInputs();touch=!touch}
+            var micRequested by remember {mutableStateOf(window.session.microphoneEnabled)}
+            var micActive by remember {mutableStateOf(window.session.microphoneActive)}
+            var clipboard by remember {mutableStateOf(window.session.clipboardEnabled)}
+            LaunchedEffect(window.id) {while(true) {
+                micRequested=window.session.microphoneEnabled;micActive=window.session.microphoneActive;clipboard=window.session.clipboardEnabled
+                kotlinx.coroutines.delay(500)
+            }}
+            ChoiceButton(if(micActive) "麦克风：开" else if(micRequested) "麦克风…" else "麦克风",micRequested) {
+                if(micRequested) window.session.setMicrophoneEnabled(false)
+                else org.openuuyc.pico.uu.UuMicrophonePermissionActivity.request(controller.context()) {granted -> if(granted) window.session.setMicrophoneEnabled(true)}
+            }
+            ChoiceButton("剪贴板",clipboard) {window.session.setClipboardEnabled(!window.session.clipboardEnabled)}
             Box {
                 ChoiceButton("显示器 ▾",popup==2) {popup=if(popup==2) 0 else 2}
                 if(popup==2) SpatialPopup(onDismissRequest={popup=0},defaultMinWidth=500.dp) {SpatialScreenMenu(window) {popup=0}}

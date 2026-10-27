@@ -37,7 +37,7 @@ internal class PicoXrAppearance(private val context: Context) {
         prepareBackground()
     }
     fun regenerate() {seed+=1;prefs.edit().putInt("seed",seed).apply();prepareBackground()}
-    fun cycleBrightness() {brightness=if(brightness>=100) 25 else brightness+25;prefs.edit().putInt("brightness",brightness).apply()}
+    fun setBrightness(value: Int) {brightness=value.coerceIn(25,100);prefs.edit().putInt("brightness",brightness).apply()}
     fun update(mr: Boolean,color: Int,visibility: Int) {
         this.mr=mr
         if(this.color!=color) {presetId=PicoBackgroundPattern.presets.firstOrNull {it.color==color}?.id ?: "black";generated=null;generatedKey="";prefs.edit().putString("preset",presetId).apply()}

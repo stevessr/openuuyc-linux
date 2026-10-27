@@ -55,12 +55,96 @@ internal class UuDirectSession(
     private val onWindowVisibility: (Int, Boolean) -> Unit = { _, _ -> },
     private val onUnexpectedDisconnect: () -> Unit = {}
 ) : AutoCloseable {
+    companion object {
+        private val appFocused=AtomicBoolean(false)
+        private val live=java.util.concurrent.ConcurrentHashMap.newKeySet<UuDirectSession>()
+        fun setApplicationFocused(value: Boolean) {
+            appFocused.set(value)
+            live.forEach {it.clipboardBinding.focusChanged();if(!value) it.stopMicrophoneForFocus() else it.postRtc {it.updateMicrophone()}}
+        }
+    }
+    private val clipboardBinding: UuClipboardBinding=UuClipboardBinding(context,
+        permitted={appFocused.get() && !closed.get()},publish={clipboardWire.text(it)})
+    private val clipboardWire: UuClipboardWire=UuClipboardWire(
+        next={synchronized(this) {nextRequestSeq++}},
+        send={payload -> !closed.get() && rtcCallbacks.post {synchronized(this) {if(!closed.get() && inputReady()) sendControl(payload)}}},
+        write={text,done -> clipboardBinding.write(text,done)},rejected={clipboardBinding.enable(false);emit("远端拒绝文本剪贴板，已关闭同步")})
+    val clipboardEnabled: Boolean get()=clipboardBinding.enabled
+    fun setClipboardEnabled(value: Boolean) {
+        if(!value) clipboardBinding.enable(false)
+        postRtc {clipboardWire.reset();clipboardBinding.enable(value);emit(if(value) "文本剪贴板同步已开启（仅前台会话）" else "剪贴板同步已关闭")}
+    }
+    private val micState=UuMicrophoneState()
+    @Volatile private var audioModule: org.webrtc.audio.JavaAudioDeviceModule?=null
+    private var microphoneTransceiver: RtpTransceiver?=null
+    private var microphoneTrack: AudioTrack?=null
+    private var microphoneSource: org.webrtc.AudioSource?=null
+    @Volatile var microphoneActive=false;private set
+    @Volatile var microphoneNegotiated=false;private set
+    val microphoneEnabled: Boolean get()=micState.requested
+    fun setMicrophoneEnabled(value: Boolean) {
+        if(!value) {audioModule?.setMicrophoneMute(true);micState.stop()}
+        postRtc {
+            if(value) {
+                if(context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)!=android.content.pm.PackageManager.PERMISSION_GRANTED) {emit("麦克风未授权，未开启");return@postRtc}
+                val direction=microphoneTransceiver?.currentDirection
+                if(direction!=RtpTransceiver.RtpTransceiverDirection.SEND_RECV && direction!=RtpTransceiver.RtpTransceiverDirection.SEND_ONLY) {emit("本次会话未协商可发送的麦克风轨道");return@postRtc}
+            }
+            val id=synchronized(this) {nextRequestSeq++}
+            micState.request(id,value)
+            val generation=micState.generation
+            val sent=synchronized(this) {if(inputReady()) textChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(UuWire.microphonePolicy(id,value)),false))==true else false}
+            if(!sent) {micState.stop();emit("麦克风控制通道未就绪，未开启")}
+            else emit(if(value) "麦克风等待远端虚拟声卡确认" else "麦克风已关闭")
+            updateMicrophone()
+            if(value && sent) cleanupHandler.postDelayed({postRtc {if(micState.generation==generation && micState.requested && !microphoneActive) {setMicrophoneEnabled(false);emit("远端未打开麦克风，已安全关闭")}}},8000)
+        }
+    }
+    private fun stopMicrophoneForFocus() {audioModule?.setMicrophoneMute(true);if(micState.requested) setMicrophoneEnabled(false)}
+    private fun updateMicrophone() {
+        val permission=context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED
+        val direction=microphoneTransceiver?.currentDirection
+        val send=direction==RtpTransceiver.RtpTransceiverDirection.SEND_RECV || direction==RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
+        if(!closed.get() && micState.mayCapture(permission,appFocused.get(),send)) {
+            if(microphoneTrack==null) {
+                val engine=factory ?: return
+                val source=engine.createAudioSource(MediaConstraints())
+                val track=engine.createAudioTrack("audio_0",source)
+                track.setEnabled(false)
+                if(microphoneTransceiver?.sender?.setTrack(track,false)!=true) {track.dispose();source.dispose();micState.stop();emit("麦克风音轨绑定失败");return}
+                microphoneSource=source;microphoneTrack=track
+            }
+            microphoneTrack?.setEnabled(true);audioModule?.setMicrophoneMute(false);microphoneActive=true
+            emit("麦克风回传已开启")
+        } else {
+            audioModule?.setMicrophoneMute(true);microphoneActive=false
+            val track=microphoneTrack;val source=microphoneSource;microphoneTrack=null;microphoneSource=null
+            if(track!=null) {runCatching {microphoneTransceiver?.sender?.setTrack(null,false)};runCatching {track.dispose()};runCatching {source?.dispose()}}
+        }
+    }
     private val http = OkHttpClient.Builder().pingInterval(0, TimeUnit.SECONDS)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
     private val diagnostics = UuSessionDiagnostics(context)
     private val screenSettings=mutableMapOf<Int,UuCaptureSettings>()
+    private val userConfiguredScreens=mutableSetOf<Int>()
+    private val portraitRequests=mutableSetOf<Int>()
+    private val decodedScreenSizes=mutableMapOf<Int,Pair<Int,Int>>()
+    private fun improvePortraitQuality() {
+        if(closed.get() || !inputReady() || remoteSettings.pending!=null) return
+        for(screen in remoteSettings.screens) {
+            if(screen.id in portraitRequests) continue
+            val current=screenSettings[screen.id] ?: remoteSettings.current
+            val next=UuPortraitQuality.plan(screen.current,decodedScreenSizes[screen.id],current,remoteSettings.profiles,
+                screen.id in userConfiguredScreens || -2 in userConfiguredScreens) ?: continue
+            if(runCatching { applySettings(next,targetScreen=screen.id,automatic=true) }.getOrDefault(false)) {
+                portraitRequests.add(screen.id)
+                emit("竖屏清晰度：已请求屏幕 ${screen.id} 的 ${next.maxWidth}×${next.maxHeight} 像素上限，等待远端确认")
+            }
+            return
+        }
+    }
     private var pendingSettingsScreen: Pair<Long,Int?>?=null
     private val remoteSettings = UuRemoteSettingsState()
     private var topologyPending: Long? = null
@@ -157,7 +241,7 @@ internal class UuDirectSession(
 
     @Synchronized fun start(xrSurface: Surface) {
         check(!started && !closed.get())
-        started = true
+        started = true;live.add(this)
         windowSurfaces[0] = xrSurface
         PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions())
         localProfiles = runCatching { UuLocalDecoders.profiles() }.getOrDefault(localProfiles)
@@ -169,6 +253,7 @@ internal class UuDirectSession(
                 if (heldKeys.isNotEmpty()) sendControl("{\"heartbeat\":\"kbd_heartbeat\"}".toByteArray(Charsets.UTF_8))
                 diagnosticTicks++
                 if (diagnosticTicks in listOf(3, 8, 15, 30)) reportMediaStats()
+                improvePortraitQuality()
                 when (health.check()) {
                     UuSessionHealth.Warning.SIGNAL_TIMEOUT -> {
                         emit("UU 信令握手超过 30 秒，终止无效连接")
@@ -380,6 +465,8 @@ internal class UuDirectSession(
                     synchronized(this@UuDirectSession) {
                         if (closed.get()) return@synchronized
                         negotiatedVideoTracks = acceptedTracks
+                        val audioDirection=microphoneTransceiver?.currentDirection
+                        microphoneNegotiated=audioDirection==RtpTransceiver.RtpTransceiverDirection.SEND_RECV || audioDirection==RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
                         if (!remoteIce.activate { peer?.addIceCandidate(it) == true }) {
                             emit("UU ICE 候选地址无法安装，已终止会话")
                             terminateUnexpectedly()
@@ -468,6 +555,7 @@ internal class UuDirectSession(
                 // EGL allocation waits for native threads. Never hold the session
                 // monitor or run this on the Android menu/UI thread.
                 created.init(base.eglBaseContext,EglBase.CONFIG_PLAIN,GlRectDrawer())
+                created.setLayoutAspectRatio(0f) // full frame; OpenXR quad supplies true display aspect
                 created.createEglSurface(xrSurface)
                 synchronized(this) {
                     if(!closed.get() && egl===base && windowSurfaces[index]===xrSurface) {
@@ -531,6 +619,8 @@ internal class UuDirectSession(
                             cleanupHandler.post { synchronized(this@UuDirectSession) {
                                 if(!closed.get() && windowVideos[pane]===wanted) {
                                     val id=windowPlan.getOrNull(pane)?.screen
+                                    if(id!=null) decodedScreenSizes[id]=size
+                                    emit("视频窗口 ${pane+1} 解码尺寸 ${size.first}×${size.second}")
                                     val name=remoteSettings.screens.firstOrNull {it.id==id}?.toString() ?: "屏幕 ${id ?: "?"}"
                                     windowInfoListener?.invoke(pane,id,name,size.first,size.second)
                                 }
@@ -573,7 +663,16 @@ internal class UuDirectSession(
         egl = localEgl
         windowSurfaces.forEach { (index, xrSurface) -> attachRenderer(index, xrSurface, localEgl) }
         updateWindows()
+        val adm=org.webrtc.audio.JavaAudioDeviceModule.builder(context)
+            .setAudioRecordErrorCallback(object: org.webrtc.audio.JavaAudioDeviceModule.AudioRecordErrorCallback {
+                private fun fail() {audioModule?.setMicrophoneMute(true);micState.stop();postRtc {updateMicrophone()};emit("本机麦克风录音失败，已关闭回传")}
+                override fun onWebRtcAudioRecordInitError(error: String) {fail()}
+                override fun onWebRtcAudioRecordStartError(code: org.webrtc.audio.JavaAudioDeviceModule.AudioRecordStartErrorCode,error: String) {fail()}
+                override fun onWebRtcAudioRecordError(error: String) {fail()}
+            }).createAudioDeviceModule()
+        adm.setMicrophoneMute(true);audioModule=adm
         val engine = PeerConnectionFactory.builder()
+            .setAudioDeviceModule(adm)
             .setVideoDecoderFactory(decoder)
             .setVideoEncoderFactory(org.webrtc.DefaultVideoEncoderFactory(localEgl.eglBaseContext, false, true))
             .createPeerConnectionFactory()
@@ -639,7 +738,11 @@ internal class UuDirectSession(
         // UU desktop controller offers audio_0 followed by five independent
         // recvonly video m-lines (video_0..video_4); one line is insufficient
         // for desktop/auxiliary video track selection.
-        connection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO, options)
+        // Reserve an Opus sender without creating an AudioSource/AudioRecord.
+        // Real recording is attached only after permission + remote policy gates.
+        microphoneTransceiver=connection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
+            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV))
+        microphoneTransceiver?.sender?.setStreams(listOf("audio_0"))
         repeat(5) {
             connection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, options)
         }
@@ -760,7 +863,10 @@ internal class UuDirectSession(
                     if (!isControl && channel.label() != "TEXT_DATA_CHANNEL") return@postRtc
                     if (bytes.isNotEmpty() && bytes[0] == '{'.code.toByte()) return@postRtc
                     try {
+                        if(clipboardWire.receive(bytes,clipboardBinding.enabled && appFocused.get() && inputReady())) return@postRtc
                         val payload = UuWire.decodeEnvelope(bytes)
+                        payload.microphoneAck?.let {(id,code) -> micState.response(id,code);updateMicrophone();if(code!=0) emit("远端麦克风策略被拒绝：$code")}
+                        payload.simpleAction?.let {action -> if(action in setOf(23,24,27)) {micState.event(action);updateMicrophone()}}
                         payload.captureLevel?.let { remoteSettings.captureLevel = it }
                         if (payload.screens.isNotEmpty()) {
                             remoteSettings.screens = payload.screens
@@ -1041,7 +1147,7 @@ internal class UuDirectSession(
         return sent
     }
 
-    @Synchronized fun applySettings(settings: UuCaptureSettings, physical: UuDisplayMode? = null, dpi: Int = 0, targetScreen: Int? = null): Boolean {
+    @Synchronized fun applySettings(settings: UuCaptureSettings, physical: UuDisplayMode? = null, dpi: Int = 0, targetScreen: Int? = null,automatic: Boolean=false): Boolean {
         if (!inputReady()) return false
         if(targetScreen==null) remoteSettings.validate(settings) else {
             require(remoteSettings.screens.any {it.id==targetScreen}) {"目标屏幕已移除"}
@@ -1057,6 +1163,7 @@ internal class UuDirectSession(
         val packet = UuWire.captureSetting(sequence, settings,
             targetScreen ?: if (physical != null || dpi != 0) selectedScreen() ?: return false else -2, physical, dpi)
         if (textChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(packet), false)) != true) return false
+        if(!automatic) userConfiguredScreens.add(targetScreen ?: -2)
         pendingSettingsScreen=sequence to targetScreen
         remoteSettings.pending = sequence to settings
         cleanupHandler.postDelayed({ synchronized(this) {
@@ -1080,6 +1187,8 @@ internal class UuDirectSession(
     override fun close() {
         // PeerConnection.dispose must not run on Observer/DataChannel callbacks.
         // Mark closed synchronously, then release on the Android main queue.
+        audioModule?.setMicrophoneMute(true);micState.stop()
+        clipboardBinding.enable(false);live.remove(this)
         deferredClose.request { rtcCallbacks.close();disposeAfterCallbacks() }
     }
 
@@ -1158,6 +1267,9 @@ internal class UuDirectSession(
                     runCatching { channel.dispose() }
                 }
             }
+            val micTrack=microphoneTrack;val micSource=microphoneSource;val micSender=microphoneTransceiver?.sender
+            microphoneTrack=null;microphoneSource=null;microphoneActive=false;microphoneNegotiated=false;microphoneTransceiver=null
+            cleanup.add {runCatching {micSender?.setTrack(null,false)};runCatching {micTrack?.dispose()};runCatching {micSource?.dispose()}}
             val connection = peer
             peer = null
             cleanup.add { connection?.close(); connection?.dispose() }
@@ -1170,6 +1282,7 @@ internal class UuDirectSession(
             val engine = factory
             factory = null
             cleanup.add { engine?.dispose() }
+            val adm=audioModule;audioModule=null;cleanup.add {adm?.release()}
             cleanup
         }
         // JNI operations may wait for network/signaling callbacks; never hold

@@ -151,6 +151,8 @@ internal object UuWire {
         })
     }
 
+    fun microphonePolicy(sequence: Long,enabled: Boolean)=rpc(sequence,21,message {integer(it,1,if(enabled) 1 else 0)})
+
     internal fun rpc(sequence: Long, field: Int, payload: ByteArray): ByteArray = message { out ->
         integer(out, 1, sequence); integer(out, 2, System.currentTimeMillis())
         bytes(out, 21, message { request ->
@@ -246,7 +248,9 @@ internal object UuWire {
         val cursorScreen: Int? = null,
         val topologyAck: Pair<Long, Int>? = null,
         val captureAck: Long? = null,
-        val captureErrors: List<Int> = emptyList()
+        val captureErrors: List<Int> = emptyList(),
+        val microphoneAck: Pair<Long,Int>? = null,
+        val simpleAction: Int? = null
     )
     private class Reader(private val data: ByteArray) {
         var offset = 0
@@ -427,7 +431,8 @@ internal object UuWire {
         return Envelope(sequence, timestamp, echo, screen, screen?.let(tracksByScreen::get), echoAck, registeredRequest,
             registrationError, tracksByScreen.toMap(), remoteScreens, flags?.number(1)?.toInt(), cursor?.number(6)?.toInt(), cursor?.number(9)?.toInt(),
             response?.data(8)?.let { captureRequest?.let { id -> id to fields(it).number(1).toInt() } },
-            if (captureReply != null) captureRequest else null, errors)
+            if (captureReply != null) captureRequest else null, errors,
+            response?.data(17)?.let {captureRequest?.let {id -> id to fields(it).number(1).toInt()}},simple?.number(1)?.toInt())
 
     }
 

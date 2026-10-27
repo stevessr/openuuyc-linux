@@ -6,7 +6,7 @@ inline int xr_control_owner(int pane) {
     if(pane>=0 && pane<6) return pane;
     if(pane>=7 && pane<=12) return pane-7;
     if(pane>=13 && pane<=36) return (pane-13)/4;
-    if(pane>=37 && pane<=66) return (pane-37)%6;
+    if(pane>=37 && pane<=78) return (pane-37)%6;
     return -1;
 }
 inline int xr_choose_pointer(const XrPointerIntent (&h)[2],int captured,int preferred) {

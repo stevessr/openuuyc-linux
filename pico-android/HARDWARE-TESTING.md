@@ -191,3 +191,20 @@
 - 两手先评估再选输入手：按下事件优先，空闲的另一只手不能阻止菜单命中；拖动时保持原手柄捕获。主页面/环境/退出等全局菜单操作不再依赖活动串流存在。
 - 原生回归覆盖六屏内容与菜单 ID 区分、控件归属、双手菜单优先级及捕获不被抢走；新增设备 fixture 检查无串流时主页面/环境仍可点击。
 - 实际普通 UU 连接是否不再 ANR、沉浸式射线与圆点位置及主菜单手柄点击，仍须用户实机复测；基础 fixture 不是这些真实操作的通过证据。
+
+## Portrait stream sampling correction (2026-10-27)
+
+- OS 5 native video Surface swapchains now use an orientation-neutral square edge,
+  capped at 2160 and clamped to the runtime's reported image limits. Composition
+  samples the entire Surface; physical quad aspect still follows decoded frames.
+  This avoids downsampling portrait video into the old 1920×1080 landscape target.
+- Unconfigured portrait screens request a larger capture height only within the
+  advertised codec capability intersection. Explicit user settings are preserved;
+  requests remain pending until the existing remote acknowledgement path confirms.
+- Native resolution tests and four JVM portrait-planner tests cover runtime limits,
+  landscape stability, manual overrides and missing capabilities. Local Android
+  build/JVM/Lint validation does not establish live remote portrait sharpness.
+- Microphone and plain-text clipboard toolbar controls are included in this build.
+  Both are opt-in; microphone capture requires Android permission, negotiated send
+  direction, remote driver acknowledgement/open event and foreground app state.
+  Remote microphone interoperability and live clipboard transfer remain unverified.

@@ -14,7 +14,7 @@ import org.openuuyc.pico.uu.UuCaptureSettings
 import org.openuuyc.pico.uu.UuDisplayMode
 import kotlinx.coroutines.delay
 
-private enum class SettingsPage(val title: String) { QUALITY("画质"), DISPLAY("显示器分辨率与 DPI"), ADVANCED("高级设置"), CODEC("编码偏好") }
+private enum class SettingsPage(val title: String) { QUALITY("画质"), DISPLAY("显示器分辨率与 DPI"), ADVANCED("高级设置"), CODEC("编码偏好"), BITRATE("自定义码率") }
 
 /** Each official Subwindow owns this popup, including navigation and pending state. */
 @OptIn(ExperimentalLayoutApi::class)
@@ -46,7 +46,7 @@ internal fun SpatialStreamSettings(window: SpatialSessionController.StreamWindow
                 listOf(5 to "自动（原画）",4 to "原画",3 to "超清",2 to "高清").forEach {(quality,label) ->
                     ChoiceButton("${if(state.current.quality==quality) "✓  " else "     "}$label",state.current.quality==quality,ready,Modifier.fillMaxWidth()) {apply(state.current.copy(quality=quality))}
                 }
-                ChoiceButton("自定义码率                   ${state.current.bitrateMbps} Mbps ›",state.current.quality==6,ready,Modifier.fillMaxWidth()) {page=SettingsPage.ADVANCED}
+                ChoiceButton("自定义码率                   ${state.current.bitrateMbps} Mbps ›",state.current.quality==6,ready,Modifier.fillMaxWidth()) {bitrate=state.current.bitrateMbps.toString();page=SettingsPage.BITRATE}
                 ChoiceButton("显示器分辨率与 DPI                     ›",modifier=Modifier.fillMaxWidth()) {page=SettingsPage.DISPLAY}
                 SectionLabel("帧率上限","当前 ${state.current.fps} FPS · 仅列出双方可用预设")
                 FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp),verticalArrangement=Arrangement.spacedBy(8.dp)) {
@@ -80,10 +80,12 @@ internal fun SpatialStreamSettings(window: SpatialSessionController.StreamWindow
                     source?.dpis.orEmpty().forEach {dpi -> ChoiceButton("$dpi%",source?.dpi==dpi,ready && state.captureLevel>=5) {apply(dpi=dpi)}}
                 }
             }
-            SettingsPage.ADVANCED -> {
+            SettingsPage.BITRATE -> {
                 SectionLabel("自定义码率","Mbps · 实际可用上限以远端确认结果为准")
                 TextField(value=bitrate,onValueChange={bitrate=it.filter(Char::isDigit).take(3)},modifier=Modifier.fillMaxWidth(),placeholder={Text("输入 1–500 Mbps")})
                 Button(onClick={apply(state.current.copy(quality=6,bitrateMbps=bitrate.toIntOrNull() ?: 0))},enabled=ready && bitrate.toIntOrNull() in 1..500) {Text("应用码率")}
+            }
+            SettingsPage.ADVANCED -> {
                 SectionLabel("串流尺寸上限","仅列出双方编码能力支持的尺寸")
                 val sizes=state.profiles.filter {state.current.codec==0 || it.codec==state.current.codec}.map {it.width to it.height}.distinct().sortedBy {it.first*it.second}
                 sizes.forEach {(w,h) -> ChoiceButton("$w × $h",state.current.maxWidth==w && state.current.maxHeight==h,ready,Modifier.fillMaxWidth()) {apply(state.current.copy(maxWidth=w,maxHeight=h))}}

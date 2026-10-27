@@ -10,6 +10,11 @@ import android.view.Surface
 /** One atlas row per window: independent hover states, transparent video area. */
 internal class PicoXrWindowFrame(private val surface: Surface) {
     private val titles=Array(6) {"正在连接…"}
+    private val microphones=BooleanArray(6)
+    private val clipboards=BooleanArray(6)
+    fun sharing(pane: Int,mic: Boolean,clip: Boolean) {
+        if(pane in 0..5 && (microphones[pane]!=mic || clipboards[pane]!=clip)) {microphones[pane]=mic;clipboards[pane]=clip;draw()}
+    }
     fun title(pane: Int,text: String) {if(pane in 0..5 && titles[pane]!=text) {titles[pane]=text;draw()}}
     private var background=Color.BLACK
     private var backgroundImage: Bitmap?=null
@@ -41,10 +46,18 @@ internal class PicoXrWindowFrame(private val surface: Surface) {
                 p.color=Color.argb(245,22,27,35)
                 c.drawRoundRect(RectF(100f,0f,1100f,54f),14f,14f,p)
                 p.color=if(hover==49+pane) Color.rgb(34,53,78) else Color.rgb(32,39,49)
-                c.drawRoundRect(RectF(110f,5f,460f,49f),7f,7f,p)
+                c.drawRoundRect(RectF(110f,5f,330f,49f),7f,7f,p)
                 p.color=PicoTheme.TEXT;p.textSize=24f
                 val device=titles[pane].substringBefore(" - ")+" ▾"
-                c.drawText(device.take(p.breakText(device,true,325f,null)),122f,35f,p)
+                c.drawText(device.take(p.breakText(device,true,190f,null)),122f,35f,p)
+                for(slot in 0..1) {
+                    val active=if(slot==0) microphones[pane] else clipboards[pane]
+                    val hovered=hover==(if(slot==0) 67 else 73)+pane
+                    val x=340f+slot*65
+                    p.color=if(active || hovered) Color.rgb(34,53,78) else Color.rgb(22,26,33)
+                    c.drawRoundRect(RectF(x,5f,x+55,49f),7f,7f,p)
+                    PicoToolbarIcons.draw(c,if(slot==0) "mic" else "clipboard",x+12,11f,30f,if(active || hovered) PicoTheme.ACCENT else PicoTheme.MUTED)
+                }
                 p.color=if(hover==55+pane) PicoTheme.ACCENT else Color.rgb(34,53,78)
                 c.drawRoundRect(RectF(475f,5f,880f,49f),7f,7f,p)
                 p.color=PicoTheme.TEXT
