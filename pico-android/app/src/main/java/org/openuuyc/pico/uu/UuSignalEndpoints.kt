@@ -11,7 +11,12 @@ internal class UuSignalEndpoints(raw: List<String>) {
     // make duplicates nondeterministic across millisecond boundaries.
     private val endpoints = raw.distinct()
     private var index = 0
-    init { require(endpoints.isNotEmpty()) }
+    init {
+        require(endpoints.isNotEmpty())
+        // Fail closed on insecure or invalid roster entries before opening any
+        // sockets; generated t values are not used for endpoint identity.
+        endpoints.forEach(UuWire::signalEndpoint)
+    }
 
     val current: String get() = UuWire.signalEndpoint(endpoints[index])
     val position: Int get() = index + 1
