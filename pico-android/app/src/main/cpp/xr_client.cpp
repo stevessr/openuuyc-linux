@@ -1,6 +1,6 @@
 // PICO OpenXR native client. Stereo display comes from the compositor:
-// one head-locked spatial quad is rendered separately for each eye, while
-// the Android MediaCodec producer writes H.264 frames into the quad Surface.
+// up to three independent world-space quads can display separate UU RTP
+// tracks, with each Android decoder producing into its own Surface.
 #include <jni.h>
 #include <android/log.h>
 #include <EGL/egl.h>
@@ -9,6 +9,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <atomic>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -18,6 +19,7 @@
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "OpenUUYC-PICO", __VA_ARGS__)
 static std::atomic<bool> stop_requested{false};
+static std::atomic<uint32_t> window_visible_mask{1u};
 
 static XrPosef identity_pose(float z = 0.f) {
     XrPosef pose{};
@@ -175,22 +177,36 @@ static XrVector3f rotate_vector(const XrQuaternionf &q, XrVector3f v) {
             v.z + q.w*t.z + q.x*t.y - q.y*t.x};
 }
 
-static bool intersect_quad(const XrPosef &aim, float &u, float &v) {
+static bool intersect_quad(const XrPosef &aim, float &u, float &v, int &pane) {
     XrVector3f direction = rotate_vector(aim.orientation, {0.f, 0.f, -1.f});
     if (std::fabs(direction.z) < 0.0001f) return false;
-    float t = (-2.f - aim.position.z) / direction.z;
+    const float t = (-2.f - aim.position.z) / direction.z;
     if (t <= 0.f) return false;
-    float x = aim.position.x + t * direction.x;
-    float y = aim.position.y + t * direction.y;
-    u = x / 1.8f + 0.5f;
-    v = 0.5f - y / 1.0125f;
-    return u >= 0.f && u <= 1.f && v >= 0.f && v <= 1.f;
+    const float x = aim.position.x + t * direction.x;
+    const float y = aim.position.y + t * direction.y;
+    const uint32_t visible = window_visible_mask.load(std::memory_order_acquire);
+    for (int index = 0; index < 3; ++index) {
+        if (!(visible & (1u << index))) continue;
+        const float center = index == 1 ? -1.55f : index == 2 ? 1.55f : 0.f;
+        const float width = index == 0 ? 1.65f : 1.25f;
+        const float height = width * 9.f / 16.f;
+        const float horizontal = (x - center) / width + 0.5f;
+        const float vertical = 0.5f - y / height;
+        if (horizontal >= 0.f && horizontal <= 1.f &&
+            vertical >= 0.f && vertical <= 1.f) {
+            pane = index;
+            u = horizontal;
+            v = vertical;
+            return true;
+        }
+    }
+    return false;
 }
 
 static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmethodID scroll_method,
                           XrSession session, XrSpace world, Actions &actions,
                           XrTime timestamp, bool &last_down, float &old_u, float &old_v,
-                          XrTime &last_scroll_time) {
+                          int &last_pane, XrTime &last_scroll_time) {
     XrActiveActionSet active{actions.set, XR_NULL_PATH};
     XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
     sync.countActiveActionSets = 1;
@@ -203,16 +219,23 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
             (location.locationFlags & (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) !=
             (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) continue;
         float u = 0.f, v = 0.f;
-        if (!intersect_quad(location.pose, u, v)) continue;
+        int pane = 0;
+        if (!intersect_quad(location.pose, u, v, pane)) continue;
         XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};
         query.action = actions.click;
         query.subactionPath = actions.hand_paths[hand];
         XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
         if (XR_FAILED(xrGetActionStateBoolean(session, &query, &state))) continue;
         bool down = state.isActive && state.currentState == XR_TRUE;
-        if (down != last_down || std::fabs(u-old_u) >= 0.002f || std::fabs(v-old_v) >= 0.002f) {
-            env->CallVoidMethod(activity, method, u, v, down ? JNI_TRUE : JNI_FALSE);
-            old_u = u; old_v = v; last_down = down;
+        if (pane != last_pane && last_down) {
+            env->CallVoidMethod(activity, method, last_pane, old_u, old_v, JNI_FALSE);
+            last_down = false;
+            down = false; // never carry a drag across different remote desktops
+        }
+        if (pane != last_pane || down != last_down ||
+            std::fabs(u-old_u) >= 0.002f || std::fabs(v-old_v) >= 0.002f) {
+            env->CallVoidMethod(activity, method, pane, u, v, down ? JNI_TRUE : JNI_FALSE);
+            old_u = u; old_v = v; last_down = down; last_pane = pane;
         }
         // PICO4/PICO4S/Neo3: thumbstick vertical axis maps to the UU
         // mouse_scroll action. Dead zone and 120ms repeat protect against
@@ -235,7 +258,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
         return;
     }
     if (last_down) {
-        env->CallVoidMethod(activity, method, old_u, old_v, JNI_FALSE);
+        env->CallVoidMethod(activity, method, last_pane, old_u, old_v, JNI_FALSE);
         last_down = false;
     }
 }
@@ -246,11 +269,20 @@ Java_org_openuuyc_pico_PicoActivity_nativeStop(JNIEnv *, jobject) {
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetWindowVisible(JNIEnv *, jobject, jint pane, jboolean visible) {
+    if (pane < 0 || pane >= 3) return;
+    const uint32_t bit = 1u << pane;
+    if (visible) window_visible_mask.fetch_or(bit, std::memory_order_acq_rel);
+    else window_visible_mask.fetch_and(~bit, std::memory_order_acq_rel);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject activity) {
     stop_requested.store(false, std::memory_order_release);
+    window_visible_mask.store(1u, std::memory_order_release);
     jclass klass = env->GetObjectClass(activity);
-    jmethodID ready = env->GetMethodID(klass, "onXrSurface", "(Landroid/view/Surface;)V");
-    jmethodID pointer = env->GetMethodID(klass, "onPointer", "(FFZ)V");
+    jmethodID ready = env->GetMethodID(klass, "onXrSurface", "(ILandroid/view/Surface;)V");
+    jmethodID pointer = env->GetMethodID(klass, "onPointer", "(IFFZ)V");
     jmethodID scroll_method = env->GetMethodID(klass, "onScroll", "(I)V");
     JavaVM *vm = nullptr;
     env->GetJavaVM(&vm);
@@ -258,7 +290,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     XrInstance instance = XR_NULL_HANDLE;
     XrSession session = XR_NULL_HANDLE;
     XrSpace world = XR_NULL_HANDLE;
-    XrSwapchain swapchain = XR_NULL_HANDLE;
+    XrSwapchain swapchains[3] = {XR_NULL_HANDLE, XR_NULL_HANDLE, XR_NULL_HANDLE};
     EGLState egl;
     Actions actions;
     bool running = false;
@@ -266,6 +298,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     bool action_ready = false;
     bool previous_down = false;
     float previous_u = -1.f, previous_v = -1.f;
+    int previous_pane = 0;
     XrTime last_scroll_time = 0;
     const char *failure = nullptr;
 
@@ -345,6 +378,10 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             failure = "No local tracking reference space"; break;
         }
         action_ready = actions.create(instance, session);
+        XrSystemProperties properties{XR_TYPE_SYSTEM_PROPERTIES};
+        uint32_t max_layers = 1;
+        if (XR_SUCCEEDED(xrGetSystemProperties(instance, system, &properties)))
+            max_layers = std::min(3u, properties.graphicsProperties.maxLayerCount);
         PFN_xrCreateSwapchainAndroidSurfaceKHR create_surface = nullptr;
         xrGetInstanceProcAddr(instance, "xrCreateSwapchainAndroidSurfaceKHR",
             reinterpret_cast<PFN_xrVoidFunction *>(&create_surface));
@@ -354,12 +391,18 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         swapchain_info.width = 1920;
         swapchain_info.height = 1080;
         // Extension requires format/sampleCount/faceCount/arraySize/mipCount = 0.
-        jobject surface = nullptr;
-        if (!xr_ok(create_surface(session, &swapchain_info, &swapchain, &surface), "surface swapchain") || !surface) {
-            failure = "Cannot create video Surface"; break;
+        for (uint32_t pane = 0; pane < max_layers; ++pane) {
+            jobject surface = nullptr;
+            if (!xr_ok(create_surface(session, &swapchain_info, &swapchains[pane], &surface),
+                       "create pane swapchain") || !surface) {
+                if (pane == 0) failure = "Cannot create main video Surface";
+                else LOGE("Auxiliary pane %u unavailable; continuing with fewer windows", pane);
+                continue;
+            }
+            env->CallVoidMethod(activity, ready, static_cast<jint>(pane), surface);
+            env->DeleteLocalRef(surface);
         }
-        env->CallVoidMethod(activity, ready, surface);
-        env->DeleteLocalRef(surface);
+        if (failure) break;
         while (!stop_requested.load(std::memory_order_acquire)) {
             XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
             while (xrPollEvent(instance, &event) == XR_SUCCESS) {
@@ -371,7 +414,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                     // the user is no longer interacting with our XR layer.
                     input_focused = changed->state == XR_SESSION_STATE_FOCUSED;
                     if (!input_focused && previous_down) {
-                        env->CallVoidMethod(activity, pointer, previous_u, previous_v, JNI_FALSE);
+                        env->CallVoidMethod(activity, pointer, previous_pane, previous_u, previous_v, JNI_FALSE);
                         previous_down = false;
                     }
                     if (changed->state == XR_SESSION_STATE_READY && !running) {
@@ -397,26 +440,35 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             if (XR_FAILED(xrWaitFrame(session, &wait_info, &state))) break;
             XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
             if (XR_FAILED(xrBeginFrame(session, &begin))) break;
-            XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-            quad.space = world;
-            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            quad.pose = identity_pose(-2.f);
-            quad.size = {1.8f, 1.0125f};
-            quad.subImage.swapchain = swapchain;
-            quad.subImage.imageRect = {{0, 0}, {1920, 1080}};
-            quad.subImage.imageArrayIndex = 0;
-            const XrCompositionLayerBaseHeader *layers[] = {
-                reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad)
-            };
+            XrCompositionLayerQuad quads[3]{};
+            const XrCompositionLayerBaseHeader *layers[3]{};
+            uint32_t layer_count = 0;
+            const uint32_t visible = window_visible_mask.load(std::memory_order_acquire);
+            for (uint32_t index = 0; index < 3; ++index) {
+                if (swapchains[index] == XR_NULL_HANDLE || !(visible & (1u << index)))
+                    continue;
+                auto &quad = quads[layer_count];
+                quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+                quad.space = world;
+                quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                quad.pose = identity_pose(-2.f);
+                quad.pose.position.x = index == 1 ? -1.55f : index == 2 ? 1.55f : 0.f;
+                quad.size.width = index == 0 ? 1.65f : 1.25f;
+                quad.size.height = quad.size.width * 9.f / 16.f;
+                quad.subImage.swapchain = swapchains[index];
+                quad.subImage.imageRect = {{0, 0}, {1920, 1080}};
+                quad.subImage.imageArrayIndex = 0;
+                layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad);
+            }
             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
             end.displayTime = state.predictedDisplayTime;
             end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-            end.layerCount = state.shouldRender ? 1u : 0u;
-            end.layers = state.shouldRender ? layers : nullptr;
+            end.layerCount = state.shouldRender ? layer_count : 0u;
+            end.layers = end.layerCount ? layers : nullptr;
             if (action_ready && input_focused && state.shouldRender) {
                 process_input(env, activity, pointer, scroll_method, session, world, actions,
                               state.predictedDisplayTime, previous_down, previous_u, previous_v,
-                              last_scroll_time);
+                              previous_pane, last_scroll_time);
             } else if (previous_down) {
                 env->CallVoidMethod(activity, pointer, previous_u, previous_v, JNI_FALSE);
                 previous_down = false;
@@ -433,7 +485,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     }
     if (running) xrEndSession(session);
     actions.destroy();
-    if (swapchain != XR_NULL_HANDLE) xrDestroySwapchain(swapchain);
+    for (auto chain : swapchains) if (chain != XR_NULL_HANDLE) xrDestroySwapchain(chain);
     if (world != XR_NULL_HANDLE) xrDestroySpace(world);
     if (session != XR_NULL_HANDLE) xrDestroySession(session);
     if (instance != XR_NULL_HANDLE) xrDestroyInstance(instance);
