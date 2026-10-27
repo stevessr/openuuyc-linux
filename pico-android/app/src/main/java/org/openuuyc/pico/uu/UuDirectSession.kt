@@ -317,6 +317,10 @@ internal class UuDirectSession(
                     } else if (channel.state() == DataChannel.State.CLOSED ||
                                channel.state() == DataChannel.State.CLOSING) {
                         if (channel === controlChannel || channel === textChannel) {
+                            // Revoke the button while CONTROL is still writable.
+                            if (pressed && controlChannel?.state() == DataChannel.State.OPEN) {
+                                sendControl(UuPointerWire.button(false))
+                            }
                             captureGate.onTransportClosed()
                             pressed = false
                         }
@@ -335,10 +339,24 @@ internal class UuDirectSession(
                     if (bytes.isNotEmpty() && bytes[0] == '{'.code.toByte()) return
                     try {
                         val payload = UuWire.decodeEnvelope(bytes)
+                        val beforeScreen = captureGate.selectedScreen
+                        val beforeTrack = captureGate.selectedTrack
                         if (isControl && payload.echoRequest) {
                             sendControl(UuWire.echoResponse(payload.seq, payload.timestamp))
                         }
-                        when (captureGate.observe(payload, isControl)) {
+                        val acknowledgment = captureGate.observe(payload, isControl)
+                        // A host display/track change revokes the held drag. Do
+                        // not allow a fresh DOWN until the old UP was sent.
+                        if (pressed && (beforeScreen != captureGate.selectedScreen ||
+                                beforeTrack != captureGate.selectedTrack)) {
+                            if (!sendControl(UuPointerWire.button(false))) {
+                                emit("UU 显示器切换时按键释放失败，已断开远控")
+                                close()
+                                return
+                            }
+                            pressed = false
+                        }
+                        when (acknowledgment) {
                             UuCaptureGate.Ack.REGISTERED -> emit("UU 视频轨道注册确认成功")
                             UuCaptureGate.Ack.REJECTED -> emit("UU 视频轨道注册被拒绝（错误码 ${payload.trackAckError}）")
                             UuCaptureGate.Ack.NONE -> {}
@@ -410,16 +428,12 @@ internal class UuDirectSession(
         if (closed.get() || !captureGate.inputReady(
             controlChannel?.state() == DataChannel.State.OPEN,
             textChannel?.state() == DataChannel.State.OPEN
-        ) || !u.isFinite() || !v.isFinite()) return
+        )) return
         val screen = captureGate.selectedScreen ?: return
-        val x = u.toDouble().coerceIn(0.0, 0.999999)
-        val y = v.toDouble().coerceIn(0.0, 0.999999)
-        sendControl(JSONObject().put("action", "mouse_move_absolute")
-            .put("screen_id", screen).put("abs_x", x).put("abs_y", y)
-            .toString().toByteArray(StandardCharsets.UTF_8))
+        if (!UuPointerWire.valid(u, v)) return
+        if (!sendControl(UuPointerWire.move(screen, u, v))) return
         if (pressed != down) {
-            if (sendControl(JSONObject().put("action", if (down) "mouse_press" else "mouse_release")
-                .put("button", 1).toString().toByteArray(StandardCharsets.UTF_8))) pressed = down
+            if (sendControl(UuPointerWire.button(down))) pressed = down
         }
     }
 
@@ -427,7 +441,7 @@ internal class UuDirectSession(
         if (!closed.compareAndSet(false, true)) return
         echoRetry?.cancel(false)
         heartbeatExecutor.shutdownNow()
-        if (pressed) sendControl("""{"action":"mouse_release","button":1}""".toByteArray())
+        if (pressed) sendControl(UuPointerWire.button(false))
         pressed = false
         captureGate.onTransportClosed()
         answerInstalled = false
