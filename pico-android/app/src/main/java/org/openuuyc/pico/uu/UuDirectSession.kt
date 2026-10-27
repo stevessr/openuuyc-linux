@@ -275,7 +275,14 @@ internal class UuDirectSession(
             "answer", "restart_ice" -> {
                 val sdp = if (compressed != null) UuWire.ungzip(compressed) else data.optString("sdp")
                 if (sdp.isBlank()) return
-                remoteIce.resetForRenegotiation()
+                // Trickle candidates may arrive before the initial SDP.
+                // Preserve that queue on first answer; only discard an
+                // installed generation when the host explicitly restarts ICE.
+                val restart = data.optString("type") == "restart_ice"
+                if (remoteIce.isReady()) {
+                    if (!restart) return // Duplicate answer, do not reset ICE.
+                    remoteIce.resetForRenegotiation()
+                }
                 peer?.setRemoteDescription(sdpObserver(onSuccess = {
                     synchronized(this@UuDirectSession) {
                         if (closed.get()) return@synchronized
