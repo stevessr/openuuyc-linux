@@ -180,27 +180,34 @@ class PicoActivity : Activity() {
         message("加入 UU 远控房间：${device.alias}")
         worker.submit {
             try {
-                // The pending NRD request might finish after the user
-                // disconnected. Only its active generation can enter XR.
+                // Only the network request runs off-thread. Adoption and
+                // Session/Surface ownership are serialized on the UI thread
+                // with Stop and Activity.onDestroy.
                 val room = api.join(device)
-                if (isFinishing || isDestroyed || !joinGate.adopt(ticket)) return@submit
-                val direct = UuDirectSession(applicationContext, room, api.identity, ::message)
-                session = direct
-                running.set(true)
-                xrThread = Thread({
-                    try { nativeRun(this) }
-                    finally {
-                        ui.post {
-                            if (!isDestroyed) stopSession()
-                            xrSurface?.release()
-                            xrSurface = null
-                        }
+                ui.post {
+                    if (isFinishing || isDestroyed || !joinGate.adopt(ticket)) return@post
+                    try {
+                        val direct = UuDirectSession(applicationContext, room, api.identity, ::message)
+                        session = direct
+                        running.set(true)
+                        xrThread = Thread({
+                            try { nativeRun(this) }
+                            finally {
+                                ui.post {
+                                    if (!isDestroyed) stopSession()
+                                    xrSurface?.release()
+                                    xrSurface = null
+                                }
+                            }
+                        }, "OpenUUYC-PICO-OpenXR").also { it.start() }
+                    } catch (e: Exception) {
+                        joinGate.stop()
+                        message("UU 头显启动失败：${e.javaClass.simpleName}")
                     }
-                }, "OpenUUYC-PICO-OpenXR").also { it.start() }
+                }
             } catch (e: Exception) {
-                if (!isDestroyed) message("UU 设备连接失败：${e.javaClass.simpleName}")
-            } finally {
                 joinGate.failed(ticket)
+                if (!isDestroyed) message("UU 设备连接失败：${e.javaClass.simpleName}")
             }
         }
     }
