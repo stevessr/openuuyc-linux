@@ -52,6 +52,7 @@ internal class UuDirectSession(
     private val room: UuRoom,
     private val identity: UuIdentity,
     private val events: (String) -> Unit,
+    private val onWindowVisibility: (Int, Boolean) -> Unit = { _, _ -> },
     private val onUnexpectedDisconnect: () -> Unit = {}
 ) : AutoCloseable {
     private val http = OkHttpClient.Builder().pingInterval(0, TimeUnit.SECONDS)
@@ -77,13 +78,16 @@ internal class UuDirectSession(
     private var peer: PeerConnection? = null
     private var factory: PeerConnectionFactory? = null
     private var egl: EglBase? = null
-    private var renderer: EglRenderer? = null
-    private var surface: Surface? = null
+    private val renderers = mutableMapOf<Int, EglRenderer>()
+    private val windowSurfaces = mutableMapOf<Int, Surface>()
+    private val windowVideos = mutableMapOf<Int, VideoTrack>()
+    private var screenTracks: Map<Int, Int> = emptyMap()
+    private var windowPlan: List<UuWindowLayout.Pane?> = listOf(null, null, null)
+    private var pointerScreen: Int? = null
     private var controlInfo: ControlReply? = null
     private var controlChannel: DataChannel? = null
     private var textChannel: DataChannel? = null
     private val channels = mutableListOf<DataChannel>()
-    private var video: VideoTrack? = null
     private val videoTrackRouter = UuVideoTrackRouter<VideoTrack>()
     private var negotiatedVideoTracks: List<Int> = emptyList()
     private var remoteAudio: AudioTrack? = null
@@ -118,7 +122,7 @@ internal class UuDirectSession(
 
     @Synchronized fun start(xrSurface: Surface) {
         check(socket == null && !closed.get())
-        surface = xrSurface
+        windowSurfaces[0] = xrSurface
         health.markStarted()
         heartbeatExecutor.scheduleAtFixedRate({
             synchronized(this) {
@@ -336,17 +340,57 @@ internal class UuDirectSession(
         override fun onSetFailure(error: String) { emit("SDP negotiation error") }
     }
 
-    private fun createPeer(info: ControlReply) {
+    /** Secondary XR Surfaces may arrive before or after the signaling handshake. */
+    @Synchronized fun addWindowSurface(index: Int, xrSurface: Surface) {
+        if (closed.get() || index !in 1..2) return
+        if (windowSurfaces.containsKey(index)) return
+        windowSurfaces[index] = xrSurface
+        egl?.let { attachRenderer(index, xrSurface, it) }
+        updateWindows()
+    }
+
+    private fun attachRenderer(index: Int, xrSurface: Surface, base: EglBase) {
+        if (closed.get() || renderers.containsKey(index)) return
+        val output = EglRenderer("OpenUUYC-PICO-pane-" + index)
+        output.init(base.eglBaseContext, EglBase.CONFIG_PLAIN, GlRectDrawer())
+        output.createEglSurface(xrSurface)
+        renderers[index] = output
+        windowVideos[index]?.addSink(output)
+        onWindowVisibility(index, windowVideos[index] != null)
+    }
+
+    /**
+     * Do not bind late RTP callbacks to whichever pane they arrive on.
+     * Always use the currently selected ScreenSources.video_track_index.
+     */
+    @Synchronized private fun updateWindows() {
+        windowPlan = UuWindowLayout.plan(
+            captureGate.selectedScreen, captureGate.selectedTrack,
+            screenTracks, videoTrackRouter.availableIndices()
+        )
+        for (pane in 0..2) {
+            val wanted = windowPlan[pane]?.track?.let(videoTrackRouter::at)
+            val old = windowVideos[pane]
+            if (wanted !== old) {
+                renderers[pane]?.let { old?.removeSink(it) }
+                if (pane == 0) old?.removeSink(firstFrameSink)
+                if (wanted == null) windowVideos.remove(pane) else windowVideos[pane] = wanted
+                renderers[pane]?.let { sink -> wanted?.addSink(sink) }
+                if (pane == 0) wanted?.addSink(firstFrameSink)
+            }
+            onWindowVisibility(pane, wanted != null && renderers.containsKey(pane))
+        }
+    }
+
+    @Synchronized private fun createPeer(info: ControlReply) {
         health.markPeerCreated()
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions()
         )
         val localEgl = EglBase.create()
         egl = localEgl
-        val output = EglRenderer("OpenUUYC-UU-Direct")
-        output.init(localEgl.eglBaseContext, EglBase.CONFIG_PLAIN, GlRectDrawer())
-        output.createEglSurface(surface)
-        renderer = output
+        windowSurfaces.forEach { (index, xrSurface) -> attachRenderer(index, xrSurface, localEgl) }
+        updateWindows()
         val engine = PeerConnectionFactory.builder()
             .setVideoDecoderFactory(org.webrtc.DefaultVideoDecoderFactory(localEgl.eglBaseContext))
             .setVideoEncoderFactory(org.webrtc.DefaultVideoEncoderFactory(localEgl.eglBaseContext, false, true))
@@ -450,18 +494,8 @@ internal class UuDirectSession(
         if (track !is VideoTrack) return
         synchronized(this) {
             if (closed.get()) return
-            bindDisplayedVideo(videoTrackRouter.observed(track.id(), track))
-        }
-    }
-
-    @Synchronized private fun bindDisplayedVideo(track: VideoTrack?) {
-        if (video === track) return
-        renderer?.let { video?.removeSink(it) }
-        video?.removeSink(firstFrameSink)
-        video = track
-        if (track != null) {
-            renderer?.let { track.addSink(it) }
-            track.addSink(firstFrameSink)
+            videoTrackRouter.observed(track.id(), track)
+            updateWindows()
         }
     }
 
@@ -536,10 +570,12 @@ internal class UuDirectSession(
                             sendControl(UuWire.echoResponse(payload.seq, payload.timestamp))
                         }
                         val acknowledgment = captureGate.observe(payload, isControl)
+                        if (payload.screenTracks.isNotEmpty()) screenTracks = payload.screenTracks
                         if (beforeScreen != captureGate.selectedScreen ||
                             beforeTrack != captureGate.selectedTrack) {
                             health.markTrackRegistrationFinished()
-                            bindDisplayedVideo(videoTrackRouter.select(captureGate.selectedTrack))
+                            videoTrackRouter.select(captureGate.selectedTrack)
+                            updateWindows()
                         }
                         // A host display/track change revokes the held drag. Do
                         // not allow a fresh DOWN until the old UP was sent.
@@ -634,13 +670,23 @@ internal class UuDirectSession(
         return channel.send(DataChannel.Buffer(ByteBuffer.wrap(data), true))
     }
 
-    @Synchronized fun pointer(u: Float, v: Float, down: Boolean) {
+    @Synchronized fun pointer(pane: Int, u: Float, v: Float, down: Boolean) {
         if (closed.get()) return
-        val ready = captureGate.inputReady(
+        val target = windowPlan.getOrNull(pane)
+        val screen = target?.screen
+        // Side panes without a validated ScreenSources mapping remain view-only.
+        val mapped = pane == 0 || (screen != null && screenTracks[screen] == target?.track)
+        val ready = mapped && captureGate.inputReady(
             controlChannel?.state() == DataChannel.State.OPEN,
             textChannel?.state() == DataChannel.State.OPEN
         )
-        if (pointerFlow.pointer(captureGate.selectedScreen, u, v, down, ready, ::sendControl) ==
+        if (pointerScreen != screen && pointerFlow.pressed && !pointerFlow.release(::sendControl)) {
+            emit("UU 跨窗口释放远端按键失败")
+            terminateUnexpectedly()
+            return
+        }
+        pointerScreen = screen
+        if (pointerFlow.pointer(screen, u, v, down, ready, ::sendControl) ==
             UuPointerFlow.Result.RELEASE_FAILED) {
             emit("UU 鼠标释放发送失败，停止远程控制以防持续拖拽")
             terminateUnexpectedly()
@@ -668,7 +714,16 @@ internal class UuDirectSession(
         captureGate.onTransportClosed()
         localIce.close()
         remoteIce.close()
-        bindDisplayedVideo(null)
+        for ((index, track) in windowVideos) {
+            renderers[index]?.let(track::removeSink)
+            if (index == 0) track.removeSink(firstFrameSink)
+            onWindowVisibility(index, false)
+        }
+        windowVideos.clear()
+        windowSurfaces.clear()
+        windowPlan = listOf(null, null, null)
+        screenTracks = emptyMap()
+        pointerScreen = null
         videoTrackRouter.reset()
         negotiatedVideoTracks = emptyList()
         remoteAudio?.setEnabled(false)
@@ -683,8 +738,8 @@ internal class UuDirectSession(
         runCatching { peer?.close() }
         runCatching { peer?.dispose() }
         peer = null
-        renderer?.release()
-        renderer = null
+        renderers.values.forEach { it.release() }
+        renderers.clear()
         egl?.release()
         egl = null
         factory?.dispose()

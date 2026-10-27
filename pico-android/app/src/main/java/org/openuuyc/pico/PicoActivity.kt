@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicLong
 class PicoActivity : Activity() {
     private external fun nativeRun(activity: PicoActivity)
     private external fun nativeStop()
+    private external fun nativeSetWindowVisible(index: Int, visible: Boolean)
 
     private val ui = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
@@ -42,7 +43,7 @@ class PicoActivity : Activity() {
     private val running = AtomicBoolean(false)
     @Volatile private var session: UuDirectSession? = null
     private var xrThread: Thread? = null
-    private var xrSurface: Surface? = null
+    private val xrSurfaces = mutableMapOf<Int, Surface>()
     private lateinit var status: TextView
     private lateinit var qrImage: ImageView
     private lateinit var devices: LinearLayout
@@ -202,7 +203,8 @@ class PicoActivity : Activity() {
                 ui.post {
                     if (isFinishing || isDestroyed || !joinGate.adopt(ticket)) return@post
                     try {
-                        val direct = UuDirectSession(applicationContext, room, api.identity, ::message) {
+                        val direct = UuDirectSession(applicationContext, room, api.identity, ::message,
+                            { index, visible -> nativeSetWindowVisible(index, visible) }) {
                             ui.post { if (running.get() && !isDestroyed) stopSession() }
                         }
                         session = direct
@@ -212,8 +214,8 @@ class PicoActivity : Activity() {
                             finally {
                                 ui.post {
                                     if (!isDestroyed) stopSession()
-                                    xrSurface?.release()
-                                    xrSurface = null
+                                    xrSurfaces.values.forEach { it.release() }
+                                    xrSurfaces.clear()
                                 }
                             }
                         }, "OpenUUYC-PICO-OpenXR").also { it.start() }
@@ -230,21 +232,23 @@ class PicoActivity : Activity() {
     }
 
     @Suppress("unused")
-    fun onXrSurface(surface: Surface) {
+    fun onXrSurface(index: Int, surface: Surface) {
         ui.post {
-            if (!running.get()) { surface.release(); return@post }
-            xrSurface = surface
-            try { session?.start(surface) }
-            catch (e: Exception) {
-                message("UU 直连启动失败：${e.javaClass.simpleName}")
+            if (!running.get() || index !in 0..2) { surface.release(); return@post }
+            xrSurfaces.put(index, surface)?.release()
+            try {
+                if (index == 0) session?.start(surface)
+                else session?.addWindowSurface(index, surface)
+            } catch (e: Exception) {
+                message("UU 直连启动失败：" + e.javaClass.simpleName)
                 stopSession()
             }
         }
     }
 
     @Suppress("unused")
-    fun onPointer(u: Float, v: Float, down: Boolean) {
-        session?.pointer(u, v, down)
+    fun onPointer(index: Int, u: Float, v: Float, down: Boolean) {
+        session?.pointer(index, u, v, down)
     }
 
     @Suppress("unused")
