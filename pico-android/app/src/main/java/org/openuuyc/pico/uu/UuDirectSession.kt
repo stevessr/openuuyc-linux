@@ -1,6 +1,9 @@
 package org.openuuyc.pico.uu
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.view.Surface
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -26,6 +29,7 @@ import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.VideoTrack
 import org.webrtc.VideoSink
+import org.webrtc.AudioTrack
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
@@ -78,6 +82,23 @@ internal class UuDirectSession(
     private var textChannel: DataChannel? = null
     private val channels = mutableListOf<DataChannel>()
     private var video: VideoTrack? = null
+    private var remoteAudio: AudioTrack? = null
+    private var audioFocusHeld = false
+    private val audioManager =
+        context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { focus ->
+        synchronized(this) {
+            audioFocusHeld = focus == AudioManager.AUDIOFOCUS_GAIN && !closed.get()
+            remoteAudio?.setEnabled(audioFocusHeld)
+        }
+    }
+    private val audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+        .setAudioAttributes(AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+            .build())
+        .setOnAudioFocusChangeListener(audioFocusListener)
+        .build()
     private var pendingBinaryEvent: JSONObject? = null
     private var pendingBinaryName: String? = null
     private val captureGate = UuCaptureGate()
@@ -328,9 +349,11 @@ internal class UuDirectSession(
             override fun onRenegotiationNeeded() {}
             override fun onAddTrack(receiver: RtpReceiver?, streams: Array<out MediaStream>?) {
                 attachVideo(receiver?.track())
+                attachAudio(receiver?.track())
             }
             override fun onTrack(transceiver: RtpTransceiver?) {
                 attachVideo(transceiver?.receiver?.track())
+                attachAudio(transceiver?.receiver?.track())
             }
         })
         val connection = peer ?: throw IllegalStateException("createPeerConnection failed")
@@ -367,6 +390,23 @@ internal class UuDirectSession(
             video = track
             renderer?.let { track.addSink(it) }
             track.addSink(firstFrameSink)
+        }
+    }
+
+    private fun attachAudio(track: MediaStreamTrack?) {
+        if (track !is AudioTrack) return
+        synchronized(this) {
+            if (closed.get() || remoteAudio === track) return
+            remoteAudio?.setEnabled(false)
+            remoteAudio = track
+            val granted = runCatching {
+                audioManager.requestAudioFocus(audioFocusRequest) ==
+                    AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            }.getOrDefault(false)
+            audioFocusHeld = granted
+            track.setEnabled(granted)
+            emit(if (granted) "UU WebRTC 远端音轨已接入头显音频输出"
+                 else "UU 远端音轨已接入，但 Android 音频焦点不可用")
         }
     }
 
@@ -535,6 +575,12 @@ internal class UuDirectSession(
         renderer?.let { video?.removeSink(it) }
         video?.removeSink(firstFrameSink)
         video = null
+        remoteAudio?.setEnabled(false)
+        remoteAudio = null
+        if (audioFocusHeld) {
+            runCatching { audioManager.abandonAudioFocusRequest(audioFocusRequest) }
+        }
+        audioFocusHeld = false
         channels.forEach { runCatching { it.close() } }
         channels.clear()
         runCatching { peer?.close() }
