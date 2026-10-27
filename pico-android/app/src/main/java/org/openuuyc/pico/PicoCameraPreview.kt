@@ -27,6 +27,7 @@ internal class PicoCameraPreview(
     private var session: CameraCaptureSession? = null
     private var surface: Surface? = null
     private var epoch = 0L
+    private var firstFrame = false
     var active = false
         private set
 
@@ -38,35 +39,47 @@ internal class PicoCameraPreview(
         }
         active = true
         epoch++
+        firstFrame = false
         preview.visibility = View.VISIBLE
-        if (preview.isAvailable) open(epoch)
-        else preview.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+        preview.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) { open(epoch) }
             override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {}
-            override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {}
+            override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {
+                if (active && !firstFrame) {
+                    firstFrame = true
+                    report("摄像头第一帧已收到")
+                }
+            }
             override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean { stop(); return true }
         }
+        if (preview.isAvailable) open(epoch)
     }
 
     private fun open(ticket: Long) {
         if (!active || ticket != epoch || camera != null) return
         try {
             val ids = manager.cameraIdList
-            val id = ids.firstOrNull {
-                manager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) ==
-                    CameraCharacteristics.LENS_FACING_BACK
-            } ?: ids.firstOrNull()
-            if (id == null) {
+            if (ids.isEmpty()) {
                 fail("PICO OS 未向 Android Camera2 暴露相机；Ultra 的原生透视相机需要厂商 XR 相机接口")
                 return
             }
-            val characteristics = manager.getCameraCharacteristics(id)
-            val sizes = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                ?.getOutputSizes(SurfaceTexture::class.java)
-            val size = sizes?.minByOrNull {
-                kotlin.math.abs(it.width - 1280) + kotlin.math.abs(it.height - 720)
-            }
-            if (size == null) { fail("Camera2 相机不支持预览 Surface"); return }
+            // Prefer backward-facing cameras, but skip devices without a usable
+            // SurfaceTexture stream instead of failing on the first listed ID.
+            val candidates = ids.mapNotNull { candidate ->
+                runCatching {
+                    val info = manager.getCameraCharacteristics(candidate)
+                    val sizes = info.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                        ?.getOutputSizes(SurfaceTexture::class.java)
+                    val size = sizes?.minByOrNull {
+                        kotlin.math.abs(it.width - 1280) + kotlin.math.abs(it.height - 720)
+                    } ?: return@runCatching null
+                    Triple(candidate, size, info.get(CameraCharacteristics.LENS_FACING) ==
+                        CameraCharacteristics.LENS_FACING_BACK)
+                }.getOrNull()
+            }.sortedByDescending { it.third }
+            val selected = candidates.firstOrNull()
+            if (selected == null) { fail("系统列出了 Camera2 ID，但没有可预览的摄像头"); return }
+            val (id, size) = selected
             preview.surfaceTexture?.setDefaultBufferSize(size.width, size.height)
             manager.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
@@ -84,7 +97,11 @@ internal class PicoCameraPreview(
                                     val request = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                                     request.addTarget(surface!!)
                                     configured.setRepeatingRequest(request.build(), null, handler)
-                                    report("Camera2 相机已开始输出预览")
+                                    report("Camera2 已开始请求相机图像，等待实际画面")
+                                    handler.postDelayed({
+                                        if (ticket == epoch && active && !firstFrame)
+                                            fail("Camera2 会话成功，但 5 秒内无有效画面；PICO 可能限制了相机输出")
+                                    }, 5_000)
                                 } catch (e: Exception) { fail("Camera2 取流失败：" + e.javaClass.simpleName) }
                             }
                             override fun onConfigureFailed(configured: CameraCaptureSession) {
@@ -111,6 +128,7 @@ internal class PicoCameraPreview(
     fun stop() {
         epoch++
         active = false
+        firstFrame = false
         session?.close()
         session = null
         camera?.close()
