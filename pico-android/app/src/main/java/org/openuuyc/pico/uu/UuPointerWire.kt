@@ -23,6 +23,15 @@ internal object UuPointerWire {
             .toString().toByteArray(StandardCharsets.UTF_8)
     }
 
+    fun scroll(delta: Int): ByteArray {
+        require(delta in -1200..1200 && delta != 0)
+        return JSONObject()
+            .put("action", "mouse_scroll")
+            .put("delta_x", 0)
+            .put("delta_y", delta)
+            .toString().toByteArray(StandardCharsets.UTF_8)
+    }
+
     fun button(down: Boolean): ByteArray =
         JSONObject()
             .put("action", if (down) "mouse_press" else "mouse_release")

@@ -89,6 +89,7 @@ struct Actions {
     XrActionSet set = XR_NULL_HANDLE;
     XrAction aim = XR_NULL_HANDLE;
     XrAction click = XR_NULL_HANDLE;
+    XrAction scroll = XR_NULL_HANDLE;
     XrActionSpaceCreateInfo unused{}; // non-owning action reference
     XrSpace hands[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
     XrPath hand_paths[2] = {XR_NULL_PATH, XR_NULL_PATH};
@@ -112,6 +113,10 @@ struct Actions {
         std::strcpy(info.actionName, "click");
         std::strcpy(info.localizedActionName, "Trigger click");
         if (!xr_ok(xrCreateAction(set, &info, &click), "create trigger action")) return false;
+        info.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
+        std::strcpy(info.actionName, "scroll_y");
+        std::strcpy(info.localizedActionName, "Remote mouse scroll");
+        if (!xr_ok(xrCreateAction(set, &info, &scroll), "create scroll action")) return false;
 
         // Try each PICO generation, then the Khronos simple controller.
         // Profiles unsupported by older runtimes are harmlessly ignored.
@@ -123,16 +128,18 @@ struct Actions {
         };
         for (const auto *profile : profiles) {
             bool simple = std::strcmp(profile, "/interaction_profiles/khr/simple_controller") == 0;
-            XrActionSuggestedBinding bindings[4] = {
+            XrActionSuggestedBinding bindings[6] = {
                 {aim, path(instance, "/user/hand/left/input/aim/pose")},
                 {aim, path(instance, "/user/hand/right/input/aim/pose")},
                 {click, path(instance, simple ? "/user/hand/left/input/select/click" : "/user/hand/left/input/trigger/click")},
-                {click, path(instance, simple ? "/user/hand/right/input/select/click" : "/user/hand/right/input/trigger/click")}
+                {click, path(instance, simple ? "/user/hand/right/input/select/click" : "/user/hand/right/input/trigger/click")},
+                {scroll, path(instance, "/user/hand/left/input/thumbstick/y")},
+                {scroll, path(instance, "/user/hand/right/input/thumbstick/y")}
             };
             XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggested.interactionProfile = path(instance, profile);
             suggested.suggestedBindings = bindings;
-            suggested.countSuggestedBindings = 4;
+            suggested.countSuggestedBindings = simple ? 4 : 6;
             if (suggested.interactionProfile != XR_NULL_PATH)
                 xrSuggestInteractionProfileBindings(instance, &suggested);
         }
@@ -180,9 +187,10 @@ static bool intersect_quad(const XrPosef &aim, float &u, float &v) {
     return u >= 0.f && u <= 1.f && v >= 0.f && v <= 1.f;
 }
 
-static void process_input(JNIEnv *env, jobject activity, jmethodID method,
+static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmethodID scroll_method,
                           XrSession session, XrSpace world, Actions &actions,
-                          XrTime timestamp, bool &last_down, float &old_u, float &old_v) {
+                          XrTime timestamp, bool &last_down, float &old_u, float &old_v,
+                          XrTime &last_scroll_time) {
     XrActiveActionSet active{actions.set, XR_NULL_PATH};
     XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
     sync.countActiveActionSets = 1;
@@ -206,6 +214,24 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method,
             env->CallVoidMethod(activity, method, u, v, down ? JNI_TRUE : JNI_FALSE);
             old_u = u; old_v = v; last_down = down;
         }
+        // PICO4/PICO4S/Neo3: thumbstick vertical axis maps to the UU
+        // mouse_scroll action. Dead zone and 120ms repeat protect against
+        // noise and flooding the remote host with wheel events.
+        XrActionStateGetInfo scroll_query{XR_TYPE_ACTION_STATE_GET_INFO};
+        scroll_query.action = actions.scroll;
+        scroll_query.subactionPath = actions.hand_paths[hand];
+        XrActionStateFloat scroll_state{XR_TYPE_ACTION_STATE_FLOAT};
+        if (scroll_method && XR_SUCCEEDED(xrGetActionStateFloat(session, &scroll_query, &scroll_state)) &&
+            scroll_state.isActive && std::fabs(scroll_state.currentState) >= 0.45f) {
+            constexpr XrTime scroll_period = 120'000'000; // nanoseconds
+            if (last_scroll_time == 0 || timestamp - last_scroll_time >= scroll_period) {
+                jint delta = scroll_state.currentState >= 0.f ? 120 : -120;
+                env->CallVoidMethod(activity, scroll_method, delta);
+                last_scroll_time = timestamp;
+            }
+        } else {
+            last_scroll_time = 0;
+        }
         return;
     }
     if (last_down) {
@@ -225,6 +251,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     jclass klass = env->GetObjectClass(activity);
     jmethodID ready = env->GetMethodID(klass, "onXrSurface", "(Landroid/view/Surface;)V");
     jmethodID pointer = env->GetMethodID(klass, "onPointer", "(FFZ)V");
+    jmethodID scroll_method = env->GetMethodID(klass, "onScroll", "(I)V");
     JavaVM *vm = nullptr;
     env->GetJavaVM(&vm);
 
@@ -239,6 +266,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     bool action_ready = false;
     bool previous_down = false;
     float previous_u = -1.f, previous_v = -1.f;
+    XrTime last_scroll_time = 0;
     const char *failure = nullptr;
 
     do {
@@ -386,8 +414,9 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             end.layerCount = state.shouldRender ? 1u : 0u;
             end.layers = state.shouldRender ? layers : nullptr;
             if (action_ready && input_focused && state.shouldRender) {
-                process_input(env, activity, pointer, session, world, actions,
-                              state.predictedDisplayTime, previous_down, previous_u, previous_v);
+                process_input(env, activity, pointer, scroll_method, session, world, actions,
+                              state.predictedDisplayTime, previous_down, previous_u, previous_v,
+                              last_scroll_time);
             } else if (previous_down) {
                 env->CallVoidMethod(activity, pointer, previous_u, previous_v, JNI_FALSE);
                 previous_down = false;

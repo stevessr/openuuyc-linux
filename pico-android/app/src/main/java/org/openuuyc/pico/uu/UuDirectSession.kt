@@ -511,6 +511,15 @@ internal class UuDirectSession(
         }
     }
 
+    @Synchronized fun scroll(delta: Int) {
+        if (closed.get() || !captureGate.inputReady(
+            controlChannel?.state() == DataChannel.State.OPEN,
+            textChannel?.state() == DataChannel.State.OPEN
+        )) return
+        if (delta !in -1200..1200 || delta == 0) return
+        sendControl(UuPointerWire.scroll(delta))
+    }
+
     @Synchronized override fun close() {
         if (!closed.compareAndSet(false, true)) return
         signalGate.close()

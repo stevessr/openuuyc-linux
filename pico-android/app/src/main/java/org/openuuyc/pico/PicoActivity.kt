@@ -234,6 +234,11 @@ class PicoActivity : Activity() {
     }
 
     @Suppress("unused")
+    fun onScroll(delta: Int) {
+        session?.scroll(delta)
+    }
+
+    @Suppress("unused")
     fun onXrError(reason: String) {
         message("OpenXR：$reason")
         ui.post { stopSession() }

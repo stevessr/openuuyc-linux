@@ -36,6 +36,17 @@ class UuPointerWireTest {
         }
     }
 
+    @Test fun thumbstickScrollMatchesOfficialUuInputJson() {
+        val up = JSONObject(String(UuPointerWire.scroll(120)))
+        val down = JSONObject(String(UuPointerWire.scroll(-120)))
+        assertEquals("mouse_scroll", up.getString("action"))
+        assertEquals(0, up.getInt("delta_x"))
+        assertEquals(120, up.getInt("delta_y"))
+        assertEquals(-120, down.getInt("delta_y"))
+        assertThrows(IllegalArgumentException::class.java) { UuPointerWire.scroll(0) }
+        assertThrows(IllegalArgumentException::class.java) { UuPointerWire.scroll(9999) }
+    }
+
     @Test fun pressAndReleaseAreReversibleUUEvents() {
         val press = JSONObject(String(UuPointerWire.button(true)))
         val release = JSONObject(String(UuPointerWire.button(false)))
