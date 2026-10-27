@@ -54,3 +54,6 @@
 | E1 Camera2 权限 | PICO 4 Ultra 点击相机预览，首次拒绝然后允许 | 权限拒绝能显示说明，允许后能正确枚举/报告实际支持情况 |
 | E2 PICO 相机接口 | PICO 4 Ultra 实机 Camera2 ID 缺失或透视摄像头受限 | 显示具体不可用信息；不得默认为已打开 PICO 透视相机 |
 | E3 相机生命周期 | 开启 Camera2 预览后切换应用/休眠/返回 | 相机资源关闭且无后台预览，重新点击能再次请求，不能泄漏 CameraDevice |
+
+| E4 PICO MR 背景 | PICO 4 Ultra 开启「现实透视背景」并启动 UU 空间窗口 | 若 XR runtime 支持 Alpha Blend，真实环境在三窗口背后出现；关闭开关后恢复 VR 背景 |
+| E5 XR 不支持 MR | 不提供 Alpha Blend 的 OpenXR runtime | 只使用 Opaque，主显示不受影响，日志/状态提示不支持 |

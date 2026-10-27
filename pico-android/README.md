@@ -79,3 +79,9 @@ PICO 原生客户端目前按 XR runtime 支持的合成层上限创建**最多 
 已补 Android `CAMERA` 按需权限请求（不再安装即索要）、Camera2 设备枚举与主动预览入口；打开预览后，若系统不公开 Camera2 ID，应用显示设备不支持的具体原因而不是无响应。页面可缩放，预览失焦/切换应用后会关闭摄像头释放资源。
 
 **PICO 4 Ultra 透视彩色相机不保证暴露为 Android Camera2**：消费版 PICO 的 XR 透视摄像头须经 PICO SDK 对应的专用 XR 相机扩展与平台权限才能获取。当前 Camera2 代码是可用设备的预览路径和错误诊断，**不是** `XR_PICO_camera_image` 透视相机接入的替代品。未经真实头显验证前不得视为原生透视取流修复完成。
+
+## PICO 4 Ultra 视频透视（MR 背景）
+
+在设备列表上方「现实透视背景」切换开关。默认尝试使用 Android OpenXR runtime 所公开的 `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`，把系统渲染的实时环境作为空间窗口后的背景；如果 PICO 固件不支持，则回退到不透视的 VR 背景，不影响控制链路。这与 Camera2 图像读取是两回事：合成器掌握图像，应用本身不获取原始相机帧。该方案参考 PICO 官方视频透视文档，仍需 PICO 4 Ultra 实机确认 alpha-blend 与 quad-only 场景能协同渲染。
+
+若业务确实要求读取摄像头原始帧用于本地计算机视觉，应另行实现 PICO Native OpenXR 3.0 `XR_PICO_camera_image`（依赖 `XR_EXT_future`）或 SecureMR 授权数据通路，并处理运行时能力、设备版本、摄像头占用、异步 Future 生命周期与个人信息权限；`Camera2` 的成功仅代表该固件确实暴露了 Android 摄像头，并非原始透视传感器的保证。
