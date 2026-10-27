@@ -15,7 +15,8 @@ internal class UuVideoTrackRouter<T> {
 
     fun observed(trackId: String, track: T): T? {
         val index = trackId.removePrefix("video_")
-            .takeIf { trackId.startsWith("video_") && it.length in 1..2 && it.all(Char::isDigit) }
+            .takeIf { trackId.startsWith("video_") && it.length in 1..2 &&
+                it.all(Char::isDigit) && (it == "0" || !it.startsWith("0")) }
             ?.toIntOrNull()?.takeIf { it in 0..4 }
         if (index != null) tracks[index] = track
         else if (fallback == null) fallback = track
