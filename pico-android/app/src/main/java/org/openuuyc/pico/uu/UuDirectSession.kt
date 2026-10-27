@@ -44,7 +44,8 @@ internal class UuDirectSession(
     private val context: Context,
     private val room: UuRoom,
     private val identity: UuIdentity,
-    private val events: (String) -> Unit
+    private val events: (String) -> Unit,
+    private val onUnexpectedDisconnect: () -> Unit = {}
 ) : AutoCloseable {
     private val http = OkHttpClient.Builder().pingInterval(0, TimeUnit.SECONDS)
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -109,17 +110,28 @@ internal class UuDirectSession(
                 }
             }
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                emit("UU 信令连接失败：${t.javaClass.simpleName}")
-                close()
+                if (!closed.get()) {
+                    emit("UU 信令连接失败：${t.javaClass.simpleName}")
+                    terminateUnexpectedly()
+                }
             }
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                emit("UU 信令已关闭 ($code)")
-                close()
+                if (!closed.get()) {
+                    emit("UU 信令已关闭 ($code)")
+                    terminateUnexpectedly()
+                }
             }
         })
     }
 
     private fun emit(text: String) { if (!closed.get()) events(text) }
+
+    /** Exit headset mode if the authorized UU signaling connection dies. */
+    private fun terminateUnexpectedly() {
+        if (closed.get()) return
+        close()
+        onUnexpectedDisconnect()
+    }
 
     private fun parseMessage(frame: String) {
         if (closed.get()) return
@@ -149,7 +161,10 @@ internal class UuDirectSession(
                 packet.acknowledge?.let { socket?.send(UuSocketIoWire.eventAck(it)) }
                 when (packet.name) {
                     "soac" -> if (signalGate.mayProcessMedia()) parseSoac(packet.payload, null)
-                    "leave", "publisher_disconnect" -> close()
+                    "leave", "publisher_disconnect" -> {
+                        emit("UU 远端已结束控制会话")
+                        terminateUnexpectedly()
+                    }
                 }
             }
             is UuSocketIoWire.Packet.BinaryStart -> {
@@ -162,9 +177,9 @@ internal class UuDirectSession(
             }
             is UuSocketIoWire.Packet.Rejected -> {
                 emit("UU 信令服务拒绝连接")
-                close()
+                terminateUnexpectedly()
             }
-            UuSocketIoWire.Packet.Disconnected -> close()
+            UuSocketIoWire.Packet.Disconnected -> terminateUnexpectedly()
             UuSocketIoWire.Packet.Ignore -> {}
         }
     }

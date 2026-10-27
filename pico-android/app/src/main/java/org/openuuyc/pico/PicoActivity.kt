@@ -187,7 +187,9 @@ class PicoActivity : Activity() {
                 ui.post {
                     if (isFinishing || isDestroyed || !joinGate.adopt(ticket)) return@post
                     try {
-                        val direct = UuDirectSession(applicationContext, room, api.identity, ::message)
+                        val direct = UuDirectSession(applicationContext, room, api.identity, ::message) {
+                            ui.post { if (running.get() && !isDestroyed) stopSession() }
+                        }
                         session = direct
                         running.set(true)
                         xrThread = Thread({
