@@ -237,6 +237,8 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     bool running = false;
     bool input_focused = false;
     bool action_ready = false;
+    bool previous_down = false;
+    float previous_u = -1.f, previous_v = -1.f;
     const char *failure = nullptr;
 
     do {
@@ -330,8 +332,6 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         }
         env->CallVoidMethod(activity, ready, surface);
         env->DeleteLocalRef(surface);
-        bool previous_down = false;
-        float previous_u = -1.f, previous_v = -1.f;
         while (!stop_requested.load(std::memory_order_acquire)) {
             XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
             while (xrPollEvent(instance, &event) == XR_SUCCESS) {
