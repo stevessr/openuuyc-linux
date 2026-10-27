@@ -123,54 +123,56 @@ internal class UuDirectSession(
 
     private fun parseMessage(frame: String) {
         if (closed.get()) return
-        when {
-            frame == "2" || frame.startsWith("2") -> socket?.send("3" + frame.drop(1))
-            frame.startsWith("40") -> {
+        when (val packet = UuSocketIoWire.parse(frame)) {
+            is UuSocketIoWire.Packet.Open -> emit("UU Engine.IO 会话已建立")
+            is UuSocketIoWire.Packet.Ping -> socket?.send("3" + packet.payload)
+            UuSocketIoWire.Packet.NamespaceConnected -> {
                 if (!signalingConnected) {
                     signalingConnected = true
                     socket?.send("421[\"room_info\"]")
                 }
             }
-            frame.startsWith("431") -> {
-                // room_info ACK id=1
-                val array = JSONArray(frame.removePrefix("431"))
-                if (array.length() == 0 || array.optJSONObject(0) == null)
-                    throw IllegalArgumentException("UU room_info ACK missing")
+            is UuSocketIoWire.Packet.RoomAck -> {
                 val (header, bytes) = UuWire.controlEvent(identity.deviceId, appControlId)
                 socket?.send(header)
                 socket?.send(ByteString.of(*UuWire.attachment(bytes)))
                 emit("UU 房间已登录，发送原生控制握手")
             }
-            frame.startsWith("432") -> {
-                controlInfo = UuWire.parseControlAck(frame, appControlId)
+            is UuSocketIoWire.Packet.ControlAck -> {
+                controlInfo = UuWire.parseControlAck(packet.data, appControlId)
                 emit("UU 控制握手已确认，启动设备直连 WebRTC")
                 createPeer(controlInfo!!)
             }
-            frame.startsWith("451-") -> {
-                val start = frame.indexOf('[')
-                if (start < 0) return
-                val args = JSONArray(frame.substring(start))
-                pendingBinaryName = args.optString(0)
-                pendingBinaryEvent = args.optJSONObject(1)
-            }
-            frame.startsWith("42") -> {
-                val arrayStart = frame.indexOf('[')
-                if (arrayStart < 0) return
-                val packet = JSONArray(frame.substring(arrayStart))
-                if (packet.optString(0) == "soac") {
-                    parseSoac(packet.optJSONObject(1), null)
+            is UuSocketIoWire.Packet.Event -> {
+                packet.acknowledge?.let { socket?.send(UuSocketIoWire.eventAck(it)) }
+                when (packet.name) {
+                    "soac" -> parseSoac(packet.payload, null)
+                    "leave", "publisher_disconnect" -> close()
                 }
             }
-            frame == "41" || frame == "1" -> close()
+            is UuSocketIoWire.Packet.BinaryStart -> {
+                packet.acknowledge?.let { socket?.send(UuSocketIoWire.eventAck(it)) }
+                require(pendingBinaryEvent == null) { "interleaved binary UU events" }
+                pendingBinaryName = packet.name
+                pendingBinaryEvent = packet.payload
+                require(pendingBinaryEvent != null) { "binary UU event missing metadata" }
+            }
+            is UuSocketIoWire.Packet.Rejected -> {
+                emit("UU 信令服务拒绝连接")
+                close()
+            }
+            UuSocketIoWire.Packet.Disconnected -> close()
+            UuSocketIoWire.Packet.Ignore -> {}
         }
     }
 
     private fun parseBinary(frame: ByteArray) {
-        val event = pendingBinaryEvent ?: return
+        val pending = pendingBinaryEvent ?: return
         val type = pendingBinaryName
         pendingBinaryEvent = null
         pendingBinaryName = null
-        if (type == "soac") parseSoac(event, frame)
+        val payload = UuSocketIoWire.binaryPayload(frame)
+        if (type == "soac") parseSoac(pending, UuWire.attachment(payload))
     }
 
     private fun parseSoac(envelope: JSONObject?, compressed: ByteArray?) {
