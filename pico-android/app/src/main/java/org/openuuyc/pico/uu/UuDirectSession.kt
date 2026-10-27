@@ -69,15 +69,8 @@ internal class UuDirectSession(
     private var video: VideoTrack? = null
     private var pendingBinaryEvent: JSONObject? = null
     private var pendingBinaryName: String? = null
-    private var currentScreen: Int? = null
-    private var inputReady = false
-    private var captureRequested = false
-    private var pbConnected = false
-    private var selectedTrackIndex: Int? = null
+    private val captureGate = UuCaptureGate()
     private var nextRequestSeq = 2L
-    private var trackRequested = false
-    private var trackRegistered = false
-    private var pendingTrackSeq: Long? = null
     private var pressed = false
     private var signalingConnected = false
     private var answerInstalled = false
@@ -307,9 +300,9 @@ internal class UuDirectSession(
         channel.registerObserver(object : DataChannel.Observer {
             override fun onBufferedAmountChange(previousAmount: Long) {}
             override fun onStateChange() {
-                if (channel.state() == DataChannel.State.OPEN) {
-                    synchronized(this@UuDirectSession) {
-                        when(channel.label()) {
+                synchronized(this@UuDirectSession) {
+                    if (channel.state() == DataChannel.State.OPEN) {
+                        when (channel.label()) {
                             "CONTROL_DATA_CHANNEL" -> {
                                 controlChannel = channel
                                 startPbHandshake()
@@ -319,49 +312,40 @@ internal class UuDirectSession(
                                 maybeStartCapture()
                             }
                         }
+                    } else if (channel.state() == DataChannel.State.CLOSED ||
+                               channel.state() == DataChannel.State.CLOSING) {
+                        if (channel === controlChannel || channel === textChannel) {
+                            captureGate.onTransportClosed()
+                            pressed = false
+                        }
+                        if (channel === controlChannel) controlChannel = null
+                        if (channel === textChannel) textChannel = null
                     }
                 }
             }
             override fun onMessage(buffer: DataChannel.Buffer) {
-                if (buffer.data.remaining() > 65536) return
-                val bytes = ByteArray(buffer.data.remaining())
-                buffer.data.get(bytes)
-                if (channel.label() != "CONTROL_DATA_CHANNEL" &&
-                    channel.label() != "TEXT_DATA_CHANNEL") return
-                if (bytes.isNotEmpty() && bytes[0] == '{'.code.toByte()) return
-                try {
-                    val payload = UuWire.decodeEnvelope(bytes)
-                    if (channel.label() == "CONTROL_DATA_CHANNEL") {
-                        if (payload.echoRequest) {
+                synchronized(this@UuDirectSession) {
+                    if (closed.get() || buffer.data.remaining() > 65536) return
+                    val bytes = ByteArray(buffer.data.remaining())
+                    buffer.data.get(bytes)
+                    val isControl = channel.label() == "CONTROL_DATA_CHANNEL"
+                    if (!isControl && channel.label() != "TEXT_DATA_CHANNEL") return
+                    if (bytes.isNotEmpty() && bytes[0] == '{'.code.toByte()) return
+                    try {
+                        val payload = UuWire.decodeEnvelope(bytes)
+                        if (isControl && payload.echoRequest) {
                             sendControl(UuWire.echoResponse(payload.seq, payload.timestamp))
-                            pbConnected = true
                         }
-                        if (payload.echoResponse) pbConnected = true
-                        if (pbConnected) echoRetry?.cancel(false)
-                    }
-                    if (payload.screenId != null && payload.screenId >= 0)
-                        currentScreen = payload.screenId
-                    if (payload.videoTrackIndex != null && payload.videoTrackIndex >= 0)
-                        selectedTrackIndex = payload.videoTrackIndex
-                    if (pendingTrackSeq != null && payload.trackAckId == pendingTrackSeq) {
-                        if (payload.trackAckError == 0) {
-                            trackRegistered = true
-                            emit("UU 视频轨道注册确认成功")
-                        } else {
-                            emit("UU 视频轨道注册被拒绝（错误码 ${payload.trackAckError}）")
-                            trackRequested = false
-                            trackRegistered = false
-                            pendingTrackSeq = null
-                            return
+                        when (captureGate.observe(payload, isControl)) {
+                            UuCaptureGate.Ack.REGISTERED -> emit("UU 视频轨道注册确认成功")
+                            UuCaptureGate.Ack.REJECTED -> emit("UU 视频轨道注册被拒绝（错误码 ${payload.trackAckError}）")
+                            UuCaptureGate.Ack.NONE -> {}
                         }
+                        if (captureGate.pbConnected) echoRetry?.cancel(false)
+                        maybeStartCapture()
+                    } catch (_: IllegalArgumentException) {
+                        // Vendor extensions may be opaque; never reflect them back.
                     }
-                    maybeStartCapture()
-                    inputReady = pbConnected && captureRequested &&
-                        currentScreen != null &&
-                        controlChannel?.state() == DataChannel.State.OPEN &&
-                        textChannel?.state() == DataChannel.State.OPEN
-                } catch (_: IllegalArgumentException) {
-                    // Vendor extensions may be opaque; never reflect them back.
                 }
             }
         })
@@ -373,7 +357,7 @@ internal class UuDirectSession(
         echoAttempts = 0
         echoRetry = heartbeatExecutor.scheduleAtFixedRate({
             synchronized(this) {
-                if (closed.get() || pbConnected) {
+                if (closed.get() || captureGate.pbConnected) {
                     echoRetry?.cancel(false)
                     return@synchronized
                 }
@@ -389,30 +373,29 @@ internal class UuDirectSession(
     }
 
     @Synchronized private fun maybeStartCapture() {
-        if (captureRequested || !pbConnected || currentScreen == null) return
-        if (controlChannel?.state() != DataChannel.State.OPEN ||
-            textChannel?.state() != DataChannel.State.OPEN) return
+        val controlOpen = controlChannel?.state() == DataChannel.State.OPEN
+        val textOpen = textChannel?.state() == DataChannel.State.OPEN
+        val action = captureGate.next(controlOpen, textOpen)
+        if (action == UuCaptureGate.Action.NONE) return
         val text = textChannel ?: return
-        val trackIndex = selectedTrackIndex ?: return
-        // UU's track registration precedes capture, both on reliable TEXT
-        // PPID. The selected track must come from the host's ScreenSources.
-        if (!trackRequested) {
-            val sequence = nextRequestSeq++
-            val trackPacket = UuWire.registerVideoTrack(sequence, trackIndex)
-            trackRequested = text.send(DataChannel.Buffer(ByteBuffer.wrap(trackPacket), false))
-            if (trackRequested) pendingTrackSeq = sequence
-            return
+        val sequence = nextRequestSeq++
+        val packet = when (action) {
+            UuCaptureGate.Action.REGISTER_TRACK ->
+                UuWire.registerVideoTrack(sequence, captureGate.selectedTrack ?: return)
+            UuCaptureGate.Action.START_VIDEO ->
+                UuWire.startVideoCapture(sequence, captureGate.selectedScreen ?: return)
+            UuCaptureGate.Action.CAPTURE_SETTING -> UuWire.captureSetting(sequence)
+            UuCaptureGate.Action.NONE -> return
         }
-        // Wait for the real SendVideoTrackRsp; sending start-capture before
-        // the host acknowledges the track can yield a permanent black screen.
-        if (!trackRegistered) return
-        val capturePacket = UuWire.startVideoCapture(nextRequestSeq++, currentScreen!!)
-        if (!text.send(DataChannel.Buffer(ByteBuffer.wrap(capturePacket), false))) return
-        // UE CaptureSetting snapshot is a separate RPC, not a substitute for
-        // SimpleAction start-capture.
-        val payload = UuWire.captureSetting(nextRequestSeq++)
-        captureRequested = text.send(DataChannel.Buffer(ByteBuffer.wrap(payload), false))
-        if (captureRequested) emit("UU 视频轨道已注册，申请远端 H.264 画面")
+        if (text.send(DataChannel.Buffer(ByteBuffer.wrap(packet), false))) {
+            captureGate.onSubmitted(action, sequence)
+            if (action == UuCaptureGate.Action.CAPTURE_SETTING)
+                emit("UU 视频轨道注册确认，远端 H.264 画面已请求")
+        }
+        // Never issue dependent UU RPCs in the same turn as SendVideoTrack.
+        // Wait for real ACK, then invoke again. For the two post-ACK steps,
+        // the second call is safe since the first is already locally admitted.
+        if (action == UuCaptureGate.Action.START_VIDEO) maybeStartCapture()
     }
 
     @Synchronized private fun sendControl(data: ByteArray): Boolean {
@@ -422,8 +405,11 @@ internal class UuDirectSession(
     }
 
     @Synchronized fun pointer(u: Float, v: Float, down: Boolean) {
-        if (closed.get() || !inputReady || !u.isFinite() || !v.isFinite()) return
-        val screen = currentScreen ?: return
+        if (closed.get() || !captureGate.inputReady(
+            controlChannel?.state() == DataChannel.State.OPEN,
+            textChannel?.state() == DataChannel.State.OPEN
+        ) || !u.isFinite() || !v.isFinite()) return
+        val screen = captureGate.selectedScreen ?: return
         val x = u.toDouble().coerceIn(0.0, 0.999999)
         val y = v.toDouble().coerceIn(0.0, 0.999999)
         sendControl(JSONObject().put("action", "mouse_move_absolute")
@@ -441,7 +427,7 @@ internal class UuDirectSession(
         heartbeatExecutor.shutdownNow()
         if (pressed) sendControl("""{"action":"mouse_release","button":1}""".toByteArray())
         pressed = false
-        inputReady = false
+        captureGate.onTransportClosed()
         answerInstalled = false
         pendingRemoteCandidates.clear()
         renderer?.let { video?.removeSink(it) }
