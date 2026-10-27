@@ -304,7 +304,6 @@ internal class UuDirectSession(
                             terminateUnexpectedly()
                             return@synchronized
                         }
-                    }
                         maybeStartCapture()
                     }
                     emit("UU WebRTC SDP 已接受（${acceptedTracks.size} 条视频轨道）")
