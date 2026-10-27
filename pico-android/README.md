@@ -22,15 +22,15 @@ PICO 在本机进行 UU 登录，获取设备列表和加入房间；**不需要
 | UU NRD 签名 REST / 设备身份注册 | 实现代码，CI 测试 HMAC/请求合约 |
 | 二维码登录、设备列表、加入房间 | 实现代码，需真实账号联测 |
 | Socket.IO 握手及控制请求、WebRTC ICE/SDP | 实现代码，需真实 UU 信令服务器联测 |
-| WebRTC H.264 -> EglRenderer -> OpenXR Android Surface | 实现代码，需实机帧呈现验证 |
-| 远程鼠标绝对坐标、按键 | 使用 UU CONTROL_DATA_CHANNEL 原生 JSON 格式；发送前检查控制通道和屏幕 ID |
-| UU CaptureSetting 初始化请求、PB ECHO、屏幕列表解析 | 已添加协议代码，仍需真实对端联测 |\n| Mixed KCP、音频、键盘、文件传输和完整异常恢复 | **尚未实现完整互通** |
+| WebRTC H.264 -> EglRenderer -> OpenXR Android Surface | 增加第一帧检测和黑屏提醒，仍需实机验证 |\n| WebRTC 远端音轨 | 接收音轨并管理 Android 音频焦点，需 PICO 实机听音验证 |
+| 远程鼠标移动、扳机按键、摇杆滚动 | 使用 UU CONTROL_DATA_CHANNEL 原生 JSON 格式；OpenXR 失焦会主动释放按键；滚动绑定 PICO 摇杆 Y 轴，仍需实机验证 |
+| UU CaptureSetting 初始化请求、PB ECHO、屏幕列表解析 | 已添加协议代码，仍需真实对端联测 |\n| Mixed KCP、麦克风、键盘、文件传输、完整异常恢复 | **尚未实现完整互通** |
 
 ## CI
 
 工作流 `.github/workflows/pico-android.yml` 包含 JVM 协议单测、Android Lint、arm64 JNI/OpenXR 构建和 Linux 对照端检查。Actions **无法模拟真实 UU 服务和 PICO 追踪环境**。QR 账号有效性、信令握手顺序、H264 播放和鼠标真正控制远端机器仍需要物理头显与主机双端联测。
 
-## 安全
+## 可靠性与输入\n\n- UU 房间的多个已授权信令节点支持**命名空间建立前**的自动切换；连接建立后不重放可能改变远端状态的请求。\n- 房间控制握手 30 秒、WebRTC ICE 35 秒超时会终止失效会话；发送采集请求 25 秒无首帧仅告警，避免主机短暂停止输出被强制断开。\n- 二维码确认后会强制刷新设备注册；轮询间隔 1 秒，重入登录与旧会话回调不会覆盖当前连接。\n- PICO 4 / 4S / Neo3 手柄摇杆 Y 轴触发滚轮事件（120 单位，120ms 节流，45% 死区）；头显失焦、停止运行、屏幕切换时释放远端按键。\n- 远端音频使用 Android WebRTC 接收，获得音频焦点才启用音轨；音频焦点丢失会停止播放。\n\n## 安全
 
 NRD 登录只请求 https；信令仅使用 wss；应用通过 `usesCleartextTraffic=false` 禁止明文网络。授权令牌只保存在内存中、不写日志；当前版本退出应用需要重新扫码，不做明文自动登录。本实现仅提供已登录且可控设备的正常远程控制，不自动接管已有会话。
 
