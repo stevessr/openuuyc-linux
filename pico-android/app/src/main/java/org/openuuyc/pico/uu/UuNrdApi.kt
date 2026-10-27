@@ -71,7 +71,9 @@ internal data class UuIdentity(
     val clientId: String, var deviceId: String, val systemId: String, val machineGuid: String
 )
 
-internal data class UuAccount(val token: String, val userId: String, val nickname: String)
+internal data class UuAccount(val token: String, val userId: String, val nickname: String) {
+    override fun toString() = "UuAccount(<redacted>)"
+}
 
 internal data class UuQr(val url: String, val token: String, val ticket: String)
 
@@ -110,37 +112,60 @@ internal class UuNrdApi(private val context: Context) {
         private set
 
     private val transport = UuNrdTransport()
+    private val vault = KeystoreSessionVault(context)
+    private val credentialLock = Any()
+
+    fun restoreSavedLogin(): UuSavedLoginFlow.Result {
+        val result = UuSavedLoginFlow(vault) { saved ->
+            account = saved
+            request("GET", "/api/v1/user/info")
+        }.restore()
+        if (result != UuSavedLoginFlow.Result.RESTORED) account = null
+        return result
+    }
+
+    fun acceptLogin(session: UuAccount, isCurrent: () -> Boolean): Boolean = synchronized(credentialLock) {
+        if (!isCurrent()) return@synchronized false
+        vault.save(session)
+        account = session
+        true
+    }
+
+    fun logoutLocal() = synchronized(credentialLock) { vault.clear(); account = null }
+
+    fun cancelPendingRequests() { transport.cancelPendingCalls() }
 
     fun clearAccount() { account = null }
     fun close() { transport.close() }
 
     private fun request(
-        method: String, path: String, body: JSONObject? = null, platform: Boolean = false
-    ): JSONObject = transport.request(method, path, body, identity, account, platform)
+        method: String, path: String, body: JSONObject? = null, platform: Boolean = false, allowEmptyData: Boolean = false
+    ): JSONObject = transport.request(method, path, body, identity, account, platform, allowEmptyData)
 
     fun initializeDevice(force: Boolean = false) {
         if (!force && identity.deviceId.matches(Regex("[a-z0-9]{16}"))) return
-        // Preserve the established WindowsDeviceInitRequest shape to maintain
-        // protocol compatibility. The platform value describes the PICO client.
-        val body = JSONObject()
-            .put("name", "OpenUUYC PICO")
-            .put("client_id", identity.clientId)
-            .put("system_id", identity.systemId)
-            .put("machine_guid", identity.machineGuid)
-            .put("os", "Android ${Build.VERSION.RELEASE}")
-            .put("base_board", Build.BOARD)
-            .put("cpu", Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a")
-            .put("video", JSONArray())
-            .put("mac", "")
-            .put("memory", 0)
-            .put("screen", "1920x1080")
-            .put("platform", 2)
-            .put("controllable", false)
+        val profile=UuAndroidDeviceProfile.read(context)
+        val body = deviceRegistrationBody(identity,"Android ${Build.VERSION.RELEASE}",profile.board,profile.cpu,
+            profile.memoryMiB,profile.video,profile.screen,profile.appVersion)
         val reply = request("POST", "/api/v1/device/windows/init", body, platform = true)
         val device = reply.getString("device_id")
         require(device.matches(Regex("[a-z0-9]{16}"))) { "Invalid UU device identity" }
+        require(!identity.deviceId.matches(Regex("[a-z0-9]{16}")) || identity.deviceId==device) { "Refusing to replace a registered device identity" }
         identity.deviceId = device
-        prefs.edit().putString("device", device).apply()
+        prefs.edit().putString("device", device)
+            .putLong("hardware_reported_at",System.currentTimeMillis())
+            .putLong("hardware_memory_mib",profile.memoryMiB)
+            .putString("hardware_cpu",profile.cpu).putString("hardware_gpu",profile.video.joinToString(", ")).apply()
+    }
+
+    fun requestSms(country: String,mobile: String) {
+        initializeDevice()
+        request("POST",UuSmsWire.CODE,UuSmsWire.request(country,mobile),allowEmptyData=true)
+    }
+    fun loginSms(country: String,mobile: String,code: String): UuAccount {
+        initializeDevice(force=true)
+        val result=request("POST",UuSmsWire.LOGIN,UuSmsWire.login(country,mobile,code))
+        return UuAccount(result.getString("token"),result.getString("user_id"),result.optString("nickname")).also { require(it.token.isNotBlank() && it.userId.isNotBlank()) }
     }
 
     fun createQr(): UuQr {
@@ -160,8 +185,14 @@ internal class UuNrdApi(private val context: Context) {
     }
 
     fun confirmQr(qr: UuQr): UuAccount {
+        val qrDeviceId = identity.deviceId
         val session = UuQrCredentialExchange(
-            refreshDevice = { initializeDevice(force = true) },
+            refreshDevice = {
+                initializeDevice(force = true)
+                check(identity.deviceId == qrDeviceId) {
+                    "Device identity changed; generate a new QR before exchanging credentials"
+                }
+            },
             exchangeToken = { ticket ->
                 val result = request("POST", "/api/v1/login/by_qrcode",
                     JSONObject().put("qrcode_jump_url", ticket.url).put("token", ticket.token))
@@ -173,7 +204,6 @@ internal class UuNrdApi(private val context: Context) {
             }
         ).complete(qr)
         require(session.token.isNotBlank() && session.userId.isNotBlank())
-        account = session
         return session
     }
 
@@ -194,12 +224,12 @@ internal class UuNrdApi(private val context: Context) {
         }
     }
 
-    fun join(device: UuDevice): UuRoom {
+    fun join(device: UuDevice, forceJoin: Boolean = false): UuRoom {
         requireNotNull(account)
         require(device.online && device.controllable) { "target unavailable or not controllable" }
-        require(device.occupants == 0) { "target is occupied; explicit takeover is not implemented" }
+        require(device.occupants == 0 || forceJoin) { "target is occupied; explicit confirmation required" }
         val result = request("POST", "/api/v1/room/join/by_device/${device.id}",
-            JSONObject().put("force_join", false))
+            JSONObject().put("force_join", forceJoin))
         val endpoints = mutableListOf<String>()
         val list = result.optJSONArray("signaling_list")
         if (list != null) for (i in 0 until list.length()) list.optString(i).takeIf(String::isNotBlank)?.let(endpoints::add)

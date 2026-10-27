@@ -14,21 +14,21 @@ internal object UuWindowLayout {
         selectedScreen: Int?,
         selectedTrack: Int?,
         screenTracks: Map<Int, Int>,
-        receivedTracks: List<Int>
+        receivedTracks: List<Int>,
+        maxWindows: Int = 3
     ): List<Pane?> {
         val present = receivedTracks.filter { it in 0..4 }.distinct().sorted()
         val main = selectedTrack ?: present.firstOrNull()
-        if (main == null || main !in 0..4) return listOf(null, null, null)
+        if (main == null || main !in 0..4) return List(maxWindows.coerceIn(1,6)) {null}
         val screensByTrack = screenTracks.entries
             .filter { it.key >= 0 && it.value in 0..4 }
             .sortedBy { it.key }
             .associate { it.value to it.key }
         val rest = present.filter { it != main }
         val ranked = rest.sortedWith(compareBy<Int> { if (screensByTrack.containsKey(it)) 0 else 1 }.thenBy { it })
-        return listOf(
-            Pane(main, selectedScreen ?: screensByTrack[main]),
-            ranked.getOrNull(0)?.let { Pane(it, screensByTrack[it]) },
-            ranked.getOrNull(1)?.let { Pane(it, screensByTrack[it]) }
-        )
+        return List(maxWindows.coerceIn(1,6)) {index ->
+            if(index==0) Pane(main, selectedScreen ?: screensByTrack[main])
+            else ranked.getOrNull(index-1)?.let {Pane(it,screensByTrack[it])}
+        }
     }
 }

@@ -10,6 +10,10 @@ import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 
+/** Only locally constructed numeric diagnostics; never include response text or credentials. */
+internal class UuNrdResponseException(val httpStatus: Int, val businessCode: Int? = null, val operation: String = "NRD") :
+    IOException("$operation: HTTP $httpStatus" + (businessCode?.let { ", code $it" } ?: ""))
+
 /**
  * Testable UU NRD HTTP layer. All paths, signatures and auth headers are built
  * here and verified with MockWebServer, without a live UU account or headset.
@@ -28,7 +32,10 @@ internal class UuNrdTransport(
         const val MAX_RESPONSE_BYTES = 4 * 1024 * 1024
     }
 
+    fun cancelPendingCalls() { http.dispatcher.cancelAll() }
+
     fun close() {
+        http.dispatcher.cancelAll()
         http.dispatcher.executorService.shutdown()
         http.connectionPool.evictAll()
     }
@@ -39,7 +46,7 @@ internal class UuNrdTransport(
         body: JSONObject? = null,
         identity: UuIdentity,
         account: UuAccount? = null,
-        platform: Boolean = false
+        platform: Boolean = false, allowEmptyData: Boolean = false
     ): JSONObject {
         require(method in setOf("GET", "POST", "PUT", "DELETE")) { "unsupported NRD method" }
         require(path.startsWith("/") && !path.startsWith("//") &&
@@ -56,11 +63,26 @@ internal class UuNrdTransport(
         val payload = bytes.toRequestBody("application/json".toMediaType())
         builder.method(method, if (method == "GET") null else payload)
 
+        val operation = when (path) {
+            "/api/v1/device/windows/init" -> "device-init"
+            "/api/v1/qrcode/gen/login" -> "qr-create"
+            "/api/v1/qrcode/login/status" -> "qr-status"
+            "/api/v1/login/by_qrcode" -> "qr-exchange"
+            else -> "NRD"
+        }
         http.newCall(builder.build()).execute().use { response ->
             // Redirects, 4xx and 5xx may have HTML or an empty body. Reject
             // by HTTP status *before* JSON parsing and never print the body.
-            if (!response.isSuccessful)
-                throw IOException("UU request failed: HTTP ${response.code}")
+            if (!response.isSuccessful) {
+                // Inspect only a bounded error envelope for numeric diagnostics.
+                // Do not expose server text, headers, QR URLs or credentials.
+                val code = try {
+                    val source = response.peekBody(8192).string()
+                    val json = JSONObject(source)
+                    if (json.has("code")) json.getInt("code") else null
+                } catch (_: Exception) { null }
+                throw UuNrdResponseException(response.code, code, operation)
+            }
             val stream = response.body?.byteStream() ?: throw IOException("empty UU response")
             val output = ByteArrayOutputStream()
             val buffer = ByteArray(8192)
@@ -76,9 +98,9 @@ internal class UuNrdTransport(
             if (!response.isSuccessful || code != 0) {
                 // Business messages may contain a phone number/QR/token.
                 // Deliberately exclude server-provided text from errors.
-                throw IOException("UU request failed: HTTP ${response.code}, code $code")
+                throw UuNrdResponseException(response.code, code, operation)
             }
-            return envelope.optJSONObject("data") ?: throw IOException("UU response missing data")
+            return envelope.optJSONObject("data") ?: if(allowEmptyData) JSONObject() else throw IOException("UU response missing data")
         }
     }
 }

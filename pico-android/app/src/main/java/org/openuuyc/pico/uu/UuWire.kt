@@ -21,17 +21,17 @@ internal object UuWire {
         }
         out.write(value.toInt())
     }
-    private fun integer(out: ByteArrayOutputStream, tag: Int, value: Long) {
+    internal fun integer(out: ByteArrayOutputStream, tag: Int, value: Long) {
         varint(out, tag.toLong() shl 3)
         varint(out, value)
     }
-    private fun bytes(out: ByteArrayOutputStream, tag: Int, data: ByteArray) {
+    internal fun bytes(out: ByteArrayOutputStream, tag: Int, data: ByteArray) {
         varint(out, (tag.toLong() shl 3) or 2L)
         varint(out, data.size.toLong())
         out.write(data)
     }
     private fun String.utf8() = toByteArray(StandardCharsets.UTF_8)
-    private fun message(block: (ByteArrayOutputStream) -> Unit): ByteArray =
+    internal fun message(block: (ByteArrayOutputStream) -> Unit): ByteArray =
         ByteArrayOutputStream().also(block).toByteArray()
 
     /**
@@ -46,7 +46,7 @@ internal object UuWire {
         integer(out, 9, 1) // qos_stat
     }
 
-    fun connectOptions(controllerId: String): ByteArray {
+    fun connectOptions(controllerId: String, profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080))): ByteArray {
         require(controllerId.matches(Regex("[a-z0-9]{16}")))
         val capture = message { out ->
             integer(out, 1, 2) // 60fps tier
@@ -65,13 +65,13 @@ internal object UuWire {
             integer(out, 1, 1) // viewing
             integer(out, 2, -1) // auto screen
             bytes(out, 3, capture)
-            bytes(out, 4, message { decoder ->
-                integer(decoder, 1, 60)
-                integer(decoder, 2, 1) // H264
-                integer(decoder, 3, 1920)
-                integer(decoder, 4, 1080)
-                integer(decoder, 5, 1) // 4:2:0
-            })
+            profiles.forEach { profile -> bytes(out, 4, message { decoder ->
+                integer(decoder, 1, profile.fps.toLong())
+                integer(decoder, 2, profile.codec.toLong())
+                integer(decoder, 3, profile.width.toLong())
+                integer(decoder, 4, profile.height.toLong())
+                integer(decoder, 5, 1)
+            }) }
             integer(out, 8, 3) // desktop controller ABI used by source
             bytes(out, 9, controllerId.utf8())
             integer(out, 10, 1) // normal connection
@@ -80,20 +80,17 @@ internal object UuWire {
         }
     }
 
-    fun controlEvent(controllerId: String, appControlId: String = UUID.randomUUID().toString()):
+    fun controlEvent(controllerId: String, appControlId: String = UUID.randomUUID().toString(),
+                     profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080))):
         Pair<String, ByteArray> {
         val capability = JSONObject()
             .put("ice_id", "")
             .put("display_info", JSONArray())
-            .put("video_codec_capability", JSONArray().put(
-                JSONObject()
-                    .put("video_codec", 1)
-                    .put("width", 1920)
-                    .put("height", 1080)
-                    .put("chroma_sampling", 1)
-                    .put("bit_depth", 8)
-                    .put("codec_impl", 37)
-            ))
+            .put("video_codec_capability", JSONArray().apply {
+                profiles.forEach { profile -> put(JSONObject()
+                    .put("video_codec", profile.codec).put("width", profile.width).put("height", profile.height)
+                    .put("chroma_sampling", 1).put("bit_depth", 8).put("codec_impl", 37)) }
+            })
         val streamer = JSONObject()
             .put("control_id", appControlId)
             .put("openuuyc_audio_only", false)
@@ -107,7 +104,7 @@ internal object UuWire {
             .put("app_control_id", appControlId)
             .put("app_data", JSONObject().put("_placeholder", true).put("num", 0))
             .put("streamer_data", streamer.toString())
-        return "451-2" + JSONArray().put("control").put(payload).toString() to connectOptions(controllerId)
+        return "451-2" + JSONArray().put("control").put(payload).toString() to connectOptions(controllerId, profiles)
     }
 
     /** Socket.IO binary attachment MUST start with an Engine.IO message byte. */
@@ -119,30 +116,64 @@ internal object UuWire {
      * the controlled computer's physical display. Must use TEXT_DATA_CHANNEL
      * with a text PPID, not the CONTROL_DATA_CHANNEL.
      */
-    fun captureSetting(sequence: Long = 1L): ByteArray {
+    fun captureSetting(sequence: Long = 1L, settings: UuCaptureSettings = UuCaptureSettings(), screen: Int = -2,
+                       physical: UuDisplayMode? = null, dpi: Int = 0): ByteArray {
+        settings.validate()
+        require(screen >= 0 || screen == -2)
+        require(dpi == 0 || dpi in 50..500)
         val capture = message { out ->
-            integer(out, 1, 2) // FPS 60
-            integer(out, 2, 5) // auto quality
-            integer(out, 3, 1) // capture remote cursor
-            integer(out, 4, -2) // existing tracks
-            integer(out, 5, -1) // do not change physical resolution
-            integer(out, 6, -1)
-            integer(out, 7, 1) // H264 8bit 4:2:0
-            integer(out, 10, 1) // unchanged resolution
-            integer(out, 12, 2) // auto quality general
-            integer(out, 13, 1) // H264
-            integer(out, 18, 60)
+            val tier = when(settings.fps) { 30 -> 1; 60 -> 2; 90 -> 3; else -> 4 }
+            integer(out, 1, tier.toLong())
+            integer(out, 2, settings.quality.toLong())
+            integer(out, 3, if (settings.cursor) 1 else 0)
+            integer(out, 4, screen.toLong())
+            integer(out, 5, physical?.width?.toLong() ?: -1)
+            integer(out, 6, physical?.height?.toLong() ?: -1)
+            integer(out, 7, 1) // Only formats supported by Android's I420/texture renderer.
+            integer(out, 8, if (settings.quality == 6) settings.bitrateMbps.toLong() else 0)
+            integer(out, 9, dpi.toLong())
+            integer(out, 10, 1)
+            integer(out, 12, 2)
+            integer(out, 13, settings.codec.toLong())
+            integer(out, 14, settings.maxWidth.toLong())
+            integer(out, 15, settings.maxHeight.toLong())
+            physical?.let { integer(out, 16, it.width.toLong()); integer(out, 17, it.height.toLong()) }
+            integer(out, 18, settings.fps.toLong())
         }
-        val rpc = message { out ->
-            bytes(out, 1, message { header -> integer(header, 1, sequence) })
-            bytes(out, 2, capture)
-        }
-        return message { out ->
-            integer(out, 1, sequence)
-            integer(out, 2, System.currentTimeMillis())
-            bytes(out, 21, rpc)
-        }
+        return rpc(sequence, 2, capture)
     }
+
+    fun createVirtualDisplay(sequence: Long, width: Int, height: Int): ByteArray {
+        require(width in 640..7680 && height in 480..4320)
+        return rpc(sequence, 12, message { out ->
+            bytes(out, 1, message { integer(it, 1, width.toLong()); integer(it, 2, height.toLong()) })
+            integer(out, 2, 1)
+        })
+    }
+
+    internal fun rpc(sequence: Long, field: Int, payload: ByteArray): ByteArray = message { out ->
+        integer(out, 1, sequence); integer(out, 2, System.currentTimeMillis())
+        bytes(out, 21, message { request ->
+            bytes(request, 1, message { integer(it, 1, sequence) })
+            bytes(request, field, payload)
+        })
+    }
+
+    internal data class Field(val number: Long? = null, val data: ByteArray? = null)
+    internal fun fields(data: ByteArray): Map<Int, List<Field>> {
+        require(data.size <= 1024 * 1024)
+        val reader = Reader(data)
+        val result = linkedMapOf<Int, MutableList<Field>>()
+        while (!reader.done()) {
+            val (tag, wire) = reader.tag()
+            val value = when(wire) { 0 -> Field(number = reader.long()); 2 -> Field(data = reader.len()); else -> { reader.skip(wire); Field() } }
+            result.getOrPut(tag) { mutableListOf() }.add(value)
+        }
+        return result
+    }
+    internal fun Map<Int, List<Field>>.number(field: Int, default: Long = 0) = get(field)?.lastOrNull()?.number ?: default
+    internal fun Map<Int, List<Field>>.data(field: Int) = get(field)?.lastOrNull()?.data
+
 
     /** Register *all* accepted m=video tracks, matching desktop controller. */
     fun registerVideoTrack(sequence: Long, index: Int): ByteArray =
@@ -208,7 +239,14 @@ internal object UuWire {
         val echoResponse: Boolean = false,
         val trackAckId: Long? = null,
         val trackAckError: Int? = null,
-        val screenTracks: Map<Int, Int> = emptyMap()
+        val screenTracks: Map<Int, Int> = emptyMap(),
+        val screens: List<UuRemoteScreen> = emptyList(),
+        val captureLevel: Int? = null,
+        val cursorType: Int? = null,
+        val cursorScreen: Int? = null,
+        val topologyAck: Pair<Long, Int>? = null,
+        val captureAck: Long? = null,
+        val captureErrors: List<Int> = emptyList()
     )
     private class Reader(private val data: ByteArray) {
         var offset = 0
@@ -271,19 +309,19 @@ internal object UuWire {
                 3 -> {
                     top.requireWire(wire, 2)
                     val sub = Reader(top.len())
+                    var action = 0L // proto3 default; ECHO_REQUEST is omitted on the wire.
                     while(!sub.done()) {
                         val (subField, subWire) = sub.tag()
                         when(subField) {
                             1 -> {
                                 sub.requireWire(subWire, 0)
-                                when (sub.long()) {
-                                    0L -> echo = true
-                                    1L -> echoAck = true
-                                }
+                                action = sub.long()
                             }
                             else -> sub.skip(subWire)
                         }
                     }
+                    echo = action == 0L
+                    echoAck = action == 1L
                 }
                 7 -> {
                     top.requireWire(wire, 2)
@@ -296,8 +334,8 @@ internal object UuWire {
                         } else if (screenField == 1) {
                             sources.requireWire(screenWire, 2)
                             val entry = Reader(sources.len())
-                            var entryId: Int? = null
-                            var entryTrack: Int? = null
+                            var entryId = 0 // PbScreen.id defaults to the primary screen.
+                            var entryTrack = 0 // PbScreen.video_track_index defaults to video_0.
                             while (!entry.done()) {
                                 val (entryField, entryWire) = entry.tag()
                                 when(entryField) {
@@ -306,7 +344,7 @@ internal object UuWire {
                                     else -> entry.skip(entryWire)
                                 }
                             }
-                            if (entryId != null && entryTrack != null && entryId >= 0 && entryTrack >= 0) {
+                            if (entryId >= 0 && entryTrack >= 0) {
                                 tracksByScreen[entryId] = entryTrack
                                 if (screen == null) screen = entryId
                             }
@@ -357,7 +395,40 @@ internal object UuWire {
                 else -> top.skip(wire)
             }
         }
-        return Envelope(sequence, timestamp, echo, screen, screen?.let(tracksByScreen::get), echoAck, registeredRequest, registrationError, tracksByScreen.toMap())
+        // Initial publishers may report current=-1 before capture starts. Pick
+        // only an explicitly listed source; never invent an absent screen.
+        if (tracksByScreen.isNotEmpty() && (screen == null || screen !in tracksByScreen))
+            screen = tracksByScreen.keys.first()
+        val rootFields = fields(bytes)
+        val sourceFields = rootFields.data(7)?.let(::fields)
+        val remoteScreens = sourceFields?.get(1).orEmpty().mapNotNull { field -> field.data?.let { encoded ->
+            val f = fields(encoded)
+            fun mode(raw: ByteArray?): UuDisplayMode? = raw?.let(::fields)?.let { m ->
+                val width = m.number(3).toInt(); val height = m.number(4).toInt()
+                if (width > 0 && height > 0) UuDisplayMode(width, height) else null
+            }
+            val dpiInfo = f.data(9)?.let(::fields)
+            val dpis = dpiInfo?.get(3).orEmpty().flatMap { value ->
+                if (value.number != null) listOf(value.number.toInt()) else value.data?.let { packed ->
+                    val r = Reader(packed); val numbers = mutableListOf<Int>(); while (!r.done()) numbers.add(r.long().toInt()); numbers
+                }.orEmpty()
+            }.filter { it in 50..500 }.distinct()
+            UuRemoteScreen(f.number(1).toInt(), f.number(12).toInt(), f.data(10)?.toString(Charsets.UTF_8).orEmpty(),
+                f.number(2, 60).toInt(), mode(f.data(4)), f[3].orEmpty().mapNotNull { mode(it.data) }.distinct(),
+                dpiInfo?.number(1)?.toInt() ?: 0, dpis, f.number(5).toInt())
+        }}.filter { it.id >= 0 && it.track in -1..4 }
+        val simple = rootFields.data(3)?.let(::fields)
+        val flags = simple?.data(4)?.let(::fields)
+        val cursor = rootFields.data(15)?.let(::fields)?.data(2)?.let(::fields)
+        val response = rootFields.data(22)?.let(::fields)
+        val captureReply = response?.data(2)?.let(::fields)
+        val captureRequest = response?.data(1)?.let(::fields)?.number(1)
+        val errors = captureReply?.get(1).orEmpty().mapNotNull { it.data?.let(::fields)?.number(1)?.toInt() }
+        return Envelope(sequence, timestamp, echo, screen, screen?.let(tracksByScreen::get), echoAck, registeredRequest,
+            registrationError, tracksByScreen.toMap(), remoteScreens, flags?.number(1)?.toInt(), cursor?.number(6)?.toInt(), cursor?.number(9)?.toInt(),
+            response?.data(8)?.let { captureRequest?.let { id -> id to fields(it).number(1).toInt() } },
+            if (captureReply != null) captureRequest else null, errors)
+
     }
 
     fun signalEndpoint(endpoint: String): String {
@@ -399,6 +470,29 @@ internal object UuWire {
             videoIndex++
         }
         require(videoIndex > 0) { "no UU video m-lines in SDP answer" }
+        return result
+    }
+
+    /** Video ordinal is the UU video_track_index; MID is the SDK receiver key.
+     * Do not infer this from callback order or MediaStreamTrack.id (often UUID).
+     */
+    fun videoMidIndices(sdp: String): Map<String, Int> {
+        val result = linkedMapOf<String, Int>()
+        var index = -1
+        var accepted = false
+        for (raw in sdp.lineSequence()) {
+            val line = raw.trimEnd('\r')
+            if (line.startsWith("m=")) {
+                val parts = line.split(Regex("\\s+"))
+                val video = parts.firstOrNull() == "m=video"
+                if (video) index++
+                accepted = video && parts.getOrNull(1) != "0" && index in 0..4
+            } else if (accepted && line.startsWith("a=mid:")) {
+                val mid = line.removePrefix("a=mid:")
+                require(mid.isNotBlank() && mid.length <= 64 && mid !in result)
+                result[mid] = index
+            }
+        }
         return result
     }
 

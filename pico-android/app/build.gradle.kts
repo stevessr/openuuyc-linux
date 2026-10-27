@@ -7,6 +7,7 @@ android {
     compileSdk = 35
     defaultConfig {
         applicationId = "org.openuuyc.pico"
+        testInstrumentationRunner = "org.openuuyc.pico.PicoPanelInstrumentation"
         minSdk = 29
         ndkVersion = "27.2.12479018"
         targetSdk = 35

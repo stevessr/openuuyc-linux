@@ -23,6 +23,13 @@ internal class UuVideoTrackRouter<T> {
         return active()
     }
 
+    /** Explicit identity from negotiated SDP MID, independent of SDK track UUID. */
+    fun observedAt(index: Int, track: T): T? {
+        require(index in 0..4)
+        tracks[index] = track
+        return active()
+    }
+
     fun select(index: Int?): T? {
         require(index == null || index >= 0)
         desired = index

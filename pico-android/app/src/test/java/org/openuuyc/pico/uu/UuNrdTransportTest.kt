@@ -39,6 +39,27 @@ class UuNrdTransportTest {
         MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
             .setBody("""{"code":0,"data":$json}""")
 
+    @Test fun officialSmsCodeAcceptsCommonSuccessWithoutData() {
+        server.enqueue(MockResponse().setBody("""{"code":0,"msg":"ok"}"""))
+        val result=transport.request("POST",UuSmsWire.CODE,UuSmsWire.request("86","13800000000"),identity,allowEmptyData=true)
+        assertEquals(0,result.length())
+        val captured=requireNotNull(server.takeRequest(2,TimeUnit.SECONDS))
+        assertEquals("/api/v1/security/mobile/code",captured.path)
+        val body=JSONObject(captured.body.readUtf8())
+        assertEquals("login",body.getString("type"));assertEquals("86",body.getString("country_code"))
+        assertNull(captured.getHeader("Authorization"))
+    }
+    @Test fun officialSmsLoginUsesExactFieldsAndDoesNotLeakServerEcho() {
+        server.enqueue(MockResponse().setBody("""{"code":400,"msg":"13800000000 123456"}"""))
+        val error=assertThrows(UuNrdResponseException::class.java) {
+            transport.request("POST",UuSmsWire.LOGIN,UuSmsWire.login("86","13800000000","123456"),identity)
+        }
+        assertFalse(error.message.orEmpty().contains("13800000000"));assertFalse(error.message.orEmpty().contains("123456"))
+        val captured=requireNotNull(server.takeRequest(2,TimeUnit.SECONDS))
+        assertEquals("/api/v1/login/by_mobile",captured.path)
+        assertEquals("123456",JSONObject(captured.body.readUtf8()).getString("code"))
+    }
+
     @Test fun signedQrStatusPostMatchesActualOnWireBody() {
         server.enqueue(ok())
         val payload = JSONObject()
@@ -93,6 +114,18 @@ class UuNrdTransportTest {
             transport.request("GET", "/api/v1/device/list", identity = identity, account = account)
         }
         assertTrue(exception.message.orEmpty().contains("1120"))
+        assertFalse(exception.message.orEmpty().contains("super-secret-token"))
+    }
+
+    @Test fun httpFailureIncludesOnlyOperationAndNumericCodes() {
+        server.enqueue(MockResponse().setResponseCode(400)
+            .setBody("""{"code":1234,"msg":"super-secret-token","data":{}}"""))
+        val exception = assertThrows(UuNrdResponseException::class.java) {
+            transport.request("POST", "/api/v1/login/by_qrcode", JSONObject(), identity)
+        }
+        assertEquals("qr-exchange", exception.operation)
+        assertEquals(400, exception.httpStatus)
+        assertEquals(1234, exception.businessCode)
         assertFalse(exception.message.orEmpty().contains("super-secret-token"))
     }
 

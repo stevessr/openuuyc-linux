@@ -4,6 +4,13 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class UuWindowLayoutTest {
+    @Test fun expandedLayoutKeepsProtocolTrackLimitWithoutGhostSixthTrack() {
+        val panes=UuWindowLayout.plan(0,0,(0..4).associateWith {it},(0..4).toList(),maxWindows=6)
+        assertEquals(6,panes.size)
+        assertEquals(5,panes.count {it!=null})
+        assertEquals(UuWindowLayout.Pane(4,4),panes[4])
+        assertNull(panes[5])
+    }
     @Test fun mapsThreeIndependentScreenSources() {
         val panes = UuWindowLayout.plan(7, 2, mapOf(7 to 2, 13 to 3, 21 to 1), listOf(1, 2, 3))
         assertEquals(UuWindowLayout.Pane(2, 7), panes[0])

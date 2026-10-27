@@ -44,14 +44,47 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
+      - name: Test borrowed OpenXR JNI Surface reference ownership
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
+            -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_surface_callback_test.cpp -o /tmp/xr-surface-test
+          /tmp/xr-surface-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_panel_geometry_test.cpp -o /tmp/xr-panel-geometry-test
+          /tmp/xr-panel-geometry-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_menu_click_test.cpp -o /tmp/xr-menu-click-test
+          /tmp/xr-menu-click-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_panel_depth_test.cpp -o /tmp/xr-panel-depth-test
+          /tmp/xr-panel-depth-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_grip_hold_test.cpp -o /tmp/xr-grip-hold-test
+          /tmp/xr-grip-hold-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_panel_orbit_test.cpp -o /tmp/xr-panel-orbit-test
+          /tmp/xr-panel-orbit-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_ray_geometry_test.cpp -o /tmp/xr-ray-geometry-test
+          /tmp/xr-ray-geometry-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_panel_aspect_test.cpp -o /tmp/xr-panel-aspect-test
+          /tmp/xr-panel-aspect-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_pose_math_test.cpp -o /tmp/xr-pose-math-test
+          /tmp/xr-pose-math-test
+      - name: Validate launcher and immersive Activity separation
+        run: python3 -m unittest discover -s pico-android/scripts/tests -v
       - name: Validate ADB smoke script syntax
-        run: bash -n pico-android/scripts/pico-adb-smoke.sh
+        run: bash -n pico-android/scripts/pico-adb-smoke.sh pico-android/scripts/pico-adb-ui-tests.sh
       - name: Android JVM protocol and session-state tests
         working-directory: pico-android
         run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
       - name: Native arm64 OpenXR APK build and Android lint
         working-directory: pico-android
-        run: gradle --no-daemon --stacktrace :app:assembleDebug :app:lintDebug
+        run: gradle --no-daemon --stacktrace :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug
       - name: Preserve protocol test XML, HTML and lint reports
         if: always()
         uses: actions/upload-artifact@v4

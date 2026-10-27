@@ -23,6 +23,9 @@ internal object UuSocketIoWire {
         data object Ignore : Packet()
     }
 
+    fun closeFrames(namespaceConnected: Boolean): List<String> =
+        if(namespaceConnected) listOf("42[\"leave\"]", "41") else emptyList()
+
     private const val MAX_SIGNAL_TEXT = 1024 * 1024
 
     fun parse(frame: String): Packet = try {
