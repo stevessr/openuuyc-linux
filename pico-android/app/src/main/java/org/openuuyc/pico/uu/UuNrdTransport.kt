@@ -57,6 +57,10 @@ internal class UuNrdTransport(
         builder.method(method, if (method == "GET") null else payload)
 
         http.newCall(builder.build()).execute().use { response ->
+            // Redirects, 4xx and 5xx may have HTML or an empty body. Reject
+            // by HTTP status *before* JSON parsing and never print the body.
+            if (!response.isSuccessful)
+                throw IOException("UU request failed: HTTP ${response.code}")
             val stream = response.body?.byteStream() ?: throw IOException("empty UU response")
             val output = ByteArrayOutputStream()
             val buffer = ByteArray(8192)
