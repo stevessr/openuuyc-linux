@@ -25,6 +25,7 @@ import org.webrtc.RtpTransceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.VideoTrack
+import org.webrtc.VideoSink
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
@@ -52,6 +53,14 @@ internal class UuDirectSession(
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
     private val closed = AtomicBoolean(false)
+    private val health = UuSessionHealth()
+    private val firstFrameSeen = AtomicBoolean(false)
+    private val firstFrameSink = VideoSink { _ ->
+        if (firstFrameSeen.compareAndSet(false, true)) {
+            health.markFirstFrame()
+            emit("UU 远端 H.264 第一帧已到达头显")
+        }
+    }
     private val heartbeatExecutor = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "OpenUUYC-UU-PB").apply { isDaemon = true }
     }
@@ -82,6 +91,25 @@ internal class UuDirectSession(
     @Synchronized fun start(xrSurface: Surface) {
         check(socket == null && !closed.get())
         surface = xrSurface
+        health.markStarted()
+        heartbeatExecutor.scheduleAtFixedRate({
+            synchronized(this) {
+                if (closed.get()) return@synchronized
+                when (health.check()) {
+                    UuSessionHealth.Warning.SIGNAL_TIMEOUT -> {
+                        emit("UU 信令握手超过 30 秒，终止无效连接")
+                        terminateUnexpectedly()
+                    }
+                    UuSessionHealth.Warning.ICE_TIMEOUT -> {
+                        emit("UU WebRTC/ICE 连接超过 35 秒，终止无效连接")
+                        terminateUnexpectedly()
+                    }
+                    UuSessionHealth.Warning.FIRST_FRAME_TIMEOUT ->
+                        emit("UU 视频采集已请求但 25 秒内无画面，请检查被控端及编解码器")
+                    UuSessionHealth.Warning.NONE -> {}
+                }
+            }
+        }, 1, 1, TimeUnit.SECONDS)
         connectSignaling()
     }
 
@@ -172,6 +200,7 @@ internal class UuDirectSession(
                 val verified = UuWire.parseControlAck(packet.data, appControlId)
                 if (!signalGate.controlAcknowledged()) return
                 controlInfo = verified
+                health.markControlAccepted()
                 emit("UU 控制握手已确认，启动设备直连 WebRTC")
                 createPeer(verified)
             }
@@ -254,6 +283,7 @@ internal class UuDirectSession(
     }
 
     private fun createPeer(info: ControlReply) {
+        health.markPeerCreated()
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions()
         )
@@ -277,7 +307,11 @@ internal class UuDirectSession(
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
                 if (state == PeerConnection.IceConnectionState.CONNECTED ||
                     state == PeerConnection.IceConnectionState.COMPLETED) {
+                    health.markIceConnected()
                     emit("UU P2P/中转 WebRTC 已连接")
+                } else if (state == PeerConnection.IceConnectionState.FAILED) {
+                    emit("UU WebRTC ICE 连接失败")
+                    terminateUnexpectedly()
                 }
             }
             override fun onStandardizedIceConnectionChange(state: PeerConnection.IceConnectionState?) {}
@@ -329,8 +363,10 @@ internal class UuDirectSession(
         synchronized(this) {
             if (video === track) return
             renderer?.let { video?.removeSink(it) }
+            video?.removeSink(firstFrameSink)
             video = track
             renderer?.let { track.addSink(it) }
+            track.addSink(firstFrameSink)
         }
     }
 
@@ -445,8 +481,10 @@ internal class UuDirectSession(
         }
         if (text.send(DataChannel.Buffer(ByteBuffer.wrap(packet), false))) {
             captureGate.onSubmitted(action, sequence)
-            if (action == UuCaptureGate.Action.CAPTURE_SETTING)
+            if (action == UuCaptureGate.Action.CAPTURE_SETTING) {
+                health.markCaptureRequested()
                 emit("UU 视频轨道注册确认，远端 H.264 画面已请求")
+            }
         }
         // Never issue dependent UU RPCs in the same turn as SendVideoTrack.
         // Wait for real ACK, then invoke again. For the two post-ACK steps,
@@ -486,6 +524,7 @@ internal class UuDirectSession(
         answerInstalled = false
         pendingRemoteCandidates.clear()
         renderer?.let { video?.removeSink(it) }
+        video?.removeSink(firstFrameSink)
         video = null
         channels.forEach { runCatching { it.close() } }
         channels.clear()
