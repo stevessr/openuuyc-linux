@@ -1,6 +1,8 @@
 package org.openuuyc.pico
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.os.Bundle
@@ -45,6 +47,8 @@ class PicoActivity : Activity() {
     private lateinit var qrImage: ImageView
     private lateinit var devices: LinearLayout
     private lateinit var api: UuNrdApi
+    private lateinit var cameraPreview: PicoCameraPreview
+    private companion object { const val CAMERA_REQUEST = 8341 }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,6 +82,16 @@ class PicoActivity : Activity() {
         })
         root.addView(qrImage, ViewGroup.LayoutParams(-1, 440))
         root.addView(devices)
+        cameraPreview = PicoCameraPreview(this, ::message)
+        root.addView(Button(this).apply {
+            text = "摄像头预览 / 关闭（PICO 4 Ultra）"
+            setOnClickListener {
+                if (cameraPreview.active) cameraPreview.stop()
+                else if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) cameraPreview.start()
+                else requestPermissions(arrayOf(Manifest.permission.CAMERA), CAMERA_REQUEST)
+            }
+        })
+        root.addView(cameraPreview.preview, ViewGroup.LayoutParams(-1, 440))
         val scroll = ScrollView(this)
         scroll.addView(root)
         setContentView(scroll)
@@ -253,8 +267,22 @@ class PicoActivity : Activity() {
         message("会话已断开")
     }
 
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == CAMERA_REQUEST) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) cameraPreview.start()
+            else message("摄像头权限被拒绝：无法调用头显相机")
+        }
+    }
+
+    override fun onPause() {
+        cameraPreview.stop()
+        super.onPause()
+    }
+
     override fun onDestroy() {
         stopSession()
+        cameraPreview.stop()
         joinGate.destroy()
         worker.shutdownNow()
         api.close()
