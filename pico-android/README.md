@@ -35,3 +35,15 @@ PICO 在本机进行 UU 登录，获取设备列表和加入房间；**不需要
 NRD 登录只请求 https；信令仅使用 wss；应用通过 `usesCleartextTraffic=false` 禁止明文网络。授权令牌只保存在内存中、不写日志；当前版本退出应用需要重新扫码，不做明文自动登录。本实现仅提供已登录且可控设备的正常远程控制，不自动接管已有会话。
 
 保留的 Linux `pico_bridge.rs` 仅作为旧实验性桥接方案，不再是原生 APK 的默认架构。
+
+## 测试与验收
+
+所有 JVM 协议测试在无生产 UU 账号的 CI 中运行；包括 `UuProtocolTest`、`UuCaptureGateTest`、`UuProtocolBoundaryTest` 和 `UuNrdTransportTest`。CI 自动保存 XML/HTML 报告，即使单测失败也可以在 Actions Artifacts 中定位具体断言。
+
+- **自动测试**：HMAC 签名的时间、HTTP 方法、路径、请求体、设备身份绑定；MockWebServer 上的真实 HTTP 请求、身份作用域、拒绝重定向、脱敏、4 MiB 响应限额。
+- **协议回归**：UU Socket.IO ACK、protobuf ECHO、视频轨道 ACK、屏幕 ID 与轨道绑定、SDP 重写/gzip、异常 protobuf 和有界随机输入。
+- **状态机回归**：只允许 CONTROL 通道完成 PB 握手，ACK 必须匹配请求序号，收到轨道成功 ACK 才能请求采集；切换显示器/断线立刻撤销输入权限。
+- **实机基础冒烟**：连接 PICO USB 调试后运行 `bash pico-android/scripts/pico-adb-smoke.sh [debug.apk]`，检查安装、Activity 启动、进程存活与崩溃日志。该脚本不等于 UU 账号、ICE、视频及手柄端到端测试。
+- **实机端到端验收**：依照 `pico-android/HARDWARE-TESTING.md` 对照真实 UU 被控主机逐项检查。
+
+当前未提供可公开的 UU 测试账号、远端机器和 PICO 设备，CI 无法验证真实远程控制成功。请勿把纯协议测试通过等同于能生产使用。
