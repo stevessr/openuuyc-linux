@@ -84,6 +84,7 @@ internal class UuDirectSession(
     private var video: VideoTrack? = null
     private var remoteAudio: AudioTrack? = null
     private var audioFocusHeld = false
+    private var audioFocusRequested = false
     private val audioManager =
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { focus ->
@@ -400,6 +401,7 @@ internal class UuDirectSession(
             remoteAudio?.setEnabled(false)
             remoteAudio = track
             val granted = runCatching {
+                audioFocusRequested = true
                 audioManager.requestAudioFocus(audioFocusRequest) ==
                     AudioManager.AUDIOFOCUS_REQUEST_GRANTED
             }.getOrDefault(false)
@@ -577,9 +579,10 @@ internal class UuDirectSession(
         video = null
         remoteAudio?.setEnabled(false)
         remoteAudio = null
-        if (audioFocusHeld) {
+        if (audioFocusRequested) {
             runCatching { audioManager.abandonAudioFocusRequest(audioFocusRequest) }
         }
+        audioFocusRequested = false
         audioFocusHeld = false
         channels.forEach { runCatching { it.close() } }
         channels.clear()
