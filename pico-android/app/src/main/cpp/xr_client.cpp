@@ -235,6 +235,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     EGLState egl;
     Actions actions;
     bool running = false;
+    bool input_focused = false;
     bool action_ready = false;
     const char *failure = nullptr;
 
@@ -336,6 +337,15 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             while (xrPollEvent(instance, &event) == XR_SUCCESS) {
                 if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
                     auto *changed = reinterpret_cast<XrEventDataSessionStateChanged *>(&event);
+                    // When the headset loses focus (system menu, sleep,
+                    // passthrough interruption) release a held remote trigger
+                    // immediately. A remote PC must not keep dragging while
+                    // the user is no longer interacting with our XR layer.
+                    input_focused = changed->state == XR_SESSION_STATE_FOCUSED;
+                    if (!input_focused && previous_down) {
+                        env->CallVoidMethod(activity, pointer, previous_u, previous_v, JNI_FALSE);
+                        previous_down = false;
+                    }
                     if (changed->state == XR_SESSION_STATE_READY && !running) {
                         XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
                         begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -375,12 +385,23 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             end.layerCount = state.shouldRender ? 1u : 0u;
             end.layers = state.shouldRender ? layers : nullptr;
-            if (action_ready) process_input(env, activity, pointer, session, world, actions,
-                                            state.predictedDisplayTime, previous_down, previous_u, previous_v);
+            if (action_ready && input_focused && state.shouldRender) {
+                process_input(env, activity, pointer, session, world, actions,
+                              state.predictedDisplayTime, previous_down, previous_u, previous_v);
+            } else if (previous_down) {
+                env->CallVoidMethod(activity, pointer, previous_u, previous_v, JNI_FALSE);
+                previous_down = false;
+            }
             if (XR_FAILED(xrEndFrame(session, &end))) break;
         }
     } while (false);
 
+    // Normal session teardown can bypass STOPPING. Release any held input
+    // *before* detaching the Java remote-control session and Surface.
+    if (previous_down) {
+        env->CallVoidMethod(activity, pointer, previous_u, previous_v, JNI_FALSE);
+        previous_down = false;
+    }
     if (running) xrEndSession(session);
     actions.destroy();
     if (swapchain != XR_NULL_HANDLE) xrDestroySwapchain(swapchain);
