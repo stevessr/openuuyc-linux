@@ -110,8 +110,8 @@ internal class UuDirectSession(
     private var nextRequestSeq = 2L
     private var pressed = false
     private val signalGate = UuSignalGate()
-    private var answerInstalled = false
-    private val pendingRemoteCandidates = ArrayList<IceCandidate>()
+    private val localIce = UuIceCandidateQueue<IceCandidate>()
+    private val remoteIce = UuIceCandidateQueue<IceCandidate>()
     private val appControlId = UUID.randomUUID().toString()
 
     @Synchronized fun start(xrSurface: Surface) {
@@ -275,12 +275,15 @@ internal class UuDirectSession(
             "answer", "restart_ice" -> {
                 val sdp = if (compressed != null) UuWire.ungzip(compressed) else data.optString("sdp")
                 if (sdp.isBlank()) return
-                answerInstalled = false
+                remoteIce.resetForRenegotiation()
                 peer?.setRemoteDescription(sdpObserver(onSuccess = {
                     synchronized(this@UuDirectSession) {
-                        answerInstalled = true
-                        pendingRemoteCandidates.forEach { peer?.addIceCandidate(it) }
-                        pendingRemoteCandidates.clear()
+                        if (closed.get()) return@synchronized
+                        if (!remoteIce.activate { peer?.addIceCandidate(it) == true }) {
+                            emit("UU ICE 候选地址无法安装，已终止会话")
+                            terminateUnexpectedly()
+                            return@synchronized
+                        }
                     }
                     emit("UU WebRTC SDP 已接受")
                 }), SessionDescription(SessionDescription.Type.ANSWER, sdp))
@@ -288,11 +291,15 @@ internal class UuDirectSession(
             "candidate" -> {
                 val ice = data.optJSONObject("candidate") ?: return
                 val candidate = ice.optString("candidate")
-                if (candidate.isNotBlank()) {
-                    val next = IceCandidate(ice.optString("sdpMid", "0"),
-                        ice.optInt("sdpMLineIndex", 0), candidate)
-                    if (answerInstalled) peer?.addIceCandidate(next)
-                    else if (pendingRemoteCandidates.size < 128) pendingRemoteCandidates.add(next)
+                val mid = ice.optString("sdpMid", "0")
+                val index = ice.optInt("sdpMLineIndex", 0)
+                if (candidate.length in 1..4096 && mid.length in 1..64 && index in 0..32) {
+                    val next = IceCandidate(mid, index, candidate)
+                    val key = "$mid:$index:$candidate"
+                    if (!remoteIce.submit(key, next) { peer?.addIceCandidate(it) == true }) {
+                        emit("UU 远端 ICE 候选异常或缓冲超限")
+                        terminateUnexpectedly()
+                    }
                 }
             }
         }
@@ -345,7 +352,17 @@ internal class UuDirectSession(
             override fun onIceConnectionReceivingChange(receiving: Boolean) {}
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {}
             override fun onIceCandidate(candidate: IceCandidate) {
-                socket?.send(UuWire.candidate(info, candidate.sdp, candidate.sdpMid ?: "0", candidate.sdpMLineIndex))
+                synchronized(this@UuDirectSession) {
+                    if (closed.get()) return@synchronized
+                    val mid = candidate.sdpMid ?: "0"
+                    val key = "$mid:${candidate.sdpMLineIndex}:${candidate.sdp}"
+                    if (!localIce.submit(key, candidate) {
+                            socket?.send(UuWire.candidate(info, it.sdp, it.sdpMid ?: "0", it.sdpMLineIndex)) == true
+                        }) {
+                        emit("UU 本地 ICE 候选发送失败或缓冲超限")
+                        terminateUnexpectedly()
+                    }
+                }
             }
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
             override fun onAddStream(stream: MediaStream?) {}
@@ -377,11 +394,22 @@ internal class UuDirectSession(
         }
         connection.createOffer(sdpObserver(onCreated = { desc ->
             connection.setLocalDescription(sdpObserver(onSuccess = {
-                val wireSdp = UuWire.uuOfferSdp(desc.description)
-                val zip = UuWire.gzip(wireSdp.toByteArray(StandardCharsets.UTF_8))
-                socket?.send(UuWire.offerHeader(info))
-                socket?.send(ByteString.of(*UuWire.attachment(zip)))
-                emit("UU WebRTC offer 已通过原生 Socket.IO 发送")
+                synchronized(this@UuDirectSession) {
+                    if (closed.get()) return@synchronized
+                    val wireSdp = UuWire.uuOfferSdp(desc.description)
+                    val zip = UuWire.gzip(wireSdp.toByteArray(StandardCharsets.UTF_8))
+                    val ws = socket
+                    if (ws == null || !ws.send(UuWire.offerHeader(info)) ||
+                        !ws.send(ByteString.of(*UuWire.attachment(zip))) ||
+                        !localIce.activate {
+                            ws.send(UuWire.candidate(info, it.sdp, it.sdpMid ?: "0", it.sdpMLineIndex))
+                        }) {
+                        emit("UU SDP/ICE 信令发送失败，已终止会话")
+                        terminateUnexpectedly()
+                        return@synchronized
+                    }
+                    emit("UU WebRTC offer 和有序 ICE 候选已提交")
+                }
             }), desc)
         }), MediaConstraints())
     }
@@ -576,8 +604,8 @@ internal class UuDirectSession(
         if (pressed) sendControl(UuPointerWire.button(false))
         pressed = false
         captureGate.onTransportClosed()
-        answerInstalled = false
-        pendingRemoteCandidates.clear()
+        localIce.close()
+        remoteIce.close()
         renderer?.let { video?.removeSink(it) }
         video?.removeSink(firstFrameSink)
         video = null
