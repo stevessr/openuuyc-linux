@@ -16,11 +16,13 @@ import android.widget.TextView
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.MultiFormatWriter
 import org.openuuyc.pico.uu.UuDirectSession
+import org.openuuyc.pico.uu.UuJoinGate
 import org.openuuyc.pico.uu.UuNrdApi
 import org.openuuyc.pico.uu.UuDevice
 import org.openuuyc.pico.uu.UuQr
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Direct PICO UU client: account QR -> device list -> UU room -> Socket.IO ->
@@ -32,9 +34,10 @@ class PicoActivity : Activity() {
 
     private val ui = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
-    private val loginAlive = AtomicBoolean(true)
+    private val loginEpoch = AtomicLong(0L)
+    private val joinGate = UuJoinGate()
     private val running = AtomicBoolean(false)
-    private var session: UuDirectSession? = null
+    @Volatile private var session: UuDirectSession? = null
     private var xrThread: Thread? = null
     private var xrSurface: Surface? = null
     private lateinit var status: TextView
@@ -86,22 +89,27 @@ class PicoActivity : Activity() {
     }
 
     private fun login() {
-        loginAlive.set(false)
-        loginAlive.set(true)
+        val loginTicket = loginEpoch.incrementAndGet()
         worker.submit {
+            if (loginEpoch.get() != loginTicket || isDestroyed) return@submit
             try {
                 api.initializeDevice()
                 var qr = api.createQr()
                 var statusValue = 1
                 var deadline = System.currentTimeMillis() + 300_000
-                while (loginAlive.get()) {
+                while (loginEpoch.get() == loginTicket && !isDestroyed) {
+                    val image = qrBitmap(qr.url)
                     ui.post {
-                        qrImage.setImageBitmap(qrBitmap(qr.url))
-                        qrImage.visibility = ImageView.VISIBLE
+                        if (loginEpoch.get() == loginTicket && !isDestroyed) {
+                            qrImage.setImageBitmap(image)
+                            qrImage.visibility = ImageView.VISIBLE
+                        }
                     }
                     message("请用手机 UU 客户端扫码确认，二维码有效期 5 分钟")
-                    while (loginAlive.get() && System.currentTimeMillis() < deadline) {
+                    while (loginEpoch.get() == loginTicket && !isDestroyed &&
+                        System.currentTimeMillis() < deadline) {
                         val state = api.queryQr(qr, statusValue)
+                        if (loginEpoch.get() != loginTicket || isDestroyed) return@submit
                         when (state) {
                             1, 2 -> {
                                 statusValue = state
@@ -110,6 +118,7 @@ class PicoActivity : Activity() {
                             3 -> break // refresh cancelled login ticket
                             4 -> {
                                 api.confirmQr(qr)
+                                if (loginEpoch.get() != loginTicket || isDestroyed) return@submit
                                 message("UU 登录成功，可从设备列表直接发起 PICO 远控")
                                 ui.post { qrImage.visibility = ImageView.GONE }
                                 refresh()
@@ -118,13 +127,14 @@ class PicoActivity : Activity() {
                             else -> throw IllegalArgumentException("未知的 UU 登录状态：$state")
                         }
                     }
-                    if (!loginAlive.get()) return@submit
+                    if (loginEpoch.get() != loginTicket || isDestroyed) return@submit
                     qr = api.createQr()
                     statusValue = 1
                     deadline = System.currentTimeMillis() + 300_000
                 }
             } catch (e: Exception) {
-                message("UU 原生登录失败：${e.javaClass.simpleName}")
+                if (loginEpoch.get() == loginTicket && !isDestroyed)
+                    message("UU 原生登录失败：${e.javaClass.simpleName}")
             }
         }
     }
@@ -166,13 +176,14 @@ class PicoActivity : Activity() {
     }
 
     private fun connect(device: UuDevice) {
-        if (running.get()) return
+        val ticket = joinGate.begin() ?: return
         message("加入 UU 远控房间：${device.alias}")
         worker.submit {
             try {
-                // Actual UU join/by_device authorization, not a Linux relay token.
+                // The pending NRD request might finish after the user
+                // disconnected. Only its active generation can enter XR.
                 val room = api.join(device)
-                if (isFinishing || isDestroyed) return@submit
+                if (isFinishing || isDestroyed || !joinGate.adopt(ticket)) return@submit
                 val direct = UuDirectSession(applicationContext, room, api.identity, ::message)
                 session = direct
                 running.set(true)
@@ -187,7 +198,9 @@ class PicoActivity : Activity() {
                     }
                 }, "OpenUUYC-PICO-OpenXR").also { it.start() }
             } catch (e: Exception) {
-                message("UU 设备连接失败：${e.javaClass.simpleName}")
+                if (!isDestroyed) message("UU 设备连接失败：${e.javaClass.simpleName}")
+            } finally {
+                joinGate.failed(ticket)
             }
         }
     }
@@ -217,7 +230,8 @@ class PicoActivity : Activity() {
     }
 
     private fun stopSession() {
-        loginAlive.set(false)
+        loginEpoch.incrementAndGet()
+        joinGate.stop()
         session?.close()
         session = null
         if (running.getAndSet(false)) nativeStop()
@@ -226,6 +240,7 @@ class PicoActivity : Activity() {
 
     override fun onDestroy() {
         stopSession()
+        joinGate.destroy()
         worker.shutdownNow()
         api.close()
         super.onDestroy()
