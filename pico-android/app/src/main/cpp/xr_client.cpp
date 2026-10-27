@@ -497,7 +497,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                               state.predictedDisplayTime, previous_down, previous_u, previous_v,
                               previous_pane, last_scroll_time);
             } else if (previous_down) {
-                env->CallVoidMethod(activity, pointer, previous_u, previous_v, JNI_FALSE);
+                env->CallVoidMethod(activity, pointer, previous_pane, previous_u, previous_v, JNI_FALSE);
                 previous_down = false;
             }
             if (XR_FAILED(xrEndFrame(session, &end))) break;
@@ -507,7 +507,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     // Normal session teardown can bypass STOPPING. Release any held input
     // *before* detaching the Java remote-control session and Surface.
     if (previous_down) {
-        env->CallVoidMethod(activity, pointer, previous_u, previous_v, JNI_FALSE);
+        env->CallVoidMethod(activity, pointer, previous_pane, previous_u, previous_v, JNI_FALSE);
         previous_down = false;
     }
     if (running) xrEndSession(session);
