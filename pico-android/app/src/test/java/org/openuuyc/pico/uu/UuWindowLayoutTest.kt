@@ -12,7 +12,7 @@ class UuWindowLayoutTest {
     }
 
     @Test fun selectedTrackIsNotReplacedWithUnrelatedStream() {
-        val panes = UuWindowLayout.plan(8, 4, mapOf(8 to 4), listOf(0, 1))
+        val panes = UuWindowLayout.plan(8, 4, mapOf(8 to 4), listOf(0))
         assertEquals(UuWindowLayout.Pane(4, 8), panes[0])
         assertNull(panes[2])
     }

@@ -67,3 +67,15 @@ NRD 登录只请求 https；信令仅使用 wss；应用通过 `usesCleartextTra
 - **实机端到端验收**：依照 `pico-android/HARDWARE-TESTING.md` 对照真实 UU 被控主机逐项检查。
 
 当前未提供可公开的 UU 测试账号、远端机器和 PICO 设备，CI 无法验证真实远程控制成功。请勿把纯协议测试通过等同于能生产使用。
+
+## 多窗口（PICO OpenXR）
+
+PICO 原生客户端目前按 XR runtime 支持的合成层上限创建**最多 3 个独立空间面板**：中间为 UU 当前选择的屏幕轨道，左右分别绑定其他已解码且确实存在的 `video_N` 轨道。每个面板都有独立的 Android Surface、WebRTC EglRenderer、OpenXR Surface Swapchain；空间定位器按面板命中计算鼠标坐标。没有对应视频轨道时不显示空白面板；不将重复 RTP 轨道当成新窗口。
+
+仅使用 UU `ScreenSources` 明确返回的 `screen_id ↔ video_track_index` 映射控制侧窗；映射未知的侧窗只能观看，不能将鼠标输入错误发送到默认显示器。跨窗移动、失焦时释放按键；本实现暂不保证 UU 主机真的同时推送多个视频轨道，需真实双/三屏主机测试。
+
+## PICO 4 Ultra 相机接口与权限
+
+已补 Android `CAMERA` 按需权限请求（不再安装即索要）、Camera2 设备枚举与主动预览入口；打开预览后，若系统不公开 Camera2 ID，应用显示设备不支持的具体原因而不是无响应。页面可缩放，预览失焦/切换应用后会关闭摄像头释放资源。
+
+**PICO 4 Ultra 透视彩色相机不保证暴露为 Android Camera2**：消费版 PICO 的 XR 透视摄像头须经 PICO SDK 对应的专用 XR 相机扩展与平台权限才能获取。当前 Camera2 代码是可用设备的预览路径和错误诊断，**不是** `XR_PICO_camera_image` 透视相机接入的替代品。未经真实头显验证前不得视为原生透视取流修复完成。
