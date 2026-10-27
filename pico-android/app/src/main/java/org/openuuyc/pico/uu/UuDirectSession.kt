@@ -72,7 +72,7 @@ internal class UuDirectSession(
     private val captureGate = UuCaptureGate()
     private var nextRequestSeq = 2L
     private var pressed = false
-    private var signalingConnected = false
+    private val signalGate = UuSignalGate()
     private var answerInstalled = false
     private val pendingRemoteCandidates = ArrayList<IceCandidate>()
     private val appControlId = UUID.randomUUID().toString()
@@ -127,31 +127,34 @@ internal class UuDirectSession(
             is UuSocketIoWire.Packet.Open -> emit("UU Engine.IO 会话已建立")
             is UuSocketIoWire.Packet.Ping -> socket?.send("3" + packet.payload)
             UuSocketIoWire.Packet.NamespaceConnected -> {
-                if (!signalingConnected) {
-                    signalingConnected = true
+                if (signalGate.namespaceConnected())
                     socket?.send("421[\"room_info\"]")
-                }
             }
             is UuSocketIoWire.Packet.RoomAck -> {
+                if (!signalGate.roomAcknowledged()) return
                 val (header, bytes) = UuWire.controlEvent(identity.deviceId, appControlId)
                 socket?.send(header)
                 socket?.send(ByteString.of(*UuWire.attachment(bytes)))
                 emit("UU 房间已登录，发送原生控制握手")
             }
             is UuSocketIoWire.Packet.ControlAck -> {
-                controlInfo = UuWire.parseControlAck(packet.data, appControlId)
+                if (signalGate.phase != UuSignalGate.Phase.WAIT_CONTROL_ACK) return
+                val verified = UuWire.parseControlAck(packet.data, appControlId)
+                if (!signalGate.controlAcknowledged()) return
+                controlInfo = verified
                 emit("UU 控制握手已确认，启动设备直连 WebRTC")
-                createPeer(controlInfo!!)
+                createPeer(verified)
             }
             is UuSocketIoWire.Packet.Event -> {
                 packet.acknowledge?.let { socket?.send(UuSocketIoWire.eventAck(it)) }
                 when (packet.name) {
-                    "soac" -> parseSoac(packet.payload, null)
+                    "soac" -> if (signalGate.mayProcessMedia()) parseSoac(packet.payload, null)
                     "leave", "publisher_disconnect" -> close()
                 }
             }
             is UuSocketIoWire.Packet.BinaryStart -> {
                 packet.acknowledge?.let { socket?.send(UuSocketIoWire.eventAck(it)) }
+                if (!signalGate.mayProcessMedia()) return
                 require(pendingBinaryEvent == null) { "interleaved binary UU events" }
                 pendingBinaryName = packet.name
                 pendingBinaryEvent = packet.payload
@@ -439,6 +442,9 @@ internal class UuDirectSession(
 
     @Synchronized override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        signalGate.close()
+        pendingBinaryEvent = null
+        pendingBinaryName = null
         echoRetry?.cancel(false)
         heartbeatExecutor.shutdownNow()
         if (pressed) sendControl(UuPointerWire.button(false))
