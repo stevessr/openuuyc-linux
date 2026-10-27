@@ -207,17 +207,27 @@ internal object UuWire {
     private class Reader(private val data: ByteArray) {
         var offset = 0
         fun long(): Long {
-            var bits = 0
             var result = 0L
-            while (bits < 70) {
+            for (index in 0..9) {
                 if (offset >= data.size) throw IllegalArgumentException("truncated protobuf varint")
                 val b = data[offset++].toInt() and 255
-                if (bits == 63 && (b and 0x7e) != 0) throw IllegalArgumentException("varint overflow")
-                result = result or ((b.toLong() and 127L) shl bits)
+                if (index == 9 && b > 1) throw IllegalArgumentException("protobuf varint overflow")
+                result = result or ((b.toLong() and 127L) shl (index * 7))
                 if (b and 128 == 0) return result
-                bits += 7
             }
-            throw IllegalArgumentException("varint too long")
+            throw IllegalArgumentException("protobuf varint exceeds 10 bytes")
+        }
+        fun tag(): Pair<Int, Int> {
+            val raw = long()
+            val field = raw ushr 3
+            val wire = (raw and 7).toInt()
+            require(field in 1..536870911 && wire in listOf(0, 1, 2, 5)) {
+                "invalid protobuf tag/wire type"
+            }
+            return field.toInt() to wire
+        }
+        fun requireWire(actual: Int, expected: Int) {
+            require(actual == expected) { "wrong protobuf wire type" }
         }
         fun len(): ByteArray {
             val size = long()
@@ -237,7 +247,7 @@ internal object UuWire {
     }
 
     fun decodeEnvelope(bytes: ByteArray): Envelope {
-        require(bytes.size <= 64 * 1024) { "UU control message too large" }
+        require(bytes.isNotEmpty() && bytes.size <= 64 * 1024) { "UU control message empty or too large" }
         val top = Reader(bytes)
         var sequence = 0L
         var timestamp = 0L
@@ -248,77 +258,89 @@ internal object UuWire {
         var registeredRequest: Long? = null
         var registrationError: Int? = null
         while(!top.done()) {
-            val tag = top.long().toInt()
-            require(tag > 0)
-            when(tag ushr 3) {
-                1 -> sequence = top.long()
-                2 -> timestamp = top.long()
+            val (field, wire) = top.tag()
+            when(field) {
+                1 -> { top.requireWire(wire, 0); sequence = top.long() }
+                2 -> { top.requireWire(wire, 0); timestamp = top.long() }
                 3 -> {
+                    top.requireWire(wire, 2)
                     val sub = Reader(top.len())
                     while(!sub.done()) {
-                        val field = sub.long().toInt()
-                        when(field ushr 3) {
+                        val (subField, subWire) = sub.tag()
+                        when(subField) {
                             1 -> {
+                                sub.requireWire(subWire, 0)
                                 when (sub.long()) {
                                     0L -> echo = true
                                     1L -> echoAck = true
                                 }
                             }
-                            else -> sub.skip(field and 7)
+                            else -> sub.skip(subWire)
                         }
                     }
                 }
                 7 -> {
+                    top.requireWire(wire, 2)
                     val sources = Reader(top.len())
                     while(!sources.done()) {
-                        val field = sources.long().toInt()
-                        if (field ushr 3 == 2) screen = sources.long().toInt()
-                        else if (field ushr 3 == 1) {
+                        val (screenField, screenWire) = sources.tag()
+                        if (screenField == 2) {
+                            sources.requireWire(screenWire, 0)
+                            screen = sources.long().toInt()
+                        } else if (screenField == 1) {
+                            sources.requireWire(screenWire, 2)
                             val entry = Reader(sources.len())
                             var entryId: Int? = null
                             var entryTrack: Int? = null
                             while (!entry.done()) {
-                                val screenField = entry.long().toInt()
-                                when(screenField ushr 3) {
-                                    1 -> entryId = entry.long().toInt()
-                                    12 -> entryTrack = entry.long().toInt()
-                                    else -> entry.skip(screenField and 7)
+                                val (entryField, entryWire) = entry.tag()
+                                when(entryField) {
+                                    1 -> { entry.requireWire(entryWire, 0); entryId = entry.long().toInt() }
+                                    12 -> { entry.requireWire(entryWire, 0); entryTrack = entry.long().toInt() }
+                                    else -> entry.skip(entryWire)
                                 }
                             }
                             if (entryId != null && entryTrack != null && entryId >= 0 && entryTrack >= 0) {
                                 tracksByScreen[entryId] = entryTrack
                                 if (screen == null) screen = entryId
                             }
-                        } else sources.skip(field and 7)
+                        } else sources.skip(screenWire)
                     }
                 }
                 22 -> {
+                    top.requireWire(wire, 2)
                     val rpc = Reader(top.len())
                     var requestId: Long? = null
                     var error: Int? = null
                     var hasTrackReply = false
                     while (!rpc.done()) {
-                        val tag2 = rpc.long().toInt()
-                        when(tag2 ushr 3) {
+                        val (rpcField, rpcWire) = rpc.tag()
+                        when(rpcField) {
                             1 -> {
+                                rpc.requireWire(rpcWire, 2)
                                 val header = Reader(rpc.len())
                                 while (!header.done()) {
-                                    val tag3 = header.long().toInt()
-                                    if (tag3 ushr 3 == 1) requestId = header.long()
-                                    else header.skip(tag3 and 7)
+                                    val (headerField, headerWire) = header.tag()
+                                    if (headerField == 1) {
+                                        header.requireWire(headerWire, 0)
+                                        requestId = header.long()
+                                    } else header.skip(headerWire)
                                 }
                             }
                             11 -> {
+                                rpc.requireWire(rpcWire, 2)
                                 hasTrackReply = true
                                 val reply = Reader(rpc.len())
                                 error = 0
                                 while (!reply.done()) {
-                                    val tag3 = reply.long().toInt()
-                                    if (tag3 ushr 3 == 1) error = reply.long().toInt()
-                                    else reply.skip(tag3 and 7)
+                                    val (replyField, replyWire) = reply.tag()
+                                    if (replyField == 1) {
+                                        reply.requireWire(replyWire, 0)
+                                        error = reply.long().toInt()
+                                    } else reply.skip(replyWire)
                                 }
                             }
-                            else -> rpc.skip(tag2 and 7)
+                            else -> rpc.skip(rpcWire)
                         }
                     }
                     if (hasTrackReply) {
@@ -326,7 +348,7 @@ internal object UuWire {
                         registrationError = error
                     }
                 }
-                else -> top.skip(tag and 7)
+                else -> top.skip(wire)
             }
         }
         return Envelope(sequence, timestamp, echo, screen, screen?.let(tracksByScreen::get), echoAck, registeredRequest, registrationError)
@@ -372,10 +394,15 @@ internal object UuWire {
             }
         }
         end = (app + 1 until lines.size).firstOrNull { lines[it].startsWith("m=") } ?: lines.size
+        // Replace a peer-library default value rather than adding a competing
+        // max-message-size line. Repeated normalization must be byte-stable.
+        for (i in end - 1 downTo app + 1) {
+            if (lines[i].startsWith("a=max-message-size:")) lines.removeAt(i)
+        }
+        end = (app + 1 until lines.size).firstOrNull { lines[it].startsWith("m=") } ?: lines.size
         val sctp = (app + 1 until end).firstOrNull { lines[it].startsWith("a=sctp-port:") }
         val attrAt = if (sctp != null) sctp + 1 else end
-        val messageSize = "a=max-message-size:524288"
-        if (messageSize !in lines.subList(app + 1, end)) lines.add(attrAt, messageSize)
+        lines.add(attrAt, "a=max-message-size:524288")
         // Disable mixed KCP until Android libwebrtc has a compatible transport.
         return lines.joinToString(separator, postfix = separator)
     }

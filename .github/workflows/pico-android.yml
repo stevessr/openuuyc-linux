@@ -37,9 +37,23 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-      - name: Android JVM tests, native compilation and APK
+      - name: Android JVM protocol and session-state tests
         working-directory: pico-android
-        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
+        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
+      - name: Native arm64 OpenXR APK build and Android lint
+        working-directory: pico-android
+        run: gradle --no-daemon --stacktrace :app:assembleDebug :app:lintDebug
+      - name: Preserve protocol test XML, HTML and lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico-protocol-test-reports
+          path: |
+            pico-android/app/build/test-results/testDebugUnitTest/
+            pico-android/app/build/reports/tests/testDebugUnitTest/
+            pico-android/app/build/reports/lint-results-debug.*
+          if-no-files-found: warn
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         if: success()
         with:
