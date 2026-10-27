@@ -11,7 +11,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.nio.charset.StandardCharsets
-import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import javax.crypto.Mac
@@ -110,38 +109,14 @@ internal class UuNrdApi(private val context: Context) {
     var account: UuAccount? = null
         private set
 
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(70, TimeUnit.SECONDS)
-        .callTimeout(75, TimeUnit.SECONDS)
-        .build()
+    private val transport = UuNrdTransport()
 
     fun clearAccount() { account = null }
-    fun close() { http.dispatcher.executorService.shutdown() }
+    fun close() { transport.close() }
 
-    private fun request(method: String, path: String, body: JSONObject? = null, platform: Boolean = false): JSONObject {
-        require(path.startsWith("/") && path.length <= 256)
-        val bytes = body?.toString()?.toByteArray(StandardCharsets.UTF_8) ?: ByteArray(0)
-        val signed = UuContract.headers(method, path, bytes, System.currentTimeMillis() / 1000, identity, account, platform)
-        val url = UuContract.BASE + path
-        val builder = Request.Builder().url(url)
-        signed.forEach { (key, value) -> builder.header(key, value) }
-        if (account != null && !platform) builder.header("Authorization", "Bearer ${account!!.token}")
-        if (body != null) builder.header("Content-Type", "application/json")
-        val content = bytes.toRequestBody("application/json".toMediaType())
-        builder.method(method, if (method == "GET") null else content)
-        http.newCall(builder.build()).execute().use { response ->
-            val text = response.body?.string() ?: throw IOException("empty UU response")
-            if (text.length > 4 * 1024 * 1024) throw IOException("UU response too large")
-            val envelope = JSONObject(text)
-            val code = envelope.optInt("code", -1)
-            if (!response.isSuccessful || code != 0) {
-                // Never include server-provided message in logs: it can echo auth data.
-                throw IOException("UU request failed: HTTP ${response.code}, code $code")
-            }
-            return envelope.optJSONObject("data") ?: throw IOException("UU response missing data")
-        }
-    }
+    private fun request(
+        method: String, path: String, body: JSONObject? = null, platform: Boolean = false
+    ): JSONObject = transport.request(method, path, body, identity, account, platform)
 
     fun initializeDevice() {
         if (identity.deviceId.matches(Regex("[a-z0-9]{16}"))) return
