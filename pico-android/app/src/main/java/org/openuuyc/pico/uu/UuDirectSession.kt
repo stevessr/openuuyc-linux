@@ -58,6 +58,7 @@ internal class UuDirectSession(
     private var echoRetry: ScheduledFuture<*>? = null
     private var echoAttempts = 0
     private var socket: WebSocket? = null
+    private val signalEndpoints = UuSignalEndpoints(room.endpoints)
     private var peer: PeerConnection? = null
     private var factory: PeerConnectionFactory? = null
     private var egl: EglBase? = null
@@ -81,47 +82,64 @@ internal class UuDirectSession(
     @Synchronized fun start(xrSurface: Surface) {
         check(socket == null && !closed.get())
         surface = xrSurface
-        val endpoint = UuWire.signalEndpoint(room.endpoints.first())
-        val request = Request.Builder().url(endpoint)
+        connectSignaling()
+    }
+
+    @Synchronized private fun connectSignaling() {
+        if (closed.get()) return
+        val request = Request.Builder().url(signalEndpoints.current)
             .header("X-NRD-AUTH", room.token)
             .header("X-NRD-CONTROLLING", "0")
             .header("streamer_version", "V4.7.3")
             .header("streamer_flag", """{"sdp_flags":{"gzip_sdp":true}}""")
             .build()
-        emit("UU 信令服务器连接中")
+        emit("UU 信令服务器连接中 (${signalEndpoints.position}/${signalEndpoints.count})")
         socket = http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
-                ws.send("40") // Socket.IO namespace CONNECT
+                if (!closed.get()) ws.send("40") // namespace CONNECT
             }
+
             override fun onMessage(ws: WebSocket, text: String) {
                 if (text.length <= 1024 * 1024) synchronized(this@UuDirectSession) {
+                    if (ws !== socket || closed.get()) return@synchronized
                     runCatching { parseMessage(text) }.onFailure {
                         emit("UU 信令帧解析失败")
                         ws.close(1002, "invalid UU protocol frame")
                     }
                 }
             }
+
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
                 if (bytes.size <= 1024 * 1024) synchronized(this@UuDirectSession) {
+                    if (ws !== socket || closed.get()) return@synchronized
                     runCatching { parseBinary(bytes.toByteArray()) }.onFailure {
                         emit("UU 二进制信令无效")
                         ws.close(1002, "invalid UU binary frame")
                     }
                 }
             }
+
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                if (!closed.get()) {
-                    emit("UU 信令连接失败：${t.javaClass.simpleName}")
-                    terminateUnexpectedly()
-                }
+                onSocketEnded(ws, "连接失败：${t.javaClass.simpleName}")
             }
+
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                if (!closed.get()) {
-                    emit("UU 信令已关闭 ($code)")
-                    terminateUnexpectedly()
-                }
+                onSocketEnded(ws, "已关闭 ($code)")
             }
         })
+    }
+
+    @Synchronized private fun onSocketEnded(ws: WebSocket, reason: String) {
+        if (closed.get() || ws !== socket) return
+        if (signalGate.phase == UuSignalGate.Phase.WAIT_NAMESPACE &&
+            signalEndpoints.nextBeforeNamespace()) {
+            socket = null
+            emit("UU 首选信令节点不可用，切换下一个节点")
+            connectSignaling()
+        } else {
+            emit("UU 信令 $reason")
+            terminateUnexpectedly()
+        }
     }
 
     private fun emit(text: String) { if (!closed.get()) events(text) }
