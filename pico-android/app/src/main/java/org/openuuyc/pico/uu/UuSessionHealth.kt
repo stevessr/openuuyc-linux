@@ -10,10 +10,13 @@ package org.openuuyc.pico.uu
 internal class UuSessionHealth(
     private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }
 ) {
-    enum class Warning { NONE, SIGNAL_TIMEOUT, ICE_TIMEOUT, FIRST_FRAME_TIMEOUT }
+    enum class Warning { NONE, SIGNAL_TIMEOUT, ICE_TIMEOUT, TRACK_ACK_TIMEOUT, FIRST_FRAME_TIMEOUT }
     private var started: Long? = null
     private var peerStarted: Long? = null
     private var captureStarted: Long? = null
+    private var iceDeadlineStart: Long? = null
+    private var iceHasConnectedBefore = false
+    private var trackRegistrationStarted: Long? = null
     private var signalReady = false
     private var iceReady = false
     private var firstFrame = false
@@ -29,10 +32,27 @@ internal class UuSessionHealth(
 
     @Synchronized fun markPeerCreated() {
         peerStarted = nowMs()
+        iceDeadlineStart = nowMs()
     }
 
     @Synchronized fun markIceConnected() {
         iceReady = true
+        iceHasConnectedBefore = true
+        iceDeadlineStart = null
+    }
+
+    @Synchronized fun markIceDisconnected() {
+        if (peerStarted == null || !iceReady) return
+        iceReady = false
+        iceDeadlineStart = nowMs()
+    }
+
+    @Synchronized fun markTrackRegistrationRequested() {
+        trackRegistrationStarted = nowMs()
+    }
+
+    @Synchronized fun markTrackRegistrationFinished() {
+        trackRegistrationStarted = null
     }
 
     @Synchronized fun markCaptureRequested() {
@@ -47,8 +67,13 @@ internal class UuSessionHealth(
         val now = nowMs()
         if (!signalReady && started != null && now - started!! >= 30_000L)
             return Warning.SIGNAL_TIMEOUT
-        if (!iceReady && peerStarted != null && now - peerStarted!! >= 35_000L)
+        val iceTimeoutMs = if (iceHasConnectedBefore) 15_000L else 35_000L
+        if (!iceReady && iceDeadlineStart != null &&
+            now - iceDeadlineStart!! >= iceTimeoutMs)
             return Warning.ICE_TIMEOUT
+        if (trackRegistrationStarted != null &&
+            now - trackRegistrationStarted!! >= 5_000L)
+            return Warning.TRACK_ACK_TIMEOUT
         if (!firstFrame && !frameWarningSent &&
             captureStarted != null && now - captureStarted!! >= 25_000L) {
             frameWarningSent = true

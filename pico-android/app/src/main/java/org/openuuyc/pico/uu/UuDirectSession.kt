@@ -127,7 +127,11 @@ internal class UuDirectSession(
                         terminateUnexpectedly()
                     }
                     UuSessionHealth.Warning.ICE_TIMEOUT -> {
-                        emit("UU WebRTC/ICE 连接超过 35 秒，终止无效连接")
+                        emit("UU WebRTC ICE 建立或断线恢复超时，终止失效连接")
+                        terminateUnexpectedly()
+                    }
+                    UuSessionHealth.Warning.TRACK_ACK_TIMEOUT -> {
+                        emit("UU 视频轨道注册 5 秒未收到远端确认")
                         terminateUnexpectedly()
                     }
                     UuSessionHealth.Warning.FIRST_FRAME_TIMEOUT ->
@@ -349,9 +353,15 @@ internal class UuDirectSession(
                     state == PeerConnection.IceConnectionState.COMPLETED) {
                     health.markIceConnected()
                     emit("UU P2P/中转 WebRTC 已连接")
-                } else if (state == PeerConnection.IceConnectionState.FAILED) {
-                    emit("UU WebRTC ICE 连接失败")
-                    terminateUnexpectedly()
+                } else if (state == PeerConnection.IceConnectionState.DISCONNECTED) {
+                    health.markIceDisconnected()
+                    emit("UU ICE 连接暂时断开，等待 15 秒内恢复")
+                } else if (state == PeerConnection.IceConnectionState.FAILED ||
+                           state == PeerConnection.IceConnectionState.CLOSED) {
+                    if (!closed.get()) {
+                        emit("UU WebRTC ICE 连接失败或已关闭")
+                        terminateUnexpectedly()
+                    }
                 }
             }
             override fun onStandardizedIceConnectionChange(state: PeerConnection.IceConnectionState?) {}
@@ -469,16 +479,22 @@ internal class UuDirectSession(
                         }
                     } else if (channel.state() == DataChannel.State.CLOSED ||
                                channel.state() == DataChannel.State.CLOSING) {
-                        if (channel === controlChannel || channel === textChannel) {
+                        val critical = channel === controlChannel || channel === textChannel
+                        if (critical && !closed.get()) {
                             // Revoke the button while CONTROL is still writable.
                             if (pressed && controlChannel?.state() == DataChannel.State.OPEN) {
                                 sendControl(UuPointerWire.button(false))
                             }
                             captureGate.onTransportClosed()
                             pressed = false
+                            health.markTrackRegistrationFinished()
                         }
                         if (channel === controlChannel) controlChannel = null
                         if (channel === textChannel) textChannel = null
+                        if (critical && !closed.get()) {
+                            emit("UU 必需的控制数据通道已关闭")
+                            terminateUnexpectedly()
+                        }
                     }
                 }
             }
@@ -498,6 +514,10 @@ internal class UuDirectSession(
                             sendControl(UuWire.echoResponse(payload.seq, payload.timestamp))
                         }
                         val acknowledgment = captureGate.observe(payload, isControl)
+                        if (beforeScreen != captureGate.selectedScreen ||
+                            beforeTrack != captureGate.selectedTrack) {
+                            health.markTrackRegistrationFinished()
+                        }
                         // A host display/track change revokes the held drag. Do
                         // not allow a fresh DOWN until the old UP was sent.
                         if (pressed && (beforeScreen != captureGate.selectedScreen ||
@@ -510,8 +530,16 @@ internal class UuDirectSession(
                             pressed = false
                         }
                         when (acknowledgment) {
-                            UuCaptureGate.Ack.REGISTERED -> emit("UU 视频轨道注册确认成功")
-                            UuCaptureGate.Ack.REJECTED -> emit("UU 视频轨道注册被拒绝（错误码 ${payload.trackAckError}）")
+                            UuCaptureGate.Ack.REGISTERED -> {
+                                health.markTrackRegistrationFinished()
+                                emit("UU 视频轨道注册确认成功")
+                            }
+                            UuCaptureGate.Ack.REJECTED -> {
+                                health.markTrackRegistrationFinished()
+                                emit("UU 视频轨道注册被拒绝（错误码 ${payload.trackAckError}）")
+                                terminateUnexpectedly()
+                                return
+                            }
                             UuCaptureGate.Ack.NONE -> {}
                         }
                         if (captureGate.pbConnected) echoRetry?.cancel(false)
@@ -537,6 +565,7 @@ internal class UuDirectSession(
                 if (echoAttempts >= 30) {
                     echoRetry?.cancel(false)
                     emit("UU PB 握手超时，无法建立控制")
+                    terminateUnexpectedly()
                     return@synchronized
                 }
                 echoAttempts++
@@ -562,6 +591,9 @@ internal class UuDirectSession(
         }
         if (text.send(DataChannel.Buffer(ByteBuffer.wrap(packet), false))) {
             captureGate.onSubmitted(action, sequence)
+            if (action == UuCaptureGate.Action.REGISTER_TRACK) {
+                health.markTrackRegistrationRequested()
+            }
             if (action == UuCaptureGate.Action.CAPTURE_SETTING) {
                 health.markCaptureRequested()
                 emit("UU 视频轨道注册确认，远端 H.264 画面已请求")
