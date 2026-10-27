@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.os.Handler
+import android.os.Looper
 import android.view.Surface
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -98,7 +100,9 @@ internal class UuDirectSession(
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
             .build())
-        .setOnAudioFocusChangeListener(audioFocusListener)
+        // WebRTC onTrack callbacks arrive on native worker threads without
+        // necessarily having a prepared Looper.
+        .setOnAudioFocusChangeListener(audioFocusListener, Handler(Looper.getMainLooper()))
         .build()
     private var pendingBinaryEvent: JSONObject? = null
     private var pendingBinaryName: String? = null
