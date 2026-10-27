@@ -217,6 +217,9 @@ class PicoActivity : Activity() {
                             { index, visible -> nativeSetWindowVisible(index, visible) }) {
                             ui.post { if (running.get() && !isDestroyed) stopSession() }
                         }
+                        // Camera2 preview and system XR passthrough may contend for
+                        // the headset cameras. XR always owns the sensor while active.
+                        cameraPreview.stop()
                         session = direct
                         running.set(true)
                         xrThread = Thread({

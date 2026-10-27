@@ -566,13 +566,14 @@ internal class UuDirectSession(
                         val payload = UuWire.decodeEnvelope(bytes)
                         val beforeScreen = captureGate.selectedScreen
                         val beforeTrack = captureGate.selectedTrack
+                        val beforeSources = screenTracks
                         if (isControl && payload.echoRequest) {
                             sendControl(UuWire.echoResponse(payload.seq, payload.timestamp))
                         }
                         val acknowledgment = captureGate.observe(payload, isControl)
                         if (payload.screenTracks.isNotEmpty()) screenTracks = payload.screenTracks
                         if (beforeScreen != captureGate.selectedScreen ||
-                            beforeTrack != captureGate.selectedTrack) {
+                            beforeTrack != captureGate.selectedTrack || beforeSources != screenTracks) {
                             health.markTrackRegistrationFinished()
                             videoTrackRouter.select(captureGate.selectedTrack)
                             updateWindows()
@@ -580,7 +581,7 @@ internal class UuDirectSession(
                         // A host display/track change revokes the held drag. Do
                         // not allow a fresh DOWN until the old UP was sent.
                         if (pointerFlow.pressed && (beforeScreen != captureGate.selectedScreen ||
-                                beforeTrack != captureGate.selectedTrack)) {
+                                beforeTrack != captureGate.selectedTrack || beforeSources != screenTracks)) {
                             if (!pointerFlow.release(::sendControl)) {
                                 emit("UU 显示器切换时按键释放失败，已断开远控")
                                 terminateUnexpectedly()
