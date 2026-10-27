@@ -121,7 +121,6 @@ internal class PicoXrToolbar(
         } else PicoXrMenuHit.settings(u,v,if(confirmingVirtual) 4 else 12)?.let(::click)
     }
     fun click(cell: Int) {
-        val direct = session() ?: return
         try {
             if(backgroundPage) {
                 if(cell==11) {backgroundPage=false;environmentPage=true}
@@ -144,7 +143,7 @@ internal class PicoXrToolbar(
             }
             if(spacePage) {
                 when(cell) {
-                    0 -> if(!followPending) {direct.releaseInputs();followPending=true;followView(!following)}
+                    0 -> if(!followPending) {session()?.releaseInputs();followPending=true;followView(!following)}
                     1 -> reset()
                     11 -> spacePage=false
                 }
@@ -169,6 +168,20 @@ internal class PicoXrToolbar(
                 }
                 draw();return
             }
+            // Global navigation/appearance must remain selectable after the
+            // active stream is closed or before any stream is available.
+            if(targetScreen==null && !screenPage && !confirmingVirtual) {
+                when(cell) {
+                    4,5 -> {environmentPage=true;notice="环境 · MR 与背景"}
+                    6 -> {closeScreenMenu();home()}
+                    7 -> notice="内侧扳机即时抓取；菜单外始终显示射线与焦点"
+                    9 -> notice="窗口最大对角线100英寸，保持屏幕比例"
+                    11 -> disconnect()
+                    else -> {requireNotNull(session()) {"请先打开一个串流窗口"};null}
+                }
+                if(cell in setOf(4,5,6,7,9,11)) {draw();return}
+            }
+            val direct=requireNotNull(session()) {"当前没有活动串流，可从主页面打开设备"}
             if(screenPage) {
                 when(cell) {
                     11 -> { screenPage=false;notice="已返回串流设置" }

@@ -77,6 +77,12 @@ internal class UuDirectSession(
     private val closed = AtomicBoolean(false)
     private val cleanupHandler = Handler(Looper.getMainLooper())
     private val deferredClose = UuDeferredClose(closed) { action -> cleanupHandler.post { action() } }
+    private val rtcCallbacks=UuRtcCallbackQueue {error ->
+        emit("WebRTC 回调处理失败：${error.javaClass.simpleName}");terminateUnexpectedly()
+    }
+    private fun postRtc(action: ()->Unit) {
+        if(!closed.get() && !rtcCallbacks.post {if(!closed.get()) action()}) terminateUnexpectedly()
+    }
     private val health = UuSessionHealth()
     @Volatile var onDisposed: (() -> Unit)?=null
     @Volatile var windowInfoListener: ((Int,Int?,String,Int,Int)->Unit)? = null
@@ -405,38 +411,41 @@ internal class UuDirectSession(
         onCreated: ((SessionDescription) -> Unit)? = null,
         onSuccess: (() -> Unit)? = null
     ) = object : SdpObserver {
-        override fun onCreateSuccess(sdp: SessionDescription) { onCreated?.invoke(sdp) }
-        override fun onSetSuccess() { onSuccess?.invoke() }
+        override fun onCreateSuccess(sdp: SessionDescription) { postRtc {onCreated?.invoke(sdp)} }
+        override fun onSetSuccess() { postRtc {onSuccess?.invoke()} }
         override fun onCreateFailure(error: String) { emit("SDP offer error") }
         override fun onSetFailure(error: String) { emit("SDP negotiation error") }
     }
 
     /** Secondary XR Surfaces may arrive before or after the signaling handshake. */
     /** Rebind a resized/recreated ordinary Android surface without rejoining UU. */
-    @Synchronized fun attachMainSurface(surface: Surface) {
-        if (closed.get()) return
-        if (!started) { start(surface); return }
-        windowSurfaces[0] = surface
-        renderers[0]?.let { renderer ->
-            renderer.releaseEglSurface {}
-            renderer.createEglSurface(surface)
-        }
+    fun attachMainSurface(surface: Surface) {replacePrimarySurface(surface)}
+
+    fun detachMainSurface() {
+        takeWindowRenderer(0)?.let {output -> rendererExecutor.execute {runCatching {output.release()}}}
     }
 
-    @Synchronized fun detachMainSurface() {
-        if (closed.get()) return
-        windowSurfaces.remove(0)
-        renderers[0]?.releaseEglSurface {}
+    private fun takeWindowRenderer(index: Int): EglRenderer?=synchronized(this) {
+        windowSurfaces.remove(index)
+        hiddenPanes.add(index)
+        onWindowVisibility(index,false)
+        renderers.remove(index)?.also {output -> windowVideos[index]?.removeSink(output)}
     }
 
-    fun detachWindowSurface(index: Int) {
-        val renderer=synchronized(this) {
-            windowSurfaces.remove(index)
-            hiddenPanes.add(index)
-            onWindowVisibility(index,false)
-            renderers.remove(index)?.also {output->windowVideos[index]?.removeSink(output)}
+    fun detachWindowSurface(index: Int) {takeWindowRenderer(index)?.release()}
+
+    /** Spatial containers may recreate an Android Surface during system resize. */
+    @Synchronized fun replacePrimarySurface(surface: Surface): Boolean {
+        if(closed.get()) return false
+        if(!started) {start(surface);return !closed.get()}
+        if(windowSurfaces[0]===surface) return true
+        windowSurfaces[0]=surface;hiddenPanes.remove(0)
+        renderers.remove(0)?.let {old ->
+            windowVideos[0]?.removeSink(old)
+            rendererExecutor.execute {runCatching {old.release()}}
         }
-        renderer?.release()
+        egl?.let {attachRenderer(0,surface,it)}
+        return true
     }
 
     @Synchronized fun addWindowSurface(index: Int, xrSurface: Surface) {
@@ -470,7 +479,12 @@ internal class UuDirectSession(
                 }
             } catch(error: Exception) {emit("窗口 ${index+1} 渲染初始化失败：${error.javaClass.simpleName}")}
             finally {
-                synchronized(this) {pendingRenderers.remove(index)}
+                synchronized(this) {
+                    pendingRenderers.remove(index)
+                    val replacement=windowSurfaces[index]
+                    if(!closed.get() && egl===base && replacement!=null && replacement!==xrSurface)
+                        attachRenderer(index,replacement,base)
+                }
                 if(!adopted) runCatching {output?.release()}
             }
         }
@@ -570,8 +584,8 @@ internal class UuDirectSession(
         }).apply { sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN }
         peer = engine.createPeerConnection(config, object : PeerConnection.Observer {
             override fun onSignalingChange(state: PeerConnection.SignalingState?) {}
-            override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
-                if (closed.get()) return
+            override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) { postRtc {
+                if (closed.get()) return@postRtc
                 if (state == PeerConnection.IceConnectionState.CONNECTED ||
                     state == PeerConnection.IceConnectionState.COMPLETED) {
                     health.markIceConnected()
@@ -586,12 +600,12 @@ internal class UuDirectSession(
                         terminateUnexpectedly()
                     }
                 }
-            }
+            } }
             override fun onStandardizedIceConnectionChange(state: PeerConnection.IceConnectionState?) {}
             override fun onConnectionChange(state: PeerConnection.PeerConnectionState?) {}
             override fun onIceConnectionReceivingChange(receiving: Boolean) {}
             override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {}
-            override fun onIceCandidate(candidate: IceCandidate) {
+            override fun onIceCandidate(candidate: IceCandidate) { postRtc {
                 synchronized(this@UuDirectSession) {
                     if (closed.get()) return@synchronized
                     val mid = candidate.sdpMid ?: "0"
@@ -603,22 +617,22 @@ internal class UuDirectSession(
                         terminateUnexpectedly()
                     }
                 }
-            }
+            } }
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
             override fun onAddStream(stream: MediaStream?) {}
             override fun onRemoveStream(stream: MediaStream?) {}
-            override fun onDataChannel(channel: DataChannel) { if (!closed.get()) listenChannel(channel) }
+            override fun onDataChannel(channel: DataChannel) { postRtc { if (!closed.get()) listenChannel(channel) } }
             override fun onRenegotiationNeeded() {}
-            override fun onAddTrack(receiver: RtpReceiver?, streams: Array<out MediaStream>?) {
-                if (closed.get()) return
+            override fun onAddTrack(receiver: RtpReceiver?, streams: Array<out MediaStream>?) { postRtc {
+                if (closed.get()) return@postRtc
                 attachVideo(receiver?.track())
                 attachAudio(receiver?.track())
-            }
-            override fun onTrack(transceiver: RtpTransceiver?) {
-                if (closed.get()) return
+            } }
+            override fun onTrack(transceiver: RtpTransceiver?) { postRtc {
+                if (closed.get()) return@postRtc
                 attachVideo(transceiver?.receiver?.track(), transceiver?.mid)
                 attachAudio(transceiver?.receiver?.track())
-            }
+            } }
         })
         val connection = peer ?: throw IllegalStateException("createPeerConnection failed")
         val options = RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
@@ -697,10 +711,10 @@ internal class UuDirectSession(
         if (!channels.contains(channel)) channels.add(channel)
         channel.registerObserver(object : DataChannel.Observer {
             override fun onBufferedAmountChange(previousAmount: Long) {}
-            override fun onStateChange() {
-                if (closed.get()) return
+            override fun onStateChange() { postRtc {
+                if (closed.get()) return@postRtc
                 synchronized(this@UuDirectSession) {
-                    if (closed.get()) return
+                    if (closed.get()) return@postRtc
                     val label = channel.label().takeIf { it in setOf("CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL", "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL") } ?: "other"
                     emit("数据通道 $label：${channel.state()}")
                     if (channel.state() == DataChannel.State.OPEN) {
@@ -734,15 +748,17 @@ internal class UuDirectSession(
                         }
                     }
                 }
-            }
+            } }
             override fun onMessage(buffer: DataChannel.Buffer) {
+                if(closed.get() || buffer.data.remaining()>65536) return
+                val data=buffer.data.slice()
+                val bytes=ByteArray(data.remaining());data.get(bytes)
+                postRtc {
                 synchronized(this@UuDirectSession) {
-                    if (closed.get() || buffer.data.remaining() > 65536) return
-                    val bytes = ByteArray(buffer.data.remaining())
-                    buffer.data.get(bytes)
+                    if (closed.get()) return@postRtc
                     val isControl = channel.label() == "CONTROL_DATA_CHANNEL"
-                    if (!isControl && channel.label() != "TEXT_DATA_CHANNEL") return
-                    if (bytes.isNotEmpty() && bytes[0] == '{'.code.toByte()) return
+                    if (!isControl && channel.label() != "TEXT_DATA_CHANNEL") return@postRtc
+                    if (bytes.isNotEmpty() && bytes[0] == '{'.code.toByte()) return@postRtc
                     try {
                         val payload = UuWire.decodeEnvelope(bytes)
                         payload.captureLevel?.let { remoteSettings.captureLevel = it }
@@ -803,7 +819,7 @@ internal class UuDirectSession(
                             if (!pointerFlow.release(::sendControl)) {
                                 emit("UU 显示器切换时按键释放失败，已断开远控")
                                 terminateUnexpectedly()
-                                return
+                                return@postRtc
                             }
                         }
                         when (acknowledgment) {
@@ -815,7 +831,7 @@ internal class UuDirectSession(
                                 health.markTrackRegistrationFinished()
                                 emit("UU 视频轨道注册被拒绝（错误码 ${payload.trackAckError}）")
                                 terminateUnexpectedly()
-                                return
+                                return@postRtc
                             }
                             UuCaptureGate.Ack.NONE -> {}
                         }
@@ -826,6 +842,8 @@ internal class UuDirectSession(
                     } catch (_: IllegalArgumentException) {
                         // Vendor extensions may be opaque; never reflect them back.
                     }
+                }
+
                 }
             }
         })
@@ -1062,7 +1080,7 @@ internal class UuDirectSession(
     override fun close() {
         // PeerConnection.dispose must not run on Observer/DataChannel callbacks.
         // Mark closed synchronously, then release on the Android main queue.
-        deferredClose.request { disposeAfterCallbacks() }
+        deferredClose.request { rtcCallbacks.close();disposeAfterCallbacks() }
     }
 
     private fun disposeAfterCallbacks() {

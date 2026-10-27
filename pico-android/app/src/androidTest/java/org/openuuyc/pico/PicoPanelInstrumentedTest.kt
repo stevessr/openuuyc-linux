@@ -24,7 +24,7 @@ class PicoPanelInstrumentation : Instrumentation() {
     override fun onStart() {
         val error = AtomicReference<Throwable?>(null)
         runOnMainSync {
-            try { when (phase) { "quality" -> verifyQualityCanvas(); "profile" -> { val p=org.openuuyc.pico.uu.UuAndroidDeviceProfile.read(targetContext); check(p.memoryMiB>0 && p.cpu.isNotBlank() && p.screen.contains("x")); sendStatus(0,Bundle().apply {putString("stream","Hardware profile: CPU=${p.cpu}; memory=${p.memoryMiB} MiB; GPU=${p.video}; display=${p.screen}\n")}) }; "runtime" -> { val info=PicoRuntimeProbe.extensions(targetContext); check(!info.startsWith("error:")) { info }; sendStatus(0, Bundle().apply { putString("stream", "PICO runtime extensions:\n$info\n") }) }; "network-denied" -> verifyMissingNetworkPermission(); "network" -> verifyRtcStartup(); null -> verifyPanel(); else -> verifyVaultPhase(phase!!) } } catch (failure: Throwable) { error.set(failure) }
+            try { when (phase) { "xr-menu" -> verifyXrGlobalMenu(); "quality" -> verifyQualityCanvas(); "profile" -> { val p=org.openuuyc.pico.uu.UuAndroidDeviceProfile.read(targetContext); check(p.memoryMiB>0 && p.cpu.isNotBlank() && p.screen.contains("x")); sendStatus(0,Bundle().apply {putString("stream","Hardware profile: CPU=${p.cpu}; memory=${p.memoryMiB} MiB; GPU=${p.video}; display=${p.screen}\n")}) }; "runtime" -> { val info=PicoRuntimeProbe.extensions(targetContext); check(!info.startsWith("error:")) { info }; sendStatus(0, Bundle().apply { putString("stream", "PICO runtime extensions:\n$info\n") }) }; "network-denied" -> verifyMissingNetworkPermission(); "network" -> verifyRtcStartup(); null -> verifyPanel(); else -> verifyVaultPhase(phase!!) } } catch (failure: Throwable) { error.set(failure) }
         }
         val result = Bundle()
         val failure = error.get()
@@ -34,6 +34,25 @@ class PicoPanelInstrumentation : Instrumentation() {
     }
     private fun assertEquals(expected: Any?, actual: Any?) { check(expected == actual) { "expected=$expected actual=$actual" } }
     private fun assertTrue(value: Boolean) { check(value) }
+    private fun verifyXrGlobalMenu() {
+        val reader=android.media.ImageReader.newInstance(1200,400,android.graphics.PixelFormat.RGBA_8888,4)
+        var home=0;var appearance=0
+        val menu=PicoXrToolbar(surface=reader.surface,session={null},followView={},reset={},touchMode={},keyboardModeChanged={},
+            appearance={_,_,_->appearance++},closeScreenMenu={},home={home++},connectImmersive={_,_->},pickBackground={},useImage={},
+            backgroundAction={},menuShape={},connectedIds={emptySet()},disconnect={})
+        try {
+            val homeRect=PicoXrMenuHit.toolbarRect(5)
+            menu.activate((homeRect[0]+homeRect[2])/2400,(homeRect[1]+homeRect[3])/800)
+            assertEquals(1,home);reader.acquireLatestImage()?.close()
+            val env=PicoXrMenuHit.toolbarRect(4)
+            menu.activate((env[0]+env[2])/2400,(env[1]+env[3])/800)
+            reader.acquireLatestImage()?.close()
+            val toggle=PicoXrMenuHit.settingsRect(0)
+            menu.activate((toggle[0]+toggle[2])/2400,(toggle[1]+toggle[3])/800)
+            assertEquals(1,appearance);reader.acquireLatestImage()?.close()
+        } finally {menu.close();reader.close()}
+    }
+
     private fun verifyQualityCanvas() {
         val state=org.openuuyc.pico.uu.UuRemoteSettingsState().apply {
             selected=0;current=current.copy(fps=165)
@@ -80,14 +99,28 @@ class PicoPanelInstrumentation : Instrumentation() {
             val channel = peer.createDataChannel("SMOKE_TEST", org.webrtc.DataChannel.Init())
             val done = java.util.concurrent.CountDownLatch(1)
             val success = java.util.concurrent.atomic.AtomicBoolean(false)
-            peer.createOffer(object : org.webrtc.SdpObserver {
-                override fun onCreateSuccess(s: org.webrtc.SessionDescription?) { success.set(s != null); done.countDown() }
-                override fun onCreateFailure(e: String?) { done.countDown() }
-                override fun onSetSuccess() {}
-                override fun onSetFailure(e: String?) {}
-            }, org.webrtc.MediaConstraints())
-            check(done.await(10, java.util.concurrent.TimeUnit.SECONDS)) { "RTC offer timeout" }
-            assertTrue(success.get())
+            val monitor=Any()
+            val eventRan=java.util.concurrent.CountDownLatch(1)
+            val eventError=AtomicReference<Throwable?>(null)
+            val eventQueue=org.openuuyc.pico.uu.UuRtcCallbackQueue {eventError.set(it)}
+            try {
+                synchronized(monitor) {
+                    peer.createOffer(object : org.webrtc.SdpObserver {
+                        override fun onCreateSuccess(s: org.webrtc.SessionDescription?) {
+                            success.set(s!=null)
+                            eventQueue.post {synchronized(monitor) {eventRan.countDown()}}
+                            done.countDown() // native signaling callback never waits for monitor
+                        }
+                        override fun onCreateFailure(e: String?) {done.countDown()}
+                        override fun onSetSuccess() {}
+                        override fun onSetFailure(e: String?) {}
+                    },org.webrtc.MediaConstraints())
+                    check(done.await(10,java.util.concurrent.TimeUnit.SECONDS)) {"RTC native callback blocked on session lock"}
+                    assertTrue(success.get());assertEquals(1L,eventRan.count)
+                }
+                check(eventRan.await(10,java.util.concurrent.TimeUnit.SECONDS)) {"RTC callback queue did not drain"}
+                eventError.get()?.let {throw it}
+            } finally {eventQueue.close()}
             channel?.close(); channel?.dispose()
             peer.close(); peer.dispose(); engine.dispose()
         }

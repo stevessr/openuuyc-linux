@@ -85,7 +85,9 @@ internal class PicoXrWindowFrame(private val surface: Surface) {
             // Atlas-only white tile: reserved outside all window subimages.
             p.style=Paint.Style.FILL;p.color=Color.WHITE
             c.drawRect(0f,2400f,32f,2432f,p)
-            p.color=background;c.drawRect(32f,2400f,64f,2432f,p)
+            // Transparent circular pointer tiles, sampled by native billboard quads.
+            p.color=Color.WHITE;c.drawCircle(48f,2416f,12f,p)
+            p.color=PicoTheme.ACCENT;c.drawCircle(80f,2416f,12f,p)
             c.save();c.clipRect(0,2432,1200,3232)
             p.color=background;p.alpha=backgroundAlpha
             p.colorFilter=android.graphics.ColorMatrixColorFilter(floatArrayOf(brightness,0f,0f,0f,0f,0f,brightness,0f,0f,0f,0f,0f,brightness,0f,0f,0f,0f,0f,1f,0f))

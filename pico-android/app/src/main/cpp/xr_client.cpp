@@ -5,6 +5,7 @@
 #include "xr_surface_callback.h"
 #include "xr_panel_geometry.h"
 #include "xr_pose_math.h"
+#include "xr_pointer_feedback.h"
 #include "xr_panel_depth.h"
 #include "xr_menu_click.h"
 #include "xr_grip_hold.h"
@@ -75,7 +76,11 @@ static bool panel_ray(const XrPosef &aim, const PanelGeometry &p, float &x, floa
 
 static bool ray_visible[2]={false,false};
 static XrPosef ray_poses[2]{};
-static void update_free_ray(int hand,const XrPosef &aim,const XrPosef &eye) {
+static XrPosef focus_poses[2]{};
+static float ray_lengths[2]={2,2};
+static bool focus_pressed[2]={false,false};
+static int preferred_hand=1;
+static void update_free_ray(int hand,const XrPosef &aim,const XrPosef &eye,float distance=2.f) {
     const auto d=rotate_vector(aim.orientation,{0.f,0.f,-1.f});
     const auto b=ray_basis({d.x,d.y,d.z},{eye.position.x-aim.position.x,eye.position.y-aim.position.y,eye.position.z-aim.position.z});
     // Columns are the billboard basis; its local Y follows the ray.
@@ -87,7 +92,9 @@ static void update_free_ray(int hand,const XrPosef &aim,const XrPosef &eye) {
     else if(m00>m11 && m00>m22) {const float t=std::sqrt(1+m00-m11-m22)*2;q={t/4,(m01+m10)/t,(m02+m20)/t,(m21-m12)/t};}
     else if(m11>m22) {const float t=std::sqrt(1+m11-m00-m22)*2;q={(m01+m10)/t,t/4,(m12+m21)/t,(m02-m20)/t};}
     else {const float t=std::sqrt(1+m22-m00-m11)*2;q={(m02+m20)/t,(m12+m21)/t,t/4,(m10-m01)/t};}
-    ray_poses[hand]={q,{aim.position.x+d.x,aim.position.y+d.y,aim.position.z+d.z}};
+    distance=std::clamp(distance,.05f,10.f);ray_lengths[hand]=distance;
+    ray_poses[hand]={q,{aim.position.x+d.x*distance/2,aim.position.y+d.y*distance/2,aim.position.z+d.z*distance/2}};
+    focus_poses[hand]={eye.orientation,{aim.position.x+d.x*distance,aim.position.y+d.y*distance,aim.position.z+d.z*distance}};
     ray_visible[hand]=true;
 }
 
@@ -352,9 +359,46 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
         last_down=false;grabbed_pane=-1;menu_grab=false;menu_grip=false;grip_dragging=false;interaction_hand=-1;
         trigger_blocked[0]=trigger_blocked[1]=true;grip_holds[0].reset();grip_holds[1].reset();return;
     }
-    // Prefer right hand, fallback to left when not tracked.
-    for (int hand : {1, 0}) {
-        if(interaction_hand>=0 && hand!=interaction_hand) continue;
+    // Evaluate BOTH hands before choosing. An idle right-hand desktop hover
+    // must never starve a left-hand menu click (or vice versa).
+    XrPointerIntent intents[2];
+    XrSpaceLocation eye{XR_TYPE_SPACE_LOCATION};
+    const auto eye_flags=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    const bool eye_valid=XR_SUCCEEDED(xrLocateSpace(view_space,world,timestamp,&eye)) && (eye.locationFlags&eye_flags)==eye_flags;
+    for(int hand=0;hand<2;++hand) {
+        XrSpaceLocation aim{XR_TYPE_SPACE_LOCATION};
+        const auto flags=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        if(XR_FAILED(xrLocateSpace(actions.hands[hand],world,timestamp,&aim)) || (aim.locationFlags&flags)!=flags) continue;
+        intents[hand].tracked=true;
+        float u=0,v=0;int target=-1;
+        intents[hand].menu=intersect_toolbar(aim.pose,u,v);
+        intents[hand].hit=intents[hand].menu;
+        if(intents[hand].menu) target=6;
+        else intents[hand].hit=intersect_quad(aim.pose,u,v,target);
+        XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};query.subactionPath=actions.hand_paths[hand];
+        XrActionStateBoolean trigger{XR_TYPE_ACTION_STATE_BOOLEAN},grip{XR_TYPE_ACTION_STATE_BOOLEAN};
+        query.action=actions.click;xrGetActionStateBoolean(session,&query,&trigger);
+        query.action=actions.grip;xrGetActionStateBoolean(session,&query,&grip);
+        intents[hand].pressed=(trigger.isActive && trigger.currentState) || (grip.isActive && grip.currentState);
+        intents[hand].rising=(trigger.changedSinceLastSync && trigger.currentState) || (grip.changedSinceLastSync && grip.currentState);
+        focus_pressed[hand]=intents[hand].pressed;
+        if(eye_valid && !xr_stream_content(intents[hand].hit,target)) {
+            float distance=2;
+            const int owner=xr_control_owner(target);
+            const PanelGeometry *panel=target==6?&menu_panel:(owner>=0?&panels[owner]:nullptr);
+            float x=0,y=0;
+            if(panel && panel_ray(aim.pose,*panel,x,y)) {
+                const auto point=panel_point(*panel,x,y);
+                const auto dx=point.x-aim.pose.position.x,dy=point.y-aim.pose.position.y,dz=point.z-aim.pose.position.z;
+                distance=std::sqrt(dx*dx+dy*dy+dz*dz);
+            }
+            update_free_ray(hand,aim.pose,eye.pose,distance);
+        }
+    }
+    const int selected_hand=xr_choose_pointer(intents,interaction_hand,preferred_hand);
+    if(selected_hand>=0) preferred_hand=selected_hand;
+    for (int hand : {selected_hand}) {
+        if(hand<0) continue;
         XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
         if (XR_FAILED(xrLocateSpace(actions.hands[hand], world, timestamp, &location)) ||
             (location.locationFlags & (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) !=
@@ -369,10 +413,6 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
             hit=intersect_toolbar(menu_location.pose,u,v); if(hit) pane=6;
         }
         if(!hit) hit=intersect_quad(location.pose,u,v,pane);
-        if(!hit && grabbed_pane<0 && !menu_grab) {
-            XrSpaceLocation eye{XR_TYPE_SPACE_LOCATION};
-            if(XR_SUCCEEDED(xrLocateSpace(view_space,world,timestamp,&eye))) update_free_ray(hand,location.pose,eye.pose);
-        }
         XrActionStateGetInfo grip_query{XR_TYPE_ACTION_STATE_GET_INFO};
         grip_query.action=actions.grip;grip_query.subactionPath=actions.hand_paths[hand];
         XrActionStateBoolean grip_state{XR_TYPE_ACTION_STATE_BOOLEAN};
@@ -404,7 +444,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
             if(hover_method) env->CallVoidMethod(activity,hover_method,pane,u,v,JNI_FALSE);
             return; // grip outside a window must not leak a remote click
         }
-        if(!grip_held && !grip_dragging && grabbed_pane<0 && !menu_grab) interaction_hand=-1;
+        if(!grip_held && !grip_dragging && grabbed_pane<0 && !menu_grab && !last_down) interaction_hand=-1;
         if (!hit && grabbed_pane < 0 && !menu_grab) continue;
         if (!hit) pane = resizing ? 13+grabbed_pane*4+resize_corner : 7+grabbed_pane;
         XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};
@@ -535,6 +575,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
             last_down=down;last_pane=pane;old_u=u;old_v=v;
             return;
         }
+        if(pane<6 && down && !last_down) interaction_hand=hand;
         if (pane != last_pane && last_down) {
             env->CallVoidMethod(activity, method, last_pane, old_u, old_v, JNI_FALSE);
             last_down = false;
@@ -955,21 +996,29 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 frame.subImage.swapchain=swapchains[7];frame.subImage.imageRect={{static_cast<int32_t>(i%2)*1200,static_cast<int32_t>(i/2)*800},{1200,800}};
                 layers[layer_count++]=reinterpret_cast<const XrCompositionLayerBaseHeader *>(&frame);
             }
-            if(frame_available) {
-                uint32_t rays=0;
-                for(int hand=0;hand<2 && rays<ray_budget;++hand) if(ray_visible[hand]) {
-                    auto &ray=quads[layer_count];ray.type=XR_TYPE_COMPOSITION_LAYER_QUAD;
-                    ray.space=active_space;ray.eyeVisibility=XR_EYE_VISIBILITY_BOTH;ray.pose=ray_poses[hand];
-                    ray.size={.004f,2.f};ray.subImage.swapchain=swapchains[7];ray.subImage.imageRect={{0,2400},{32,32}};
-                    layers[layer_count++]=reinterpret_cast<const XrCompositionLayerBaseHeader *>(&ray);++rays;
-                }
-            }
             // Menu hit testing has priority; keep its composition layer topmost too.
             for(uint32_t i=0;i+1<layer_count;++i) {
                 if(reinterpret_cast<const XrCompositionLayerQuad *>(layers[i])->subImage.swapchain==swapchains[6]) {
                     const auto *menu=layers[i];
                     for(uint32_t j=i;j+1<layer_count;++j) layers[j]=layers[j+1];
                     layers[layer_count-1]=menu;break;
+                }
+            }
+            if(frame_available) {
+                // One ray + one camera-facing cursor per pointer. With six
+                // windows prioritize the active hand, without exceeding runtime
+                // layer count; with spare layers show both complete pointers.
+                for(int hand:{preferred_hand,1-preferred_hand}) if(ray_visible[hand] && layer_count+2<=max_layers) {
+                    auto &ray=quads[layer_count];ray.type=XR_TYPE_COMPOSITION_LAYER_QUAD;
+                    ray.space=active_space;ray.eyeVisibility=XR_EYE_VISIBILITY_BOTH;ray.pose=ray_poses[hand];
+                    ray.size={.003f,ray_lengths[hand]};ray.subImage.swapchain=swapchains[7];ray.subImage.imageRect={{0,2400},{32,32}};
+                    layers[layer_count++]=reinterpret_cast<const XrCompositionLayerBaseHeader *>(&ray);
+                    auto &cursor=quads[layer_count];cursor.type=XR_TYPE_COMPOSITION_LAYER_QUAD;
+                    cursor.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    cursor.space=active_space;cursor.eyeVisibility=XR_EYE_VISIBILITY_BOTH;cursor.pose=focus_poses[hand];
+                    const float size=std::clamp(ray_lengths[hand]*.012f,.008f,.06f);cursor.size={size,size};
+                    cursor.subImage.swapchain=swapchains[7];cursor.subImage.imageRect={{focus_pressed[hand]?64:32,2400},{32,32}};
+                    layers[layer_count++]=reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cursor);
                 }
             }
             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
