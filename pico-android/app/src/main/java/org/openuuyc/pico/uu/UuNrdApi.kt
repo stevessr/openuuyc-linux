@@ -118,8 +118,8 @@ internal class UuNrdApi(private val context: Context) {
         method: String, path: String, body: JSONObject? = null, platform: Boolean = false
     ): JSONObject = transport.request(method, path, body, identity, account, platform)
 
-    fun initializeDevice() {
-        if (identity.deviceId.matches(Regex("[a-z0-9]{16}"))) return
+    fun initializeDevice(force: Boolean = false) {
+        if (!force && identity.deviceId.matches(Regex("[a-z0-9]{16}"))) return
         // Preserve the established WindowsDeviceInitRequest shape to maintain
         // protocol compatibility. The platform value describes the PICO client.
         val body = JSONObject()
@@ -160,7 +160,9 @@ internal class UuNrdApi(private val context: Context) {
     }
 
     fun confirmQr(qr: UuQr): UuAccount {
-        // Matching the desktop flow: identity refresh before QR token exchange.
+        // Desktop login re-registers the same client identity *after phone
+        // confirmation* and before exchanging the one-time QR credential.
+        initializeDevice(force = true)
         val result = request("POST", "/api/v1/login/by_qrcode",
             JSONObject().put("qrcode_jump_url", qr.url).put("token", qr.token))
         val session = UuAccount(result.getString("token"), result.getString("user_id"), result.optString("nickname"))

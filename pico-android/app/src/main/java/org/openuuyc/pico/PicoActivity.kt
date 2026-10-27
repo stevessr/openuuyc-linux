@@ -112,8 +112,13 @@ class PicoActivity : Activity() {
                         if (loginEpoch.get() != loginTicket || isDestroyed) return@submit
                         when (state) {
                             1, 2 -> {
+                                val scannedNow = state == 2 && statusValue != 2
                                 statusValue = state
-                                if (state == 2) message("已扫码，等待手机确认")
+                                if (scannedNow) message("已扫码，等待手机确认")
+                                // Prevent tight-loop API polling and NRD rate
+                                // limiting. Each request already owns a network
+                                // deadline; check the generation after sleeping.
+                                Thread.sleep(1_000)
                             }
                             3 -> break // refresh cancelled login ticket
                             4 -> {
