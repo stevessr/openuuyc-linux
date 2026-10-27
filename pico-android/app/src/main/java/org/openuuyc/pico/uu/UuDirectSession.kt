@@ -110,7 +110,7 @@ internal class UuDirectSession(
     private var pendingBinaryName: String? = null
     private val captureGate = UuCaptureGate()
     private var nextRequestSeq = 2L
-    private var pressed = false
+    private val pointerFlow = UuPointerFlow()
     private val signalGate = UuSignalGate()
     private val localIce = UuIceCandidateQueue<IceCandidate>()
     private val remoteIce = UuIceCandidateQueue<IceCandidate>()
@@ -504,11 +504,11 @@ internal class UuDirectSession(
                         val critical = channel === controlChannel || channel === textChannel
                         if (critical && !closed.get()) {
                             // Revoke the button while CONTROL is still writable.
-                            if (pressed && controlChannel?.state() == DataChannel.State.OPEN) {
-                                sendControl(UuPointerWire.button(false))
+                            if (pointerFlow.pressed && controlChannel?.state() == DataChannel.State.OPEN) {
+                                pointerFlow.release(::sendControl)
                             }
                             captureGate.onTransportClosed()
-                            pressed = false
+                            pointerFlow.reset()
                             health.markTrackRegistrationFinished()
                         }
                         if (channel === controlChannel) controlChannel = null
@@ -543,14 +543,13 @@ internal class UuDirectSession(
                         }
                         // A host display/track change revokes the held drag. Do
                         // not allow a fresh DOWN until the old UP was sent.
-                        if (pressed && (beforeScreen != captureGate.selectedScreen ||
+                        if (pointerFlow.pressed && (beforeScreen != captureGate.selectedScreen ||
                                 beforeTrack != captureGate.selectedTrack)) {
-                            if (!sendControl(UuPointerWire.button(false))) {
+                            if (!pointerFlow.release(::sendControl)) {
                                 emit("UU 显示器切换时按键释放失败，已断开远控")
-                                close()
+                                terminateUnexpectedly()
                                 return
                             }
-                            pressed = false
                         }
                         when (acknowledgment) {
                             UuCaptureGate.Ack.REGISTERED -> {
@@ -636,15 +635,15 @@ internal class UuDirectSession(
     }
 
     @Synchronized fun pointer(u: Float, v: Float, down: Boolean) {
-        if (closed.get() || !captureGate.inputReady(
+        if (closed.get()) return
+        val ready = captureGate.inputReady(
             controlChannel?.state() == DataChannel.State.OPEN,
             textChannel?.state() == DataChannel.State.OPEN
-        )) return
-        val screen = captureGate.selectedScreen ?: return
-        if (!UuPointerWire.valid(u, v)) return
-        if (!sendControl(UuPointerWire.move(screen, u, v))) return
-        if (pressed != down) {
-            if (sendControl(UuPointerWire.button(down))) pressed = down
+        )
+        if (pointerFlow.pointer(captureGate.selectedScreen, u, v, down, ready, ::sendControl) ==
+            UuPointerFlow.Result.RELEASE_FAILED) {
+            emit("UU 鼠标释放发送失败，停止远程控制以防持续拖拽")
+            terminateUnexpectedly()
         }
     }
 
@@ -664,8 +663,8 @@ internal class UuDirectSession(
         pendingBinaryName = null
         echoRetry?.cancel(false)
         heartbeatExecutor.shutdownNow()
-        if (pressed) sendControl(UuPointerWire.button(false))
-        pressed = false
+        pointerFlow.release(::sendControl)
+        pointerFlow.reset()
         captureGate.onTransportClosed()
         localIce.close()
         remoteIce.close()
