@@ -16,6 +16,9 @@ use openuuyc::diagnostics::logging;
 use openuuyc::media;
 use openuuyc::session::controller;
 
+#[cfg(target_os = "linux")]
+mod pico_vr;
+
 #[derive(Parser)]
 #[command(
     name = "OpenUUYC",
@@ -36,6 +39,21 @@ struct Cli {
     log_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+enum PicoVrCommand {
+    /// 检查 WiVRn、WayVR 和 OpenXR 运行时
+    Doctor,
+    /// 打开 WiVRn 配对管理器
+    Setup,
+    /// 通过本机 OpenXR 桌面映射，在 PICO 头显中使用 OpenUUYC
+    Launch {
+        /// 已在其它地方启动 WiVRn 时不再打开配对管理器
+        #[arg(long)]
+        no_dashboard: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -119,6 +137,12 @@ enum Commands {
         #[arg(long)]
         new: bool,
     },
+    #[cfg(target_os = "linux")]
+    /// PICO VR 头显支持（WiVRn + WayVR 桌面模式）
+    PicoVr {
+        #[command(subcommand)]
+        command: PicoVrCommand,
+    },
     #[command(hide = true)]
     PluginVideoHost,
 
@@ -200,6 +224,27 @@ fn main() -> Result<()> {
         hardware_decode: None,
         transport: None,
     });
+    #[cfg(target_os = "linux")]
+    if let Commands::PicoVr {
+        command: PicoVrCommand::Launch { no_dashboard },
+    } = &command {
+        pico_vr::launch(*no_dashboard)?;
+    }
+    // Route VR launching through the normal GUI instance/activation path.
+    // This preserves existing login, window reuse, transport and cleanup.
+    #[cfg(target_os = "linux")]
+    let command = match command {
+        Commands::PicoVr {
+            command: PicoVrCommand::Launch { .. },
+        } => Commands::Gui {
+            background: false,
+            fps: None,
+            codec: None,
+            hardware_decode: None,
+            transport: None,
+        },
+        other => other,
+    };
 
     #[cfg(windows)]
     if let Commands::Notification { uri } = &command {
@@ -331,6 +376,12 @@ fn main() -> Result<()> {
             openuuyc::application::terminal_attach(session.as_deref(), list, new)
         }
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),
+        #[cfg(target_os = "linux")]
+        Commands::PicoVr { command } => match command {
+            PicoVrCommand::Doctor => pico_vr::doctor(),
+            PicoVrCommand::Setup => pico_vr::setup(),
+            PicoVrCommand::Launch { .. } => unreachable!("VR launch normalized to GUI"),
+        },
         #[cfg(windows)]
         Commands::Notification { .. } => {
             unreachable!("notification activation is handled before application startup")

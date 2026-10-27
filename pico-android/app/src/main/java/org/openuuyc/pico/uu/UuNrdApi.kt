@@ -1,0 +1,239 @@
+package org.openuuyc.pico.uu
+
+import android.content.Context
+import android.os.Build
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.IOException
+import java.nio.charset.StandardCharsets
+import java.util.UUID
+import java.util.concurrent.TimeUnit
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+/**
+ * Direct UU NRD HTTP protocol.
+ *
+ * Parity reference: src/account/api/mod.rs / src/account/login/mod.rs.
+ * No Linux OpenUUYC instance, ADB reverse or localhost relay is involved.
+ */
+internal object UuContract {
+    const val BASE = "https://api.nrd.nie.163.com"
+    const val VERSION = "4.41.2.2602"
+    private const val CHANNEL = "gwqd"
+    private const val PACKAGE = "com.netease.uuremote"
+    private val SIGNING_KEY = "alWiSzXZTLu3WfFnw13uBru3".toByteArray(StandardCharsets.UTF_8)
+
+    fun headers(
+        method: String, path: String, body: ByteArray, timestamp: Long, identity: UuIdentity,
+        account: UuAccount? = null, platformOnly: Boolean = false
+    ): Map<String, String> {
+        require(path.startsWith("/") && !path.contains("://"))
+        val result = linkedMapOf(
+            "X-Param-PLAT" to "1",
+            "X-Param-VN" to VERSION,
+            "X-Param-VC" to VERSION.substringAfterLast("."),
+            "X-Param-PKGN" to PACKAGE,
+            "X-Param-CHN" to CHANNEL,
+            "X-Param-LANG" to "zh-CN",
+            "X-Param-CNT" to "zh-CN",
+            "X-Param-REL" to "prod",
+            "X-Param-OPR" to "",
+            "X-Param-TS" to timestamp.toString()
+        )
+        if (!platformOnly) {
+            result["X-Param-client-id"] = identity.clientId
+            result["X-Param-device-id"] = identity.deviceId
+            result["X-Param-system-id"] = identity.systemId
+        }
+        if (account != null && !platformOnly) result["X-Param-user-id"] = account.userId
+        val canonical = result.entries
+            .filter { it.key.lowercase().startsWith("x-param") && !it.key.equals("x-param-sign", true) }
+            .sortedBy { it.key.lowercase() }
+            .joinToString("&") { "${it.key.lowercase()}=${it.value}" }
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(SIGNING_KEY, "HmacSHA256"))
+        mac.update(method.uppercase().toByteArray(StandardCharsets.UTF_8))
+        mac.update(path.toByteArray(StandardCharsets.UTF_8))
+        mac.update(canonical.toByteArray(StandardCharsets.UTF_8))
+        mac.update(body)
+        result["X-Param-sign"] = mac.doFinal().joinToString("") { "%02x".format(it.toInt() and 255) }
+        return result
+    }
+}
+
+internal data class UuIdentity(
+    val clientId: String, var deviceId: String, val systemId: String, val machineGuid: String
+)
+
+internal data class UuAccount(val token: String, val userId: String, val nickname: String) {
+    override fun toString() = "UuAccount(<redacted>)"
+}
+
+internal data class UuQr(val url: String, val token: String, val ticket: String)
+
+internal data class UuDevice(
+    val id: String, val alias: String, val online: Boolean, val controllable: Boolean, val occupants: Int
+)
+
+internal data class UuRoom(
+    val token: String, val endpoints: List<String>, val timeoutMs: Int
+) {
+    init {
+        require(token.isNotBlank() && endpoints.isNotEmpty())
+        require(endpoints.all {
+            try {
+                val url = (if (it.contains("://")) it.replaceFirst("wss://", "https://") else "https://$it")
+                    .toHttpUrlOrNull()
+                url != null && url.scheme == "https" && !url.host.isBlank()
+            } catch (_: Exception) { false }
+        })
+    }
+}
+
+/**
+ * Keeps an install-specific UU device identity. Credentials are never exported
+ * into console logs or Android intent extras. Persistence is private to APK.
+ */
+internal class UuNrdApi(private val context: Context) {
+    private val prefs = context.getSharedPreferences("uu_identity", Context.MODE_PRIVATE)
+    val identity = UuIdentity(
+        prefs.getString("client", null) ?: UUID.randomUUID().toString().also { prefs.edit().putString("client", it).apply() },
+        prefs.getString("device", "") ?: "",
+        prefs.getString("system", null) ?: UUID.randomUUID().toString().also { prefs.edit().putString("system", it).apply() },
+        prefs.getString("machine", null) ?: UUID.randomUUID().toString().also { prefs.edit().putString("machine", it).apply() }
+    )
+    var account: UuAccount? = null
+        private set
+
+    private val transport = UuNrdTransport()
+    private val vault = KeystoreSessionVault(context)
+    private val credentialLock = Any()
+
+    fun restoreSavedLogin(): UuSavedLoginFlow.Result {
+        val result = UuSavedLoginFlow(vault) { saved ->
+            account = saved
+            request("GET", "/api/v1/user/info")
+        }.restore()
+        if (result != UuSavedLoginFlow.Result.RESTORED) account = null
+        return result
+    }
+
+    fun acceptLogin(session: UuAccount, isCurrent: () -> Boolean): Boolean = synchronized(credentialLock) {
+        if (!isCurrent()) return@synchronized false
+        vault.save(session)
+        account = session
+        true
+    }
+
+    fun logoutLocal() = synchronized(credentialLock) { vault.clear(); account = null }
+
+    fun cancelPendingRequests() { transport.cancelPendingCalls() }
+
+    fun clearAccount() { account = null }
+    fun close() { transport.close() }
+
+    private fun request(
+        method: String, path: String, body: JSONObject? = null, platform: Boolean = false, allowEmptyData: Boolean = false
+    ): JSONObject = transport.request(method, path, body, identity, account, platform, allowEmptyData)
+
+    fun initializeDevice(force: Boolean = false) {
+        if (!force && identity.deviceId.matches(Regex("[a-z0-9]{16}"))) return
+        val profile=UuAndroidDeviceProfile.read(context)
+        val body = deviceRegistrationBody(identity,"Android ${Build.VERSION.RELEASE}",profile.board,profile.cpu,
+            profile.memoryMiB,profile.video,profile.screen,profile.appVersion)
+        val reply = request("POST", "/api/v1/device/windows/init", body, platform = true)
+        val device = reply.getString("device_id")
+        require(device.matches(Regex("[a-z0-9]{16}"))) { "Invalid UU device identity" }
+        require(!identity.deviceId.matches(Regex("[a-z0-9]{16}")) || identity.deviceId==device) { "Refusing to replace a registered device identity" }
+        identity.deviceId = device
+        prefs.edit().putString("device", device)
+            .putLong("hardware_reported_at",System.currentTimeMillis())
+            .putLong("hardware_memory_mib",profile.memoryMiB)
+            .putString("hardware_cpu",profile.cpu).putString("hardware_gpu",profile.video.joinToString(", ")).apply()
+    }
+
+    fun requestSms(country: String,mobile: String) {
+        initializeDevice()
+        request("POST",UuSmsWire.CODE,UuSmsWire.request(country,mobile),allowEmptyData=true)
+    }
+    fun loginSms(country: String,mobile: String,code: String): UuAccount {
+        initializeDevice(force=true)
+        val result=request("POST",UuSmsWire.LOGIN,UuSmsWire.login(country,mobile,code))
+        return UuAccount(result.getString("token"),result.getString("user_id"),result.optString("nickname")).also { require(it.token.isNotBlank() && it.userId.isNotBlank()) }
+    }
+
+    fun createQr(): UuQr {
+        val json = request("POST", "/api/v1/qrcode/gen/login")
+        val url = json.getString("qrcode_jump_url")
+        val token = json.getString("token")
+        return UuQr(url, token, json.optString("status_query_ticket", token))
+    }
+
+    fun queryQr(qr: UuQr, last: Int): Int {
+        val body = JSONObject().put("qrcode_jump_url", qr.url).put("login_status", last).put("token", qr.ticket)
+        val result = request("POST", "/api/v1/qrcode/login/status", body)
+        val status = if (result.has("status")) result.getInt("status") else result.getInt("login_status")
+        if (result.has("status") && result.has("login_status") && result.getInt("login_status") != status)
+            throw IOException("conflicting QR status")
+        return status
+    }
+
+    fun confirmQr(qr: UuQr): UuAccount {
+        val qrDeviceId = identity.deviceId
+        val session = UuQrCredentialExchange(
+            refreshDevice = {
+                initializeDevice(force = true)
+                check(identity.deviceId == qrDeviceId) {
+                    "Device identity changed; generate a new QR before exchanging credentials"
+                }
+            },
+            exchangeToken = { ticket ->
+                val result = request("POST", "/api/v1/login/by_qrcode",
+                    JSONObject().put("qrcode_jump_url", ticket.url).put("token", ticket.token))
+                UuAccount(
+                    result.getString("token"),
+                    result.getString("user_id"),
+                    result.optString("nickname")
+                )
+            }
+        ).complete(qr)
+        require(session.token.isNotBlank() && session.userId.isNotBlank())
+        return session
+    }
+
+    fun devices(): List<UuDevice> {
+        requireNotNull(account) { "UU login required" }
+        val list = request("GET", "/api/v1/device/list")
+        val devices = list.optJSONArray("my_binded_devices") ?: return emptyList()
+        return (0 until devices.length()).mapNotNull { i ->
+            val item = devices.optJSONObject(i) ?: return@mapNotNull null
+            val id = item.optString("device_id")
+            if (!id.matches(Regex("[a-z0-9]{16}"))) return@mapNotNull null
+            UuDevice(
+                id, item.optString("alias", id),
+                item.optString("status") == "CONNECTED",
+                item.optBoolean("controllable", false),
+                item.optJSONArray("participants_info")?.length() ?: 0
+            )
+        }
+    }
+
+    fun join(device: UuDevice, forceJoin: Boolean = false): UuRoom {
+        requireNotNull(account)
+        require(device.online && device.controllable) { "target unavailable or not controllable" }
+        require(device.occupants == 0 || forceJoin) { "target is occupied; explicit confirmation required" }
+        val result = request("POST", "/api/v1/room/join/by_device/${device.id}",
+            JSONObject().put("force_join", forceJoin))
+        val endpoints = mutableListOf<String>()
+        val list = result.optJSONArray("signaling_list")
+        if (list != null) for (i in 0 until list.length()) list.optString(i).takeIf(String::isNotBlank)?.let(endpoints::add)
+        if (endpoints.isEmpty()) result.optString("signaling_server").takeIf(String::isNotBlank)?.let(endpoints::add)
+        return UuRoom(result.getString("token"), endpoints, result.optInt("ws_connect_timeout_ms", 10000))
+    }
+}

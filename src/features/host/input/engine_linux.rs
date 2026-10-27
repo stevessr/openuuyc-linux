@@ -1,6 +1,9 @@
 //! The Linux input engine: the same ownership contract as the Windows engine
 //! (every down it sends is released on loss, interruption or disconnect) on
 //! top of the X Test injector.
+#[path = "niri_touch_lease.rs"]
+mod niri_touch_lease;
+
 use super::geometry::{Geometry, Rect, Screen};
 use super::wire::{Event, KeyOrButton};
 use crate::platform::linux::input::{self as native, Injector, Lock};
@@ -52,6 +55,8 @@ pub(crate) struct Engine {
     aimed: bool,
     /// 这一串触摸走哪条路（见 `touch`）。选好之后整串都走它，抬起后再清掉。
     touch_route: Option<Route>,
+    touch_screen_hint: Option<i32>,
+    touch_lease: Option<niri_touch_lease::Lease>,
     /// 选路的结果，只为让日志在变化时记一条（和 `aim_space` 一样）。
     touch_space: Option<Result<(), String>>,
 }
@@ -102,10 +107,10 @@ fn route_for(
         }
         output
     };
+    let logical = screen.logical.ok_or_else(|| "触摸屏与合成器输出未配对".to_owned())?;
     if !is_niri && output.rotation != Rotation::Normal {
         return Err(format!("输出旋转为 {:?}", output.rotation));
     }
-    let logical = screen.logical.ok_or_else(|| "触摸屏与合成器输出未配对".to_owned())?;
     let rect = Rect {
         left: output.left,
         top: output.top,
@@ -121,14 +126,9 @@ fn route_for(
     })
 }
 
-fn niri_touch_mapping() -> Option<String> {
-    static MAPPING: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    MAPPING.get_or_init(read_niri_touch_mapping).clone()
-}
-
 /// Niri does not expose `input.touch.map-to-output` over IPC. Read the user's
 /// KDL include tree (read-only) so native touch is used only on its mapped output.
-fn read_niri_touch_mapping() -> Option<String> {
+fn niri_config_root() -> Option<std::path::PathBuf> {
     let socket = std::env::var_os("NIRI_SOCKET")?;
     let socket_name = std::path::Path::new(&socket).file_name()?.to_string_lossy();
     let pid = socket_name.strip_suffix(".sock")?.rsplit_once('.')?.1.parse::<u32>().ok()?;
@@ -139,32 +139,40 @@ fn read_niri_touch_mapping() -> Option<String> {
         .or_else(|| Some(std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
             .join("niri/config.kdl")))?;
+    Some(root)
+}
+
+fn read_niri_touch_mapping(device: &str) -> Option<String> {
+    let root=niri_config_root()?;
     let mut tokens = Vec::new();
     expand_niri_config(&root, &mut std::collections::HashSet::new(), &mut tokens, 0);
-    let mut mapping = None;
-    let mut i = 0;
-    while i + 1 < tokens.len() {
-        if tokens[i] == "input" && tokens[i + 1] == "{" {
-            let end = kdl_block_end(&tokens, i + 1)?;
-            let mut child = i + 2;
-            while child + 1 < end {
-                if tokens[child] == "touch" && tokens[child + 1] == "{" {
-                    let touch_end = kdl_block_end(&tokens, child + 1)?;
-                    let mut property = child + 2;
-                    while property + 1 < touch_end {
-                        if tokens[property] == "map-to-output" {
-                            mapping = Some(tokens[property + 1].clone());
-                            break;
-                        }
-                        property += 1;
-                    }
-                    child = touch_end + 1;
-                } else { child += 1; }
+    niri_mapping_from_tokens(&tokens,device)
+}
+
+fn niri_mapping_from_tokens(tokens: &[String],device: &str) -> Option<String> {
+    let mut global=None;
+    let mut named=None;
+    let mut i=0;
+    while i+1<tokens.len() {
+        if tokens[i]=="input" && tokens[i+1]=="{" {
+            let end=kdl_block_end(tokens,i+1)?;
+            let mut child=i+2;
+            while child+1<end {
+                if tokens[child]=="touch" {
+                    let (name,open)=if tokens[child+1]=="{" { (None,child+1) }
+                        else if tokens.get(child+2).map(String::as_str)==Some("{") { (Some(tokens[child+1].as_str()),child+2) }
+                        else { child+=1;continue; };
+                    let close=kdl_block_end(tokens,open)?;
+                    let value=(open+1..close).find(|&p| tokens[p]=="map-to-output").and_then(|p| tokens.get(p+1)).cloned();
+                    match name { None=>global=value,Some(name) if name==device=>named=Some(value),_=>() }
+                    child=close+1;
+                } else if tokens[child]=="{" { child=kdl_block_end(tokens,child)?+1; }
+                else { child+=1; }
             }
-            i = end + 1;
-        } else { i += 1; }
+            i=end+1;
+        } else { i+=1; }
     }
-    mapping
+    named.unwrap_or(global)
 }
 
 fn expand_niri_config(path: &std::path::Path, seen: &mut std::collections::HashSet<std::path::PathBuf>, out: &mut Vec<String>, depth: usize) {
@@ -251,6 +259,8 @@ impl Engine {
             mouse_policy: Default::default(),
             aim_space: None,
             touch_route: None,
+            touch_screen_hint: None,
+            touch_lease: None,
             touch_space: None,
             aimed: false,
         })
@@ -391,8 +401,10 @@ impl Engine {
         Ok(())
     }
     fn absolute(&mut self, screen: Option<i32>, x: f64, y: f64) -> Result<()> {
-        let screen = self.geometry.screen(screen)?;
-        let (logical, rect) = (screen.logical, screen.rect());
+        let selected = self.geometry.screen(screen)?;
+        let id=selected.id;
+        let (logical, rect) = (selected.logical, selected.rect());
+        if screen.is_some() && self.touch_route.is_none() { self.touch_screen_hint=Some(id); }
         // Every screen in the compositor's space, or every screen in X's:
         // a position named in one and resolved in the other lands off by the
         // output's scale.
@@ -474,7 +486,7 @@ impl Engine {
             }
             return Ok(());
         };
-        self.absolute(None, point.x, point.y)?;
+        self.absolute(self.touch_screen_hint, point.x, point.y)?;
         if self.touch.is_none() {
             self.button(1, true)?;
             self.touch = Some(point.id);
@@ -484,13 +496,34 @@ impl Engine {
     /// 选这一串触摸走哪条路，判定变化时记一条日志（和 `aim_space` 一样只记一次）。
     fn choose_route(&mut self) -> Route {
         let decision = if self.injector.has_touchscreen() {
-            let niri_mapping = std::env::var_os("NIRI_SOCKET").map(|_| niri_touch_mapping());
-            route_for(
-                crate::platform::display::compositor_layout().as_deref(),
-                &self.geometry.screens,
-                self.geometry.current,
-                niri_mapping.as_ref().and_then(|mapping| mapping.as_deref()),
-            )
+            let layout=crate::platform::display::compositor_layout();
+            let current=self.touch_screen_hint.unwrap_or(self.geometry.current);
+            let target=self.geometry.screens.iter().find(|s|s.id==current)
+                .and_then(|screen| screen.logical)
+                .and_then(|rect|layout.as_ref()?.outputs.iter().find(|o|rect==Rect {left:o.left,top:o.top,right:o.left.saturating_add(o.width as i32),bottom:o.top.saturating_add(o.height as i32)}))
+                .and_then(|o|o.name.clone());
+            let is_niri=std::env::var_os("NIRI_SOCKET").is_some();
+            // Read/configure only when a new touch sequence needs another output.
+            // Selecting a screen or moving the mouse alone never changes mapping.
+            let already_mapped=target.as_ref().is_some_and(|output|self.touch_lease.as_ref().is_some_and(|lease|lease.maps_to(output)));
+            let mut mapping=if already_mapped {target.clone()} else if is_niri { target.as_ref().and_then(|name|read_niri_touch_mapping(&native::touch_output_device_name(name))) } else {None};
+            if is_niri && std::env::var("OPENUUYC_NIRI_TEMP_TOUCH_MAP").as_deref()==Ok("1") {
+                if let Some(output)=target.as_ref() {
+                    if !already_mapped && (self.touch_lease.is_some() || mapping.as_ref()!=Some(output)) {
+                        let lease_result=(|| -> Result<()> {
+                            if self.touch_lease.is_none() {self.touch_lease=Some(niri_touch_lease::Lease::new(niri_config_root().ok_or_else(||anyhow::anyhow!("找不到 Niri 配置"))?)?);}
+                            self.touch_lease.as_mut().unwrap().map_to(output)
+                        })();
+                        if let Err(error)=lease_result {tracing::warn!(%error,"未能临时映射触摸输出");return Route::Simulated}
+                        mapping=Some(output.clone());
+                    }
+                }
+            }
+            let decision=route_for(layout.as_deref(),&self.geometry.screens,current,mapping.as_deref());
+            match (decision,is_niri,target) {
+                (Ok(route),true,Some(output))=>self.injector.select_touch_output(&output).map(|_|route).map_err(|e|e.to_string()),
+                (decision,_,_)=>decision,
+            }
         } else {
             Err("没有虚拟触摸屏".into())
         };
@@ -681,6 +714,8 @@ impl Engine {
         }
         self.touch = None;
         self.touch_route = None;
+        self.touch_screen_hint = None;
+        self.touch_lease.take();
         self.wheel = [0; 2];
         self.interruptible = false;
         self.backspace = false;
@@ -862,6 +897,32 @@ mod tests {
         assert!(unpaired[0].logical.is_none());
         let error = route_for(Some(&layout), &unpaired, 0, None).unwrap_err();
         assert!(error.contains("未配对"), "{error}");
+    }
+
+    #[test]
+    fn named_touch_mapping_does_not_override_physical_touch_default() {
+        let tokens=kdl_tokens(r#"input {
+            touch { map-to-output "DP-1" }
+            touch "OpenUUYC touch HDMI-A-1" { map-to-output "HDMI-A-1" }
+        }"#);
+        assert_eq!(niri_mapping_from_tokens(&tokens,"OpenUUYC touch HDMI-A-1").as_deref(),Some("HDMI-A-1"));
+        assert_eq!(niri_mapping_from_tokens(&tokens,"physical touchscreen").as_deref(),Some("DP-1"));
+    }
+
+    #[test]
+    fn named_touch_mapping_wins_even_when_default_is_later() {
+        let tokens=kdl_tokens(r#"input { touch "OpenUUYC touch DP-1" { map-to-output "DP-1" } }
+            input { touch { map-to-output "eDP-1" } }"#);
+        assert_eq!(niri_mapping_from_tokens(&tokens,"OpenUUYC touch DP-1").as_deref(),Some("DP-1"));
+    }
+
+    #[test]
+    fn other_named_touch_devices_never_select_our_output() {
+        let tokens=kdl_tokens(r#"input {
+            touch { map-to-output "eDP-1" }
+            touch "physical tablet" { map-to-output "DP-1" }
+        }"#);
+        assert_eq!(niri_mapping_from_tokens(&tokens,"OpenUUYC touch DP-1").as_deref(),Some("eDP-1"));
     }
 
     #[test]

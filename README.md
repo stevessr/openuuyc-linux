@@ -149,6 +149,20 @@ cargo dist
 
 ### Linux
 
+### PICO VR 头显（Linux 桌面模式）
+
+支持通过本机 **OpenXR + WiVRn + WayVR** 让 PICO 头显显示并操控 OpenUUYC 的桌面窗口。WiVRn 在 Linux 和头显之间传输 VR 画面及手柄输入，WayVR 将 Wayland/X11 桌面映射到 VR 空间。OpenUUYC 的远控连接、编解码和授权机制不变，因此不会暴露额外的网络端口。
+
+> **边界**：这是 PICO 上的原生 OpenXR 桌面映射适配（2D 浮动窗口），**不是** PICO OS 专用 OpenUUYC APK，也不是双目 3D 远程画面。手柄输入由 WayVR 映射为桌面鼠标/键盘；OpenUUYC 尚未接收原始 6DoF 追踪数据。WiVRn 官方明确列出 PICO Neo 3、PICO 4，PICO 4 Ultra 请以实际固件和 WiVRn 版本验证。
+
+1. Linux 安装 [WiVRn](https://github.com/WiVRn/WiVRn) 和 [WayVR](https://github.com/wayvr-org/wayvr)。PICO 设备按 WiVRn 管理器指引安装与服务器相同版本的 Android VR 客户端。
+2. 先执行 `OpenUUYC pico-vr doctor` 检查命令、OpenXR 运行时清单；执行 `OpenUUYC pico-vr setup` 打开配对管理器。
+3. 在头显内连接 WiVRn 后执行 `OpenUUYC pico-vr launch`，使用 WayVR 的屏幕或应用视图显示 OpenUUYC 窗口并操作远端设备。若 WiVRn 已由外部进程管理，添加 `--no-dashboard`。
+4. 若在头显连接前启动，WayVR 的 `--wait` 会等待 OpenXR 运行时可用。首次连接时可能需要根据 WayVR 的提示授权 PipeWire 屏幕采集。
+
+**故障排查**：若 `doctor` 提示没有活跃 OpenXR runtime，先检查 WiVRn 客户端是否已连接；清单存在不等于已连接。WayVR 需可在 `PATH` 中找到。PICO/PC 端 WiVRn 版本必须一致。Wayland 下桌面采集依赖桌面门户与 PipeWire。WiVRn 的桌面 VR 能力不取代 OpenUUYC 自身的 UU 远控认证。
+
+
 需要 Rust stable（edition 2024）与 C/C++ 工具链。
 
 #### Arch / Omarchy
