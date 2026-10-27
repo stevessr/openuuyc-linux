@@ -35,6 +35,10 @@ internal class UuVideoTrackRouter<T> {
         else tracks[0] ?: tracks.values.firstOrNull() ?: fallback
     }
 
+    fun at(index: Int): T? = tracks[index]
+
+    fun availableIndices(): List<Int> = tracks.keys.sorted()
+
     fun reset() {
         tracks.clear()
         fallback = null

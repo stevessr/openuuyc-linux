@@ -207,7 +207,8 @@ internal object UuWire {
         val videoTrackIndex: Int? = null,
         val echoResponse: Boolean = false,
         val trackAckId: Long? = null,
-        val trackAckError: Int? = null
+        val trackAckError: Int? = null,
+        val screenTracks: Map<Int, Int> = emptyMap()
     )
     private class Reader(private val data: ByteArray) {
         var offset = 0
@@ -356,7 +357,7 @@ internal object UuWire {
                 else -> top.skip(wire)
             }
         }
-        return Envelope(sequence, timestamp, echo, screen, screen?.let(tracksByScreen::get), echoAck, registeredRequest, registrationError)
+        return Envelope(sequence, timestamp, echo, screen, screen?.let(tracksByScreen::get), echoAck, registeredRequest, registrationError, tracksByScreen.toMap())
     }
 
     fun signalEndpoint(endpoint: String): String {
