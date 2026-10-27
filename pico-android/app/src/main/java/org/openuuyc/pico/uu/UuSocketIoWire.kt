@@ -2,6 +2,7 @@ package org.openuuyc.pico.uu
 
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONException
 
 /**
  * Strictly recognizes the Engine.IO v4 / Socket.IO default-namespace frames
@@ -24,7 +25,13 @@ internal object UuSocketIoWire {
 
     private const val MAX_SIGNAL_TEXT = 1024 * 1024
 
-    fun parse(frame: String): Packet {
+    fun parse(frame: String): Packet = try {
+        parseChecked(frame)
+    } catch (error: JSONException) {
+        throw IllegalArgumentException("invalid UU signaling JSON", error)
+    }
+
+    private fun parseChecked(frame: String): Packet {
         require(frame.length <= MAX_SIGNAL_TEXT) { "signaling frame too long" }
         if (frame.isEmpty()) throw IllegalArgumentException("empty UU signaling frame")
         return when {
@@ -77,7 +84,7 @@ internal object UuSocketIoWire {
         }
         val items = JSONArray(frame.substring(firstArray))
         require(items.length() >= 1)
-        require(items.optString(0).isNotBlank())
+        require(items.opt(0) is String && items.optString(0).isNotBlank())
         return ack.takeIf(String::isNotEmpty) to items
     }
 

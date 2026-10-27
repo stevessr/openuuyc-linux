@@ -47,7 +47,7 @@ class UuSocketIoWireTest {
         val p = UuSocketIoWire.parse("""451-23["soac",{"data":{"type":"answer"}}]""")
             as UuSocketIoWire.Packet.BinaryStart
         assertEquals("soac", p.name)
-        assertEquals("3", p.acknowledge)
+        assertEquals("23", p.acknowledge)
         assertArrayEquals(byteArrayOf(1, 2), UuSocketIoWire.binaryPayload(byteArrayOf(4, 1, 2)))
         assertThrows(IllegalArgumentException::class.java) {
             UuSocketIoWire.parse("""452-3["soac",{}]""")
