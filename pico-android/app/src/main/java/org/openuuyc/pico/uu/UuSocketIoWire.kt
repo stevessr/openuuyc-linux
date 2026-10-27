@@ -65,7 +65,9 @@ internal object UuSocketIoWire {
                 }
                 val rest = frame.substring(delimiter + 1)
                 val (ack, items) = decodeEvent(rest)
-                Packet.BinaryStart(items.getString(0), items.optJSONObject(1), ack)
+                val payload = items.optJSONObject(1)
+                    ?: throw IllegalArgumentException("UU binary event missing metadata")
+                Packet.BinaryStart(items.getString(0), payload, ack)
             }
             frame.startsWith("42") -> {
                 val (ack, items) = decodeEvent(frame.drop(2))
