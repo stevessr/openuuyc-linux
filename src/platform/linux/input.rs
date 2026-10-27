@@ -403,8 +403,9 @@ mod uinput {
     }
 
     impl Touchscreen {
-        pub(crate) fn create() -> Result<Self> {
-            let device = Device::create("OpenUUYC 虚拟触摸屏", |fd| {
+        pub(crate) fn create() -> Result<Self> { Self::create_named("OpenUUYC 虚拟触摸屏") }
+        pub(crate) fn create_named(name: &str) -> Result<Self> {
+            let device = Device::create(name, |fd| {
                 set(fd, UI_SET_EVBIT, EV_KEY.into())?;
                 set(fd, UI_SET_KEYBIT, BTN_TOUCH.into())?;
                 set(fd, UI_SET_EVBIT, EV_ABS.into())?;
@@ -1475,6 +1476,8 @@ pub(crate) struct Injector {
     absolute: Option<Absolute>,
     /// 多点触摸屏，拿不到就没有：触摸退回单指模拟。
     touchscreen: Option<uinput::Touchscreen>,
+    touchscreens_by_output: std::collections::HashMap<String,uinput::Touchscreen>,
+    touchscreen_output: Option<String>,
     /// X11 矩形 → Hyprland 逻辑矩形的映射（按显示器名对齐）。
     screen_maps: Vec<(String, (i32, i32, i32, i32), (i32, i32, i32, i32))>,
     /// 原生 Wayland 客户端的文字输入（可携带自定义 keymap）。
@@ -1543,6 +1546,21 @@ impl Injector {
         } else {
             None
         };
+        // Named devices are created before the first gesture so libinput can
+        // discover them. Per-device Niri mappings never alter physical touch.
+        let mut touchscreens_by_output=std::collections::HashMap::new();
+        if uinput.is_some() && std::env::var_os("NIRI_SOCKET").is_some() {
+            if let Some(layout)=crate::platform::display::compositor_layout() {
+                for output in &layout.outputs {
+                    if let Some(name)=&output.name {
+                        match uinput::Touchscreen::create_named(&touch_output_device_name(name)) {
+                            Ok(device)=> { touchscreens_by_output.insert(name.clone(),device); }
+                            Err(error)=>tracing::warn!(%error,output=%name,"无法创建按输出映射的虚拟触摸屏"),
+                        }
+                    }
+                }
+            }
+        }
         let screen_maps = if uinput.is_some() && hyprland() {
             let maps = screen_rect_maps();
             if maps.is_empty() {
@@ -1576,6 +1594,8 @@ impl Injector {
             uinput,
             absolute,
             touchscreen,
+            touchscreens_by_output,
+            touchscreen_output: None,
             screen_maps,
             virtual_keyboard,
         })
@@ -1589,13 +1609,22 @@ impl Injector {
     /// 有没有虚拟触摸屏。Xorg 会话不建它，Wayland 下没有 `/dev/uinput` 写权限
     /// 或者建失败了也没有；写入失败后会被丢掉，之后也是没有。
     pub fn has_touchscreen(&self) -> bool {
-        self.touchscreen.is_some()
+        self.touchscreen.is_some() || !self.touchscreens_by_output.is_empty()
+    }
+
+    pub fn select_touch_output(&mut self, output: &str) -> Result<()> {
+        ensure!(self.touchscreens_by_output.contains_key(output), "该输出没有虚拟触摸设备");
+        if self.touchscreen_output.as_deref()!=Some(output) {
+            self.release_touch()?;
+            self.touchscreen_output=Some(output.to_owned());
+        }
+        Ok(())
     }
 
     /// 真实的多点触摸，由合成器派发给应用。返回 false 表示触摸屏已经没有了（见
     /// `has_touchscreen`），调用方要退回单指模拟。
     pub fn touch(&mut self, kind: u8, points: &[Touch], rotation: Rotation) -> Result<bool> {
-        let Some(touchscreen) = &mut self.touchscreen else {
+        let Some(touchscreen) = (match self.touchscreen_output.as_ref() { Some(output)=>self.touchscreens_by_output.get_mut(output),None=>self.touchscreen.as_mut() }) else {
             return Ok(false);
         };
         let frames = touchscreen.step(kind, points, rotation)?;
@@ -1607,7 +1636,7 @@ impl Injector {
     /// 抬起所有触点。会话结束、换屏、取消时都要走一遍：合成器那边一个没抬起来
     /// 的触点会一直按着，应用也收不到结束。
     pub fn release_touch(&mut self) -> Result<()> {
-        let Some(touchscreen) = &mut self.touchscreen else {
+        let Some(touchscreen) = (match self.touchscreen_output.as_ref() { Some(output)=>self.touchscreens_by_output.get_mut(output),None=>self.touchscreen.as_mut() }) else {
             return Ok(());
         };
         let released = touchscreen.release();
@@ -1620,7 +1649,7 @@ impl Injector {
     fn keep_touchscreen(&mut self, result: Result<()>) -> Result<()> {
         if let Err(error) = &result {
             tracing::warn!(%error, "虚拟触摸屏写入失败，停用它，触摸退回单指模拟");
-            self.touchscreen = None;
+            if let Some(output)=self.touchscreen_output.take() { self.touchscreens_by_output.remove(&output); } else { self.touchscreen = None; }
         }
         result
     }
@@ -2328,3 +2357,6 @@ mod session_tests {
         injector.flush().unwrap();
     }
 }
+
+/// Exact name used in a Niri `input { touch "NAME" { map-to-output ... } }` block.
+pub(crate) fn touch_output_device_name(output: &str) -> String { format!("OpenUUYC touch {output}") }
