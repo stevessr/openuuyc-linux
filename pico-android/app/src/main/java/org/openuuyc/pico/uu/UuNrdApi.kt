@@ -160,12 +160,18 @@ internal class UuNrdApi(private val context: Context) {
     }
 
     fun confirmQr(qr: UuQr): UuAccount {
-        // Desktop login re-registers the same client identity *after phone
-        // confirmation* and before exchanging the one-time QR credential.
-        initializeDevice(force = true)
-        val result = request("POST", "/api/v1/login/by_qrcode",
-            JSONObject().put("qrcode_jump_url", qr.url).put("token", qr.token))
-        val session = UuAccount(result.getString("token"), result.getString("user_id"), result.optString("nickname"))
+        val session = UuQrCredentialExchange(
+            refreshDevice = { initializeDevice(force = true) },
+            exchangeToken = { ticket ->
+                val result = request("POST", "/api/v1/login/by_qrcode",
+                    JSONObject().put("qrcode_jump_url", ticket.url).put("token", ticket.token))
+                UuAccount(
+                    result.getString("token"),
+                    result.getString("user_id"),
+                    result.optString("nickname")
+                )
+            }
+        ).complete(qr)
         require(session.token.isNotBlank() && session.userId.isNotBlank())
         account = session
         return session

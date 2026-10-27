@@ -20,6 +20,7 @@ import org.openuuyc.pico.uu.UuJoinGate
 import org.openuuyc.pico.uu.UuNrdApi
 import org.openuuyc.pico.uu.UuDevice
 import org.openuuyc.pico.uu.UuQr
+import org.openuuyc.pico.uu.UuQrStatusTracker
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -95,7 +96,7 @@ class PicoActivity : Activity() {
             try {
                 api.initializeDevice()
                 var qr = api.createQr()
-                var statusValue = 1
+                val tracker = UuQrStatusTracker()
                 var deadline = System.currentTimeMillis() + 300_000
                 while (loginEpoch.get() == loginTicket && !isDestroyed) {
                     val image = qrBitmap(qr.url)
@@ -108,20 +109,16 @@ class PicoActivity : Activity() {
                     message("请用手机 UU 客户端扫码确认，二维码有效期 5 分钟")
                     while (loginEpoch.get() == loginTicket && !isDestroyed &&
                         System.currentTimeMillis() < deadline) {
-                        val state = api.queryQr(qr, statusValue)
+                        val state = api.queryQr(qr, tracker.status)
                         if (loginEpoch.get() != loginTicket || isDestroyed) return@submit
-                        when (state) {
-                            1, 2 -> {
-                                val scannedNow = state == 2 && statusValue != 2
-                                statusValue = state
-                                if (scannedNow) message("已扫码，等待手机确认")
-                                // Prevent tight-loop API polling and NRD rate
-                                // limiting. Each request already owns a network
-                                // deadline; check the generation after sleeping.
+                        when (tracker.receive(state)) {
+                            UuQrStatusTracker.Transition.WAITING -> Thread.sleep(1_000)
+                            UuQrStatusTracker.Transition.SCANNED -> {
+                                message("已扫码，等待手机确认")
                                 Thread.sleep(1_000)
                             }
-                            3 -> break // refresh cancelled login ticket
-                            4 -> {
+                            UuQrStatusTracker.Transition.REFRESH -> break
+                            UuQrStatusTracker.Transition.CONFIRMED -> {
                                 api.confirmQr(qr)
                                 if (loginEpoch.get() != loginTicket || isDestroyed) return@submit
                                 message("UU 登录成功，可从设备列表直接发起 PICO 远控")
@@ -129,12 +126,11 @@ class PicoActivity : Activity() {
                                 refresh()
                                 return@submit
                             }
-                            else -> throw IllegalArgumentException("未知的 UU 登录状态：$state")
                         }
                     }
                     if (loginEpoch.get() != loginTicket || isDestroyed) return@submit
                     qr = api.createQr()
-                    statusValue = 1
+                    tracker.reset()
                     deadline = System.currentTimeMillis() + 300_000
                 }
             } catch (e: Exception) {
