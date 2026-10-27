@@ -84,6 +84,7 @@ internal class UuDirectSession(
     private var textChannel: DataChannel? = null
     private val channels = mutableListOf<DataChannel>()
     private var video: VideoTrack? = null
+    private val videoTrackRouter = UuVideoTrackRouter<VideoTrack>()
     private var remoteAudio: AudioTrack? = null
     private var audioFocusHeld = false
     private var audioFocusRequested = false
@@ -397,8 +398,13 @@ internal class UuDirectSession(
         })
         val connection = peer ?: throw IllegalStateException("createPeerConnection failed")
         val options = RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
-        connection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, options)
+        // UU desktop controller offers audio_0 followed by five independent
+        // recvonly video m-lines (video_0..video_4); one line is insufficient
+        // for desktop/auxiliary video track selection.
         connection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO, options)
+        repeat(5) {
+            connection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, options)
+        }
         for (label in listOf(
             "CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL",
             "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL"
@@ -434,10 +440,17 @@ internal class UuDirectSession(
     private fun attachVideo(track: MediaStreamTrack?) {
         if (track !is VideoTrack) return
         synchronized(this) {
-            if (video === track) return
-            renderer?.let { video?.removeSink(it) }
-            video?.removeSink(firstFrameSink)
-            video = track
+            if (closed.get()) return
+            bindDisplayedVideo(videoTrackRouter.observed(track.id(), track))
+        }
+    }
+
+    @Synchronized private fun bindDisplayedVideo(track: VideoTrack?) {
+        if (video === track) return
+        renderer?.let { video?.removeSink(it) }
+        video?.removeSink(firstFrameSink)
+        video = track
+        if (track != null) {
             renderer?.let { track.addSink(it) }
             track.addSink(firstFrameSink)
         }
@@ -517,6 +530,7 @@ internal class UuDirectSession(
                         if (beforeScreen != captureGate.selectedScreen ||
                             beforeTrack != captureGate.selectedTrack) {
                             health.markTrackRegistrationFinished()
+                            bindDisplayedVideo(videoTrackRouter.select(captureGate.selectedTrack))
                         }
                         // A host display/track change revokes the held drag. Do
                         // not allow a fresh DOWN until the old UP was sent.
@@ -645,9 +659,8 @@ internal class UuDirectSession(
         captureGate.onTransportClosed()
         localIce.close()
         remoteIce.close()
-        renderer?.let { video?.removeSink(it) }
-        video?.removeSink(firstFrameSink)
-        video = null
+        bindDisplayedVideo(null)
+        videoTrackRouter.reset()
         remoteAudio?.setEnabled(false)
         remoteAudio = null
         if (audioFocusRequested) {
