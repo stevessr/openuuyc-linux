@@ -29,6 +29,13 @@ jobs:
           export XR_RUNTIME_JSON="$RUNNER_TEMP/openuuyc-openxr-components/openxr/openxr_openuuyc.json"
           "$RUNNER_TEMP/openuuyc-openxr-components/bin/openuuyc-openxr-probe" > "$RUNNER_TEMP/probe.json"
           python3 -c 'import json,os; p=json.load(open(os.environ["RUNNER_TEMP"]+"/probe.json")); assert p["instance"] and not p["system"], p'
+      - name: Synthetic device IPC to real headless OpenXR session
+        run: |
+          c++ -std=c++17 -O2 drivers/openxr/tests/device_smoke.cpp -lopenxr_loader -o "$RUNNER_TEMP/device-smoke"
+          python3 drivers/openxr/tests/device_fixture.py \
+            --runtime "$RUNNER_TEMP/openuuyc-openxr-components/openxr/openxr_openuuyc.json" \
+            --smoke "$RUNNER_TEMP/device-smoke" \
+            --probe "$RUNNER_TEMP/openuuyc-openxr-components/bin/openuuyc-openxr-probe"
       - name: Preserve executable modes in the distributable
         run: tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/openuuyc-openxr-components-linux-x86_64.tar.gz" openuuyc-openxr-components
       - uses: actions/upload-artifact@v4

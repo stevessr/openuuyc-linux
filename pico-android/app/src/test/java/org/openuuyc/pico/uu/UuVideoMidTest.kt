@@ -4,6 +4,12 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class UuVideoMidTest {
+    @Test fun dataOnlyAnswerIsNotARejectedVideoStream() {
+        val data="v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:0\r\na=sctp-port:5000\r\n"
+        assertTrue(UuWire.acceptedVideoTrackIndices(data,mediaRequired=false).isEmpty())
+        assertTrue(UuWire.videoMidIndices(data).isEmpty())
+        assertTrue(runCatching {UuWire.acceptedVideoTrackIndices(data)}.isFailure)
+    }
     private val sdp = """v=0
 m=audio 9 UDP/TLS/RTP/SAVPF 111
 a=mid:0

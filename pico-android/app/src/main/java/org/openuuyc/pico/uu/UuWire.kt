@@ -461,7 +461,7 @@ internal object UuWire {
      * Map the peer's accepted video m-lines to UU 0..4 track indices.
      * A rejected m-line (port 0) must never be registered for capture.
      */
-    fun acceptedVideoTrackIndices(sdp: String): List<Int> {
+    fun acceptedVideoTrackIndices(sdp: String,mediaRequired: Boolean=true): List<Int> {
         val result = mutableListOf<Int>()
         var videoIndex = 0
         for (line in sdp.lineSequence()) {
@@ -474,7 +474,7 @@ internal object UuWire {
             if (port != 0) result.add(videoIndex)
             videoIndex++
         }
-        require(videoIndex > 0) { "no UU video m-lines in SDP answer" }
+        require(!mediaRequired || videoIndex > 0) { "no UU video m-lines in SDP answer" }
         return result
     }
 

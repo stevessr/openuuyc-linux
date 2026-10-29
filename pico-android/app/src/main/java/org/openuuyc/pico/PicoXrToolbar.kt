@@ -44,12 +44,33 @@ internal class PicoXrToolbar(
     private var localVrApps: ((List<PicoLocalVrApp>)->Unit)->Unit={it(emptyList())}
     private var launchLocalVr: (PicoLocalVrApp)->Unit={}
     fun setLocalVrApps(load: ((List<PicoLocalVrApp>)->Unit)->Unit,launch: (PicoLocalVrApp)->Unit) {localVrApps=load;launchLocalVr=launch}
-    private var controllerHand=0
+    private var menuVisible=true
+    private var quickHand=-1
+    private var navigationCell=0
+    private var stickFocused=false
+    fun quickMenu(hand: Int) {
+        closeScreenMenu()
+        menuVisible=!(menuVisible && quickHand==hand);quickHand=if(menuVisible) hand else -1
+        controllerHand=2;previousLayout=-1;navigationCell=0;stickFocused=false
+        optionTitle=null;optionApply=null;devicePage=false;screenPage=false;spacePage=false;environmentPage=false;backgroundPage=false;keyboardPage=false;targetScreen=null;collapsed=false
+        notice="左 X / 右 A 唤起 · 摇杆选择、松开执行 · 内侧扳机拖动"
+        draw();if(menuVisible) navigate(0,false)
+    }
+    fun navigate(direction: Int,confirm: Boolean) {
+        if(direction==9) {stickFocused=false;draw();return}
+        if(!menuVisible || keyboardPage) return
+        if(direction>=100 && !isRoot()) return
+        val selected=PicoMenuNavigation.select(navigationCell,direction,::hoverCell) ?: return
+        navigationCell=selected.cell
+        stickFocused=true;hoverU=selected.u;hoverV=selected.v
+        if(confirm) {activate(selected.u,selected.v);stickFocused=true} else draw()
+    }
+    private var controllerHand=2
     private var collapsed=false
     private var previousLayout=-1
     private var controllerLayout: (Int,Int)->Unit={_,_->}
     fun setControllerMenu(hand: Int,apply: (Int,Int)->Unit) {
-        controllerHand=if(hand==1) 1 else 0;controllerLayout=apply;previousLayout=-1;draw()
+        controllerHand=hand.coerceIn(0,2);controllerLayout=apply;previousLayout=-1;draw()
     }
     private fun setFollowing(enabled: Boolean) {
         if(followPending || following==enabled) return
@@ -141,7 +162,7 @@ internal class PicoXrToolbar(
     private var confirmingVirtual = false
     private var screenPage=false
     private var menuScreens=emptyList<org.openuuyc.pico.uu.UuRemoteScreen>()
-    private var notice = "主菜单固定在手柄 · 所有功能直接点选"
+    private var notice = "悬浮菜单 · 左 X / 右 A 唤起 · 摇杆选择、松开执行"
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private fun hoverCell(u: Float,v: Float): Int? = when {
         optionTitle!=null -> PicoXrOptionLayout.hit(u,v,optionLabels.size)
@@ -151,6 +172,8 @@ internal class PicoXrToolbar(
         else -> PicoXrMenuHit.settings(u,v)
     }
     fun hover(u: Float,v: Float,down: Boolean) {
+        if(stickFocused && !down) return
+        if(down) stickFocused=false
         val previousCell=hoverCell(hoverU,hoverV)
         val nextCell=hoverCell(u,v)
         val continuous=keyboardPage || (optionTitle=="自定义码率" && down)
@@ -238,7 +261,7 @@ internal class PicoXrToolbar(
                     1 -> reset()
                     2 -> setFollowing(true)
                     3 -> setFollowing(false)
-                    7 -> {controllerHand=1-controllerHand;previousLayout=-1}
+                    7 -> options("主菜单位置",listOf("悬浮菜单（推荐）","左手柄","右手柄"),if(controllerHand==2) 0 else controllerHand+1) {controllerHand=if(it==0) 2 else it-1;previousLayout=-1}
                     6 -> {focusDots=!focusDots;focusDotsChanged(focusDots);notice=if(focusDots) "焦点圆点已开启" else "焦点圆点已隐藏；射线与点击保持可用"}
                     11 -> spacePage=false
                 }
@@ -385,7 +408,7 @@ internal class PicoXrToolbar(
     }
     fun draw() {
         val nextPortrait=qualityPage() || optionTitle!=null
-        val layout=if(nextPortrait) 2 else if(isRoot() && collapsed) 3 else if(isRoot()) 0 else 1
+        val layout=if(!menuVisible) 4 else if(nextPortrait) 2 else if(isRoot() && collapsed) 3 else if(isRoot()) 0 else 1
         if(previousLayout!=layout) {previousLayout=layout;controllerLayout(layout,controllerHand)}
         if(portrait!=nextPortrait) {portrait=nextPortrait;menuShape(portrait)}
         if (!surface.isValid) return
@@ -412,7 +435,7 @@ internal class PicoXrToolbar(
             PicoXrMaterial.label(canvas,notice,24f,32f,1152f,24f,medium=true)
             val state=session()?.settingsSnapshot(targetScreen); val c=state?.current
             if(keyboardPage) PicoKeyboardCanvas.draw(canvas,keyboardMode,keyboardKeys,hoverU,hoverV)
-            val labels=if(backgroundPage) PicoBackgroundPattern.presets.map {"${if(!customImage && selectedPreset==it.id) "✓ " else ""}${it.label}${if(it.procedural) " · 程序生成" else ""}"}+listOf("","返回环境设置") else if(environmentPage) listOf(if(mr) "MR 透视：开启" else "MR 透视：关闭","透视可见度：${mrVisibility}%","选择图片 / 全景图…",if(customImage) "图片背景：开启" else "图片背景：关闭","背景：全黑","背景：深灰","背景：深蓝","背景库 · 更多…","重新生成图案","背景亮度：${brightness}%",if(backgroundFlow) "背景流动：开" else "背景流动：关","返回主菜单") else if(spacePage) listOf(if(followPending) "跟随：切换中" else if(following) "跟随视角：开" else "跟随视角：关","重置到当前视角","跟随视角","固定窗口","窗口可独立拖动","窗口最大100英寸",if(focusDots) "焦点圆点：开" else "焦点圆点：关（默认）",if(controllerHand==0) "主菜单：左手柄" else "主菜单：右手柄","","","","返回主菜单") else if(pendingTakeover!=null) listOf("确认抢占","取消抢占") else if(devicePage) (0..11).map {i -> when(i) {
+            val labels=if(backgroundPage) PicoBackgroundPattern.presets.map {"${if(!customImage && selectedPreset==it.id) "✓ " else ""}${it.label}${if(it.procedural) " · 程序生成" else ""}"}+listOf("","返回环境设置") else if(environmentPage) listOf(if(mr) "MR 透视：开启" else "MR 透视：关闭","透视可见度：${mrVisibility}%","选择图片 / 全景图…",if(customImage) "图片背景：开启" else "图片背景：关闭","背景：全黑","背景：深灰","背景：深蓝","背景库 · 更多…","重新生成图案","背景亮度：${brightness}%",if(backgroundFlow) "背景流动：开" else "背景流动：关","返回主菜单") else if(spacePage) listOf(if(followPending) "跟随：切换中" else if(following) "跟随视角：开" else "跟随视角：关","重置到当前视角","跟随视角","固定窗口","窗口可独立拖动","窗口最大100英寸",if(focusDots) "焦点圆点：开" else "焦点圆点：关（默认）",when(controllerHand) {0->"主菜单：左手柄";1->"主菜单：右手柄";else->"主菜单：悬浮"},"","","","返回主菜单") else if(pendingTakeover!=null) listOf("确认抢占","取消抢占") else if(devicePage) (0..11).map {i -> when(i) {
                 8 -> "上一页";9 -> "下一页";10 -> "刷新设备";11 -> "返回串流"
                 else -> devices.getOrNull(deviceOffset+i)?.let { "${it.alias} · ${if(it.online && it.controllable) "沉浸式连接" else "不可连接"}" } ?: ""
             }} else if(keyboardPage) emptyList() else if(screenPage) (0..11).map { index -> when(index) {

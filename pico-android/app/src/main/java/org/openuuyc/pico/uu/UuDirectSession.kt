@@ -135,6 +135,8 @@ internal class UuDirectSession(
     val files=UuFileManager(
         next={synchronized(this) {nextRequestSeq++}},
         send={packet->synchronized(this) {!closed.get() && textChannel?.state()==DataChannel.State.OPEN && textChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(packet),false))==true}})
+    private var lastVrStatus=""
+    private var lastVrActive=false
     val quickApps=UuQuickApps()
     val vr=UuPcvrSession()
     private val http = OkHttpClient.Builder().pingInterval(0, TimeUnit.SECONDS)
@@ -469,8 +471,8 @@ internal class UuDirectSession(
                     if (!restart) return // Duplicate answer, do not reset ICE.
                     remoteIce.resetForRenegotiation()
                 }
-                val acceptedTracks = UuWire.acceptedVideoTrackIndices(sdp)
-                if (acceptedTracks.isEmpty()) {
+                val acceptedTracks = UuWire.acceptedVideoTrackIndices(sdp,mediaRequired=!applicationsOnly)
+                if (!applicationsOnly && acceptedTracks.isEmpty()) {
                     emit("UU SDP 拒绝全部视频轨道，无法接收远端画面")
                     terminateUnexpectedly()
                     return
@@ -853,7 +855,7 @@ internal class UuDirectSession(
                 if (closed.get()) return@postRtc
                 synchronized(this@UuDirectSession) {
                     if (closed.get()) return@postRtc
-                    val label = channel.label().takeIf { it in setOf("CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL", "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL") } ?: "other"
+                    val label = channel.label().takeIf { it in setOf("CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL", "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL",UuQuickApps.CHANNEL,UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL) } ?: "other"
                     emit("数据通道 $label：${channel.state()}")
                     if (channel.state() == DataChannel.State.OPEN) {
                         when (channel.label()) {
@@ -899,7 +901,11 @@ internal class UuDirectSession(
                 synchronized(this@UuDirectSession) {
                     if (closed.get()) return@postRtc
                     if(channel.label()==UuStereoFrames.CHANNEL) {vr.video(bytes);return@postRtc}
-                    if(channel.label()==UuPcvrSession.CONTROL) {vr.receive(bytes);return@postRtc}
+                    if(channel.label()==UuPcvrSession.CONTROL) {
+                        vr.receive(bytes)
+                        if(vr.status!=lastVrStatus && (!vr.active || !lastVrActive)) emit("PCVR：${vr.status}")
+                        lastVrStatus=vr.status;lastVrActive=vr.active;return@postRtc
+                    }
                     if(channel.label()==UuQuickApps.CHANNEL) {quickApps.receive(bytes);return@postRtc}
                     if(channel.label() in setOf("TEXT_DATA_CHANNEL","FILE_DATA_CHANNEL") && transfers.receive(bytes)) return@postRtc
                     val isControl = channel.label() == "CONTROL_DATA_CHANNEL"

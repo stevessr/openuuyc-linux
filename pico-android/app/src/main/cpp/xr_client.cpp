@@ -16,6 +16,7 @@
 #include "xr_controller_menu.h"
 #include "xr_panel_depth.h"
 #include "xr_menu_click.h"
+#include "xr_stick_release.h"
 #include "xr_grip_hold.h"
 #include "xr_panel_orbit.h"
 #include "xr_ray_geometry.h"
@@ -55,7 +56,10 @@ static bool toolbar_available = false;
 static PanelGeometry menu_panel=default_menu_panel();
 static std::atomic<bool> menu_portrait{false};
 static std::atomic<int> controller_menu_layout{0}; // root, landscape page, portrait page, collapsed
-static std::atomic<int> controller_menu_hand{0};
+static std::atomic<int> controller_menu_hand{2}; // 0/1 hand dock, 2 floating
+static XrTime last_menu_nav=0,menu_nav_until=0;
+static int menu_nav_hand=-1,quick_navigation_hand=-1;
+static XrStickRelease menu_stick[2];
 static bool controller_menu_available=false;
 static bool menu_grab=false;
 static bool menu_grip=false;
@@ -207,6 +211,9 @@ struct Actions {
     XrAction click = XR_NULL_HANDLE;
     XrAction grip = XR_NULL_HANDLE;
     XrAction scroll = XR_NULL_HANDLE;
+    XrAction nav_x = XR_NULL_HANDLE;
+    XrAction quick_menu = XR_NULL_HANDLE;
+    XrAction nav_click = XR_NULL_HANDLE;
     XrActionSpaceCreateInfo unused{}; // non-owning action reference
     XrSpace hands[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
     XrPath hand_paths[2] = {XR_NULL_PATH, XR_NULL_PATH};
@@ -241,6 +248,15 @@ struct Actions {
         std::strcpy(info.localizedActionName, "Remote mouse scroll");
         if (!xr_ok(xrCreateAction(set, &info, &scroll), "create scroll action")) return false;
 
+        std::strcpy(info.actionName,"menu_nav_x");std::strcpy(info.localizedActionName,"Menu joystick horizontal");
+        if(!xr_ok(xrCreateAction(set,&info,&nav_x),"create navigation action")) return false;
+        info.actionType=XR_ACTION_TYPE_BOOLEAN_INPUT;
+        std::strcpy(info.actionName,"quick_menu");std::strcpy(info.localizedActionName,"Quick menu X A");
+        if(!xr_ok(xrCreateAction(set,&info,&quick_menu),"create quick menu action")) return false;
+
+        std::strcpy(info.actionName,"menu_nav_click");std::strcpy(info.localizedActionName,"Menu joystick confirm");
+        if(!xr_ok(xrCreateAction(set,&info,&nav_click),"create navigation click")) return false;
+
         // Try each PICO generation, then the Khronos simple controller.
         // Profiles unsupported by older runtimes are harmlessly ignored.
         const char *profiles[] = {
@@ -251,7 +267,7 @@ struct Actions {
         };
         for (const auto *profile : profiles) {
             bool simple = std::strcmp(profile, "/interaction_profiles/khr/simple_controller") == 0;
-            XrActionSuggestedBinding bindings[10] = {
+            XrActionSuggestedBinding bindings[16] = {
                 {aim, path(instance, "/user/hand/left/input/aim/pose")},
                 {aim, path(instance, "/user/hand/right/input/aim/pose")},
                 {click, path(instance, simple ? "/user/hand/left/input/select/click" : "/user/hand/left/input/trigger/click")},
@@ -261,12 +277,18 @@ struct Actions {
                 {scroll, path(instance, "/user/hand/left/input/thumbstick/y")},
                 {scroll, path(instance, "/user/hand/right/input/thumbstick/y")},
                 {grip,path(instance,"/user/hand/left/input/squeeze/click")},
-                {grip,path(instance,"/user/hand/right/input/squeeze/click")}
+                {grip,path(instance,"/user/hand/right/input/squeeze/click")},
+                {nav_x,path(instance,"/user/hand/left/input/thumbstick/x")},
+                {nav_x,path(instance,"/user/hand/right/input/thumbstick/x")},
+                {quick_menu,path(instance,"/user/hand/left/input/x/click")},
+                {quick_menu,path(instance,"/user/hand/right/input/a/click")},
+                {nav_click,path(instance,"/user/hand/left/input/thumbstick/click")},
+                {nav_click,path(instance,"/user/hand/right/input/thumbstick/click")}
             };
             XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggested.interactionProfile = path(instance, profile);
             suggested.suggestedBindings = bindings;
-            suggested.countSuggestedBindings = simple ? 6 : 10;
+            suggested.countSuggestedBindings = simple ? 6 : 16;
             if (suggested.interactionProfile != XR_NULL_PATH) {
                 const auto result=xrSuggestInteractionProfileBindings(instance,&suggested);
                 LOGE("Controller binding %s: %d",profile,int(result));
@@ -384,7 +406,7 @@ static bool intersect_quad(const XrPosef &aim,float &u,float &v,int &pane) {
     return found;
 }
 
-static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmethodID scroll_method, jmethodID hover_method, jmethodID menu_method, jmethodID window_close, jmethodID window_menu,
+static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmethodID scroll_method, jmethodID hover_method, jmethodID menu_method, jmethodID window_close, jmethodID window_menu, jmethodID quick_method,jmethodID navigation_method,
                           XrSession session, XrSpace world, XrSpace menu_space, XrSpace view_space, Actions &actions,
                           XrTime timestamp, bool &last_down, float &old_u, float &old_v,
                           int &last_pane, XrTime &last_scroll_time) {
@@ -398,13 +420,45 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
     sync.countActiveActionSets = 1;
     sync.activeActionSets = &active;
     if (XR_FAILED(xrSyncActions(session, &sync))) return;
+    for(int hand=0;hand<2;++hand) {
+        XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};query.subactionPath=actions.hand_paths[hand];query.action=actions.quick_menu;
+        XrActionStateBoolean quick{XR_TYPE_ACTION_STATE_BOOLEAN};
+        if(XR_SUCCEEDED(xrGetActionStateBoolean(session,&query,&quick)) && quick.isActive && quick.changedSinceLastSync && quick.currentState && quick_method) {
+            menu_stick[0].reset();menu_stick[1].reset();last_menu_nav=0;
+            menu_reset_requested.store(true);menu_host.store(-1);controller_menu_hand.store(2);menu_nav_hand=hand;menu_nav_until=timestamp+5000000000LL;quick_navigation_hand=hand;
+            env->CallVoidMethod(activity,quick_method,jint(hand));
+        }
+        if(hand==quick_navigation_hand && menu_host.load()<0 && controller_menu_layout.load()!=4 && !menu_grab && grabbed_pane<0 && navigation_method) {
+            query.action=actions.scroll;XrActionStateFloat y{XR_TYPE_ACTION_STATE_FLOAT};xrGetActionStateFloat(session,&query,&y);
+            query.action=actions.nav_x;XrActionStateFloat x{XR_TYPE_ACTION_STATE_FLOAT};xrGetActionStateFloat(session,&query,&x);
+            const bool released=menu_stick[hand].update(x.currentState,y.currentState,x.isActive && y.isActive);
+            if(released) {
+                menu_nav_hand=hand;menu_nav_until=timestamp+5000000000LL;
+                env->CallVoidMethod(activity,navigation_method,jint(0),JNI_TRUE);
+            }
+            const float axis=std::fabs(x.currentState)>std::fabs(y.currentState)?x.currentState:-y.currentState;
+            if((x.isActive || y.isActive) && std::fabs(axis)>.6f && (last_menu_nav==0 || timestamp-last_menu_nav>180000000)) {
+                menu_nav_hand=hand;menu_nav_until=timestamp+5000000000LL;last_menu_nav=timestamp;
+                int direction=axis>0?1:-1;
+                if(controller_menu_layout.load()==0) {
+                    const float angle=std::atan2(x.currentState,y.currentState);
+                    direction=100+(int(std::lround(angle/(3.14159265358979323846f/4)))+8)%8;
+                }
+                env->CallVoidMethod(activity,navigation_method,jint(direction),JNI_FALSE);
+            }
+        } else menu_stick[hand].reset();
+    }
+    if(menu_nav_hand>=0 && timestamp>=menu_nav_until) {
+        menu_nav_hand=-1;if(navigation_method) env->CallVoidMethod(activity,navigation_method,jint(9),JNI_FALSE);
+    }
     // Evaluate BOTH hands before choosing. An idle right-hand desktop hover
     // must never starve a left-hand menu click (or vice versa).
     XrPointerIntent intents[2];
     XrSpaceLocation eye{XR_TYPE_SPACE_LOCATION};
     const auto eye_flags=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
     const bool eye_valid=XR_SUCCEEDED(xrLocateSpace(view_space,world,timestamp,&eye)) && (eye.locationFlags&eye_flags)==eye_flags;
-    const bool docked=menu_host.load()<0;
+    const bool docked=menu_host.load()<0 && controller_menu_hand.load()<2;
+    if(menu_host.load()<0 && !docked) controller_menu_available=controller_menu_layout.load()!=4;
     if(docked && menu_grab) {menu_grab=false;menu_grip=false;interaction_hand=-1;}
     const int dock_hand=controller_menu_hand.load();
     if(docked) {
@@ -443,6 +497,10 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
         query.action=actions.grip;xrGetActionStateBoolean(session,&query,&grip);
         if(grip.isActive) controller_debug_mask|=1<<(hand+2);
         if(grip.isActive && grip.currentState) controller_debug_mask|=1<<(hand+4);
+        const bool nav_confirm=menu_host.load()<0 && controller_menu_layout.load()!=4 && menu_nav_hand==hand && timestamp<menu_nav_until && !menu_grab && grabbed_pane<0;
+        // A pending stick selection owns the trigger until release; do not
+        // execute twice or leak a click into the remote desktop.
+        if(nav_confirm && trigger.isActive && trigger.currentState) trigger_blocked[hand]=true;
         trigger_held[hand]=trigger.isActive && trigger.currentState;
         intents[hand].pressed=(trigger.isActive && trigger.currentState) || (grip.isActive && grip.currentState);
         intents[hand].rising=(trigger.changedSinceLastSync && trigger.currentState) || (grip.changedSinceLastSync && grip.currentState);
@@ -549,6 +607,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
                     last_scroll_time=timestamp;
                 }
                 const auto d=rotate_vector(menu_location.pose.orientation,{0,0,-1});
+                if(eye_valid) menu_grab_origin={eye.pose.position.x,eye.pose.position.y,eye.pose.position.z};
                 orbit_drag(menu_panel,{menu_location.pose.position.x,menu_location.pose.position.y,menu_location.pose.position.z},
                     {d.x,d.y,d.z},menu_grab_origin,menu_grab_radius,grab_u,grab_v,menu_panel.aspect);
             }
@@ -642,6 +701,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
                     }
                     else {
                         const auto d=rotate_vector(location.pose.orientation,{0,0,-1});
+                        if(eye_valid) grab_depth_origin=eye.pose.position;
                         orbit_drag(p,{location.pose.position.x,location.pose.position.y,location.pose.position.z},
                             {d.x,d.y,d.z},{grab_depth_origin.x,grab_depth_origin.y,grab_depth_origin.z},window_grab_radius,grab_u,grab_v,p.aspect);
                     }
@@ -669,7 +729,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
         scroll_query.action = actions.scroll;
         scroll_query.subactionPath = actions.hand_paths[hand];
         XrActionStateFloat scroll_state{XR_TYPE_ACTION_STATE_FLOAT};
-        if (pane < 6 && scroll_method && XR_SUCCEEDED(xrGetActionStateFloat(session, &scroll_query, &scroll_state)) &&
+        if (!(menu_host.load()<0 && menu_nav_hand==hand && timestamp<menu_nav_until && controller_menu_layout.load()!=4) && pane < 6 && scroll_method && XR_SUCCEEDED(xrGetActionStateFloat(session, &scroll_query, &scroll_state)) &&
             scroll_state.isActive && std::fabs(scroll_state.currentState) >= 0.45f) {
             constexpr XrTime scroll_period = 120'000'000; // nanoseconds
             if (last_scroll_time == 0 || timestamp - last_scroll_time >= scroll_period) {
@@ -750,7 +810,9 @@ Java_org_openuuyc_pico_PicoActivity_nativeStop(JNIEnv *, jobject) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeSetControllerMenu(JNIEnv*,jobject,jint layout,jint hand) {
-    controller_menu_layout.store(std::clamp(int(layout),0,3));controller_menu_hand.store(hand==1?1:0);
+    const int old_hand=controller_menu_hand.exchange(std::clamp(int(hand),0,2));
+    const int old_layout=controller_menu_layout.exchange(std::clamp(int(layout),0,4));
+    if((old_hand!=hand && hand==2) || (old_layout==4 && layout!=4)) menu_reset_requested.store(true);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -807,6 +869,8 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     jmethodID pointer = env->GetMethodID(klass, "onPointer", "(IFFZ)V");
     jmethodID window_menu=env->GetMethodID(klass,"onXrWindowMenu","(II)V");
     jmethodID window_close=env->GetMethodID(klass,"onXrWindowClose","(I)V");
+    jmethodID quick_method=env->GetMethodID(klass,"onXrQuickMenu","(I)V");
+    jmethodID navigation_method=env->GetMethodID(klass,"onXrMenuNavigate","(IZ)V");
     jmethodID menu_method=env->GetMethodID(klass,"onXrMenuClick","(FF)V");
     jmethodID follow_report=env->GetMethodID(klass,"onXrFollowState","(Z)V");
     jmethodID hover_method = env->GetMethodID(klass,"onXrHover","(IFFZ)V");
@@ -829,8 +893,10 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     jmethodID stereo_ready=env->GetMethodID(klass,"onXrStereoSurface","(Landroid/view/Surface;II)V");
     XrEnvironmentRenderer environment;
     uint64_t input_frames=0;
+    uint64_t calibration_ticks=0;
+    jmethodID calibration_report=env->GetMethodID(klass,"onXrCalibration","(IIJ[F)V");
     grip_dragging=false;grip_holds[0].reset();grip_holds[1].reset();
-    menu_host.store(-1);menu_reset_requested.store(false);menu_portrait.store(false);
+    menu_host.store(-1);menu_reset_requested.store(true);menu_portrait.store(false);
     menu_panel=default_menu_panel();menu_grab=false;menu_grip=false;interaction_hand=-1;
     {std::lock_guard<std::mutex> lock(follow_pose_mutex);follow_click_valid=false;follow_requested_valid=false;}
     toolbar_available = false; frame_available=false; grabbed_pane=-1; follow_view.store(false); layout_reset.store(true);
@@ -1049,10 +1115,10 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                     }
                 }
             }
-            if(menu_reset_requested.exchange(false)) menu_panel=default_menu_panel();
+            const bool reset_menu=menu_reset_requested.exchange(false);
             const int menu_layout=controller_menu_layout.load();
             if(menu_host.load()<0) {
-                menu_panel.width=menu_layout==3?.15f:menu_layout==2?.30f:menu_layout==0?.42f:.50f;
+                menu_panel.width=controller_menu_hand.load()==2?(menu_layout==3?.35f:menu_layout==2?.95f:menu_layout==0?1.3f:1.45f):(menu_layout==3?.15f:menu_layout==2?.30f:menu_layout==0?.42f:.50f);
                 menu_panel.aspect=menu_layout==0?2.f/3.f:menu_layout==2?1000.f/600.f:1.f/3.f;
             } else {
                 menu_panel.width=menu_portrait.load()?.48f:.80f;
@@ -1120,13 +1186,41 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 }
             }
             const XrSpace active_space=actual_follow?following_space:(frozen!=XR_NULL_HANDLE?frozen:world);
+            if(reset_menu) {
+                const float width=menu_panel.width,aspect=menu_panel.aspect;
+                menu_panel=default_menu_panel();menu_panel.width=width;menu_panel.aspect=aspect;
+                XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+                if(XR_SUCCEEDED(xrLocateSpace(view,active_space,state.predictedDisplayTime,&head)) && (head.locationFlags&XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+                    const auto offset=rotate_vector(head.pose.orientation,{0,-.15f,-2.2f});
+                    menu_panel.x=head.pose.position.x+offset.x;menu_panel.y=head.pose.position.y+offset.y;menu_panel.z=head.pose.position.z+offset.z;
+                    const float dx=head.pose.position.x-menu_panel.x,dy=head.pose.position.y-menu_panel.y,dz=head.pose.position.z-menu_panel.z;
+                    menu_panel.yaw=std::atan2(dx,dz);menu_panel.pitch=-std::atan2(dy,std::sqrt(dx*dx+dz*dz));
+                }
+            }
             if (action_ready && input_focused && state.shouldRender) {
-                process_input(env, activity, pointer, scroll_method, hover_method, menu_method, window_close, window_menu, session, active_space, active_space, view, actions,
+                process_input(env, activity, pointer, scroll_method, hover_method, menu_method, window_close, window_menu, quick_method,navigation_method, session, active_space, active_space, view, actions,
                               state.predictedDisplayTime, previous_down, previous_u, previous_v,
                               previous_pane, last_scroll_time);
             } else if (previous_down) {
                 env->CallVoidMethod(activity, pointer, previous_pane, previous_u, previous_v, JNI_FALSE);
                 previous_down = false;
+            }
+            if(state.shouldRender && (calibration_ticks++%60)==0 && calibration_report) {
+                XrViewConfigurationView recommended[2]={{XR_TYPE_VIEW_CONFIGURATION_VIEW},{XR_TYPE_VIEW_CONFIGURATION_VIEW}};
+                uint32_t count=0;
+                XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};locate.viewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;locate.displayTime=state.predictedDisplayTime;locate.space=view;
+                XrViewState located{XR_TYPE_VIEW_STATE};XrView eyes[2]={{XR_TYPE_VIEW},{XR_TYPE_VIEW}};
+                if(XR_SUCCEEDED(xrEnumerateViewConfigurationViews(instance,system,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,2,&count,recommended)) && count==2 &&
+                   XR_SUCCEEDED(xrLocateViews(session,&locate,&located,2,&count,eyes)) && count==2 &&
+                   (located.viewStateFlags&(XR_VIEW_STATE_POSITION_VALID_BIT|XR_VIEW_STATE_ORIENTATION_VALID_BIT))==(XR_VIEW_STATE_POSITION_VALID_BIT|XR_VIEW_STATE_ORIENTATION_VALID_BIT) && state.predictedDisplayPeriod>0) {
+                    const uint32_t max_w=std::max(recommended[0].recommendedImageRectWidth,recommended[1].recommendedImageRectWidth);
+                    const uint32_t max_h=std::max(recommended[0].recommendedImageRectHeight,recommended[1].recommendedImageRectHeight);
+                    const float scale=std::min(1.f,2048.f/float(std::max(max_w,max_h)));
+                    const uint32_t w=std::max(64u,uint32_t(max_w*scale)&~1u),h=std::max(64u,uint32_t(max_h*scale)&~1u);
+                    float values[22];
+                    for(int eye=0;eye<2;++eye) {const auto& p=eyes[eye].pose;const auto& f=eyes[eye].fov;float v[11]={p.position.x,p.position.y,p.position.z,p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w,f.angleLeft,f.angleRight,f.angleUp,f.angleDown};std::copy(v,v+11,values+eye*11);}
+                    auto array=env->NewFloatArray(22);if(array) {env->SetFloatArrayRegion(array,0,22,values);env->CallVoidMethod(activity,calibration_report,jint(w),jint(h),jlong(state.predictedDisplayPeriod),array);env->DeleteLocalRef(array);}
+                }
             }
             if(tracking_enabled && tracking_callback && action_ready)
                 emit_pcvr_tracking(env,activity,tracking_enabled,tracking_callback,session,world,view,actions,state.predictedDisplayTime,input_focused && state.shouldRender);

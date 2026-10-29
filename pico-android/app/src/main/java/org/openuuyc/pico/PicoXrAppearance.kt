@@ -11,8 +11,9 @@ import java.io.File
 internal class PicoXrAppearance(private val context: Context) {
     private val prefs=context.getSharedPreferences("xr_appearance",Context.MODE_PRIVATE)
     private val imageFile=File(context.filesDir,"xr-background.img")
-    var menuHand=prefs.getInt("menu_hand",0).coerceIn(0,1); private set
-    fun setMenuHand(value: Int) {menuHand=value.coerceIn(0,1);prefs.edit().putInt("menu_hand",menuHand).apply()}
+    var menuHand=if(prefs.getBoolean("floating_menu_migrated",false)) prefs.getInt("menu_hand",2).coerceIn(0,2) else 2; private set
+    init {if(!prefs.getBoolean("floating_menu_migrated",false)) prefs.edit().putInt("menu_hand",2).putBoolean("floating_menu_migrated",true).apply()}
+    fun setMenuHand(value: Int) {menuHand=value.coerceIn(0,2);prefs.edit().putInt("menu_hand",menuHand).apply()}
     var focusDots=prefs.getBoolean("focus_dots",false); private set
     fun setFocusDots(enabled: Boolean) {focusDots=enabled;prefs.edit().putBoolean("focus_dots",enabled).apply()}
     var flow=prefs.getBoolean("background_flow",true); private set

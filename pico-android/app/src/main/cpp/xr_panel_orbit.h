@@ -8,6 +8,8 @@ inline float orbit_radius(const PanelGeometry &p,OrbitVector head,float u,float 
     return std::sqrt(x*x+y*y+z*z);
 }
 inline bool orbit_drag(PanelGeometry &p,OrbitVector ray,OrbitVector dir,OrbitVector head,float radius,float u,float v,float aspect) {
+    const float anchor_x=(u-.5f)*p.width,anchor_y=(.5f-v)*p.width*aspect;
+    radius=std::max(radius,std::sqrt(anchor_x*anchor_x+anchor_y*anchor_y)+.25f);
     const float ox=ray.x-head.x,oy=ray.y-head.y,oz=ray.z-head.z;
     const float a=dir.x*dir.x+dir.y*dir.y+dir.z*dir.z;
     if(a<.00001f) return false;

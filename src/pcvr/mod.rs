@@ -157,3 +157,6 @@ pub mod runtime;
 
 #[cfg(target_os = "linux")]
 pub mod runtime_probe;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod device;

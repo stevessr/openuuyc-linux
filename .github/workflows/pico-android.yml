@@ -96,6 +96,9 @@ jobs:
           c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
             pico-android/app/src/test/cpp/xr_controller_menu_test.cpp -o /tmp/xr-controller-menu-test
           /tmp/xr-controller-menu-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_stick_release_test.cpp -o /tmp/xr-stick-release-test
+          /tmp/xr-stick-release-test
       - name: Validate launcher and immersive Activity separation
         run: python3 -m unittest discover -s pico-android/scripts/tests -v
       - name: Validate ADB smoke script syntax

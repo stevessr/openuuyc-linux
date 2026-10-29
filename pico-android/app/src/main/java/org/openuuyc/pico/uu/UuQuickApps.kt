@@ -29,7 +29,9 @@ internal class UuQuickApps {
     }
     @Synchronized private fun send(value: JSONObject,timeout: Long=8000,callback: (JSONObject?,String?)->Unit) {
         val c=channel
-        if(!allowed || c?.state()!=DataChannel.State.OPEN) {main.post {callback(null,"远端未提供快速启动，或未允许远程终端授权；需要新版 Linux OpenUUYC")};return}
+        if(c?.state()!=DataChannel.State.OPEN) {main.post {callback(null,"快速应用通道尚未就绪，或该设备不支持 OpenUUYC 扩展")};return}
+        if(!initialized) {main.post {callback(null,"正在等待该设备的快速应用能力握手，请稍候刷新")};return}
+        if(!allowed) {main.post {callback(null,"该设备未授权应用启动：请在 Linux OpenUUYC 被控设置中允许远程终端")};return}
         if(pending.size>=4) {main.post {callback(null,"请等待上一次操作完成")};return}
         val id=++sequence;value.put("id",id);pending[id]=callback
         if(!c.send(DataChannel.Buffer(ByteBuffer.wrap(value.toString().toByteArray()),false))) {

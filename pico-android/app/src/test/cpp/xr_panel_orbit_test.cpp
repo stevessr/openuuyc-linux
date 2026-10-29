@@ -36,4 +36,12 @@ int main() {
         assert(std::fabs(anchor.y-eye.y-radius/norm)<.001f);
         assert(std::fabs(anchor.z-eye.z+radius/norm)<.001f);
     }
+    {
+        PanelGeometry p{0,0,2.f};OrbitVector viewer{1,.8f,.6f};
+        assert(orbit_drag(p,{1,.8f,.6f},{.4f,.7f,-1.f},viewer,2.f,.5f,.5f,p.aspect));
+        const auto n=panel_normal(p);PanelVector towards{viewer.x-p.x,viewer.y-p.y,viewer.z-p.z};
+        assert(panel_dot(n,towards)/std::sqrt(panel_dot(towards,towards))>.999f);
+        assert(orbit_drag(p,{1,.8f,.6f},{0,0,-1},viewer,.45f,.98f,.98f,p.aspect));
+        assert(std::isfinite(p.yaw) && std::isfinite(p.pitch));
+    }
 }

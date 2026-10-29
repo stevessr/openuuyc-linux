@@ -15,12 +15,18 @@ internal class UuPcvrSession {
         private val owner=AtomicReference<UuPcvrSession?>()
         fun stereoTarget()=owner.get()
     }
+    private var eyeCalibration: JSONObject?=null
+    @Synchronized fun calibration(width: Int,height: Int,periodNs: Long,views: FloatArray) {
+        if(width<64 || height<64 || periodNs<=0 || views.size!=22 || views.any {!it.isFinite()}) return
+        val array=org.json.JSONArray();views.forEach {array.put(it.toDouble())}
+        eyeCalibration=JSONObject().put("eye_width",width).put("eye_height",height).put("refresh_hz",1e9/periodNs.toDouble()).put("views",array)
+    }
     private val stereoFrames=UuStereoFrames()
-    private var stereoDecoder: UuStereoDecoder?=null
-    private var stereoGeneration=0
-    private var stereoWidth=0
-    private var stereoHeight=0
-    private var stereoCodec=0
+    @Volatile private var stereoDecoder: UuStereoDecoder?=null
+    @Volatile private var stereoGeneration=0
+    @Volatile private var stereoWidth=0
+    @Volatile private var stereoHeight=0
+    @Volatile private var stereoCodec=0
     private var stereoNative: ((Int,Int,Int)->Unit)?=null
     private var stereoRendered: ((Int,Long,FloatArray)->Unit)?=null
     private var lastKeyframeRequest=0L
@@ -84,6 +90,7 @@ internal class UuPcvrSession {
         val id=state.request(start)
         if(!start) owner.compareAndSet(this,null)
         val request=JSONObject().put("id",id).put("op",if(start) "start" else "stop")
+        if(start) eyeCalibration?.let {request.put("calibration",it)}
         val sent=c.send(DataChannel.Buffer(ByteBuffer.wrap(request.toString().toByteArray()),false))
         if(!sent) {revoke();status="VR 请求未发送";return false}
         status="等待远端确认（仅追踪，无远端双眼画面）"
@@ -120,5 +127,5 @@ internal class UuPcvrSession {
         c.send(DataChannel.Buffer(ByteBuffer.wrap(bytes),true))
     }
     private fun revoke() {stopStereo();active=false;state.reset();owner.compareAndSet(this,null)}
-    @Synchronized fun close() {revoke();control=null;poses=null;status="VR 会话已结束"}
+    @Synchronized fun close() {revoke();eyeCalibration=null;control=null;poses=null;status="VR 会话已结束"}
 }

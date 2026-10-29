@@ -2,10 +2,13 @@
 #include <openxr/openxr.h>
 #include <cstdio>
 #include <cstring>
-int main() {
+int main(int argc,char** argv) {
+    const bool device_only=argc==2 && std::strcmp(argv[1],"--device-only")==0;
+    const char* headless="XR_MND_headless";
     XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};
     std::strncpy(create.applicationInfo.applicationName,"OpenUUYC runtime probe",XR_MAX_APPLICATION_NAME_SIZE-1);
     create.applicationInfo.apiVersion=XR_MAKE_VERSION(1,0,0);
+    if(device_only) {create.enabledExtensionCount=1;create.enabledExtensionNames=&headless;}
     XrInstance instance=XR_NULL_HANDLE;
     const auto initialized=xrCreateInstance(&create,&instance);
     XrResult system_result=XR_ERROR_INITIALIZATION_FAILED;

@@ -52,6 +52,8 @@ struct Manifest {
     monado_revision: String,
     xrizer_revision: String,
     files: BTreeMap<String, String>,
+    #[serde(default)]
+    features: std::collections::BTreeSet<String>,
 }
 #[derive(Clone, Debug)]
 pub struct Plan {
@@ -240,6 +242,13 @@ fn select(
         probe: probe.unwrap_or_default(),
     })
 }
+pub(crate) fn device_component_available() -> Result<bool> {
+    let Some(path) = active_bundle()? else {
+        return Ok(false);
+    };
+    let (manifest, _) = bundle(&path)?;
+    Ok(manifest.features.contains("pico_device_v1"))
+}
 pub fn plan() -> Result<Plan> {
     let preference = preference()?;
     if preference == Preference::SteamVr {
@@ -258,6 +267,18 @@ impl Plan {
             .env_remove("XR_RUNTIME_JSON")
             .env_remove("VR_OVERRIDE");
         command.env("XR_RUNTIME_JSON", &self.manifest);
+        if self.backend == Backend::OpenXr {
+            if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR") {
+                let mut mounts =
+                    std::env::var_os("PRESSURE_VESSEL_FILESYSTEMS_RO").unwrap_or_default();
+                if !mounts.is_empty() {
+                    mounts.push(":");
+                }
+                mounts.push(PathBuf::from(root).join("openuuyc-pcvr/openxr"));
+                command.env("PRESSURE_VESSEL_FILESYSTEMS_RO", mounts);
+            }
+        }
+
         if api == Api::OpenVr && self.backend == Backend::OpenXr {
             let root = self.xrizer.as_ref().context("缺少 OpenVR→OpenXR 兼容库")?;
             command.env("VR_OVERRIDE", root);
@@ -277,6 +298,16 @@ impl Plan {
                 "VR_OVERRIDE={} ",
                 quote(self.xrizer.as_ref().context("缺少 xrizer")?.as_os_str())
             ));
+        }
+
+        if self.backend == Backend::OpenXr {
+            if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR") {
+                text.push_str("PRESSURE_VESSEL_FILESYSTEMS_RO=\"${PRESSURE_VESSEL_FILESYSTEMS_RO:+$PRESSURE_VESSEL_FILESYSTEMS_RO:}\"");
+                text.push_str(&quote(
+                    PathBuf::from(root).join("openuuyc-pcvr/openxr").as_os_str(),
+                ));
+                text.push(' ');
+            }
         }
         text.push_str("%command%");
         Ok(text)
@@ -354,6 +385,14 @@ pub fn run(api: Api, argv: &[OsString]) -> Result<()> {
         ensure!(
             config_root()?.join("openvr/openvrpaths.vrpath").is_file(),
             "xrizer 需要有效 OpenVR 路径文件；请显式执行 components-init-openvr（不需要安装 SteamVR）"
+        );
+    }
+    if plan.backend == Backend::OpenXr {
+        let source = active_bundle()?.context("缺少 OpenXR 组件")?;
+        let (manifest, _) = bundle(&source)?;
+        ensure!(
+            manifest.features.contains("pico_stereo_v1"),
+            "OpenXR 设备已识别，但双眼编码合成器尚未接通；未启动游戏"
         );
     }
     let executable = argv.first().context("缺少应用命令")?;
@@ -530,60 +569,15 @@ mod tests {
     }
 }
 
-/// Resolve only a currently listening local component endpoint, never invent an HMD.
-pub(crate) fn tracking_socket(
-    root: &Path,
-    preference: Preference,
-) -> Result<(PathBuf, &'static str)> {
+/// Legacy SteamVR tracking-only fallback. OpenXR uses the private snapshot broker.
+pub(crate) fn steam_tracking_socket(root: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::FileTypeExt;
-    let openxr = root.join("openuuyc-pcvr/openxr/tracking.sock");
-    let steam = root.join("openuuyc-pcvr/tracking.sock");
-    let socket =
-        |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket());
-    if preference != Preference::SteamVr && socket(&openxr) {
-        return Ok((openxr, "openxr"));
-    }
+    let path = root.join("openuuyc-pcvr/tracking.sock");
     ensure!(
-        preference != Preference::OpenXrOnly,
-        "OpenXR PICO 设备组件尚未运行；仅 OpenXR 模式不会回退 SteamVR"
+        std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_socket()),
+        "SteamVR 备用追踪驱动未运行；OpenXR 需要受管设备组件和真实眼位校准"
     );
-    ensure!(
-        socket(&steam),
-        "OpenXR PICO 设备端点未就绪，SteamVR 备用追踪驱动也未运行"
-    );
-    Ok((steam, "steamvr-tracking-fallback"))
-}
-
-#[cfg(test)]
-mod endpoint_tests {
-    use super::*;
-    #[test]
-    fn tracking_prefers_openxr_and_never_falls_back_in_only_mode() {
-        let root =
-            std::env::temp_dir().join(format!("openuuyc-runtime-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(root.join("openuuyc-pcvr/openxr")).unwrap();
-        let steam =
-            std::os::unix::net::UnixDatagram::bind(root.join("openuuyc-pcvr/tracking.sock"))
-                .unwrap();
-        assert_eq!(
-            tracking_socket(&root, Preference::OpenXrFirst).unwrap().1,
-            "steamvr-tracking-fallback"
-        );
-        assert!(tracking_socket(&root, Preference::OpenXrOnly).is_err());
-        let openxr =
-            std::os::unix::net::UnixDatagram::bind(root.join("openuuyc-pcvr/openxr/tracking.sock"))
-                .unwrap();
-        assert_eq!(
-            tracking_socket(&root, Preference::OpenXrFirst).unwrap().1,
-            "openxr"
-        );
-        assert_eq!(
-            tracking_socket(&root, Preference::SteamVr).unwrap().1,
-            "steamvr-tracking-fallback"
-        );
-        drop((steam, openxr));
-        std::fs::remove_dir_all(root).unwrap();
-    }
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -621,6 +615,7 @@ mod bundle_tests {
             monado_revision: "a".repeat(40),
             xrizer_revision: "b".repeat(40),
             files,
+            features: Default::default(),
         };
         let save = |manifest: &Manifest| {
             std::fs::write(

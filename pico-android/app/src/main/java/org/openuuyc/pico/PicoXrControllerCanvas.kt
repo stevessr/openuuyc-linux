@@ -8,7 +8,7 @@ import android.graphics.RectF
 internal object PicoXrControllerCanvas {
     fun draw(c: Canvas,labels: List<String>,following: Boolean,pending: Boolean,hand: Int,u: Float,v: Float,notice: String) {
         PicoXrMaterial.panel(c,1200f,800f)
-        PicoXrMaterial.label(c,"OpenUUYC · 手柄面板",32f,58f,1000f,30f,medium=true)
+        PicoXrMaterial.label(c,"OpenUUYC · 快速控制",32f,58f,1000f,30f,medium=true)
         PicoXrMaterial.label(c,notice,32f,96f,1100f,20f,muted=true)
         val p=Paint(Paint.ANTI_ALIAS_FLAG)
         p.style=Paint.Style.STROKE;p.strokeWidth=2f;p.color=Color.argb(75,105,170,220)
@@ -31,7 +31,7 @@ internal object PicoXrControllerCanvas {
         }
         p.textSize=22f;p.color=PicoTheme.MUTED
         c.drawText("画面位置",600f,307f,p)
-        c.drawText(if(hand==0) "左手柄固定 · 右手射线操作" else "右手柄固定 · 左手射线操作",600f,770f,p)
+        c.drawText(when(hand) {0->"左手柄固定 · 右手射线";1->"右手柄固定 · 左手射线";else->"X / A 唤起 · 摇杆选择 · 松开执行"},600f,770f,p)
     }
     fun collapsed(c: Canvas,hand: Int) {
         c.drawColor(Color.TRANSPARENT,android.graphics.PorterDuff.Mode.CLEAR)

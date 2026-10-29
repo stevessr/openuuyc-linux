@@ -313,3 +313,17 @@ and reachability still require headset validation.
 - Rust focused regressions: quick-app authorization/catalog (3), PCVR tracking bridge (3), audio queue freshness (1) passed.
 - New FTP tests exercise official request framing, compressed/plain directory parity, path validation, upload block/save acknowledgements, download completion/length checks, and cancellation against a simulated peer.
 - The latest single-file transfer APK has NOT been validated against the real PICO/UU host. ADB discovery currently has no device. These results are not evidence of upload/download interoperability on the headset, folder batch transfer, persistent cross-session resume, or a complete PCVR HMD transport.
+
+### 2026-10-30 device bridge checkpoint
+
+- Commit `82d34dc` contains the preceding OpenXR component/receiver foundation. Follow-up device bridge work is separate and still in progress.
+- Monado PICO builder, owner-only seqlock broker, real runtime eye/FOV calibration reporting and per-session publication have been added. Sixteen focused Rust PCVR tests pass; the Android APK/JVM tests/lint and arm64 native library build pass.
+- The real OpenXR loader + overlaid Monado successfully creates a headless HMD session in a temporary synthetic IPC fixture, and `xrLocateSpace` returns (1, 2, 3); stale source rejection passes. This is not real-device pose evidence.
+- The updated component bundle was installed, and the updated APK was successfully installed on PICO at `192.168.3.52:5555`. A new local debug host GUI was started for the requested live test; no permissions were granted automatically.
+- The real headset user test and GPU stereo/video path are not yet verified/connected. No SteamVR requirement was introduced.
+
+### Floating quick-menu stick release
+- Left X / right A summons the floating menu; repeating the same key hides it.
+- Deflect the invoking hand's stick beyond 60%, then return below 25% to execute the highlighted item once. A stick press/trigger confirmation is not required.
+- Below-threshold motion must not execute anything. Closing the menu or losing stick tracking cancels the pending selection. Verify both hands and submenu navigation on hardware.
+- Application directories use data-only SDP (zero media tracks). Existing connections wait for capability readiness; unsupported official UU quick-app peers must report unsupported instead of requesting audio/video.

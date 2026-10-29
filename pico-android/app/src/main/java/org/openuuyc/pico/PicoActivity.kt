@@ -50,6 +50,10 @@ open class PicoActivity : Activity() {
     }
     private external fun nativeStereoFormat(generation: Int,width: Int,height: Int)
     private external fun nativeStereoFrame(generation: Int,frame: Long,views: FloatArray)
+    fun onXrCalibration(width: Int,height: Int,periodNs: Long,views: FloatArray) {
+        session?.vr?.calibration(width,height,periodNs,views)
+        xrExtraSessions.values.forEach {it.vr.calibration(width,height,periodNs,views)}
+    }
     fun onXrStereoSurface(surface: android.view.Surface?,width: Int,height: Int) {
         org.openuuyc.pico.uu.UuPcvrSession.stereoTarget()?.stereoSurface(surface,width,height)
     }
@@ -181,7 +185,22 @@ open class PicoActivity : Activity() {
 
     private fun loadDeviceQuickApps(device: UuDevice,connect: Boolean,callback: (List<org.openuuyc.pico.uu.UuQuickApps.App>?,String?)->Unit,forFiles: Boolean=false) {
         val direct=deviceAppSession(device)
-        if(direct!=null) {if(forFiles) callback(emptyList(),null) else direct.quickApps.list(callback);return}
+        if(direct!=null) {
+            val epoch=appDirectoryEpoch
+            val deadline=android.os.SystemClock.elapsedRealtime()+15000
+            fun awaitCapabilities() {
+                if(isDestroyed || epoch!=appDirectoryEpoch || deviceAppSession(device)!==direct) {
+                    callback(null,"设备连接已结束，请重新连接应用目录");return
+                }
+                if(forFiles && direct.filesReady) {callback(emptyList(),null);return}
+                if(!forFiles && direct.quickApps.initialized) {direct.quickApps.list(callback);return}
+                if(android.os.SystemClock.elapsedRealtime()>=deadline) {
+                    callback(null,if(forFiles) "文件管理通道未就绪，请确认远端支持 UU 文件管理" else "该设备未完成快速应用能力握手；需要支持此扩展的 OpenUUYC 被控端，官方 UU 暂不支持此应用目录");return
+                }
+                ui.postDelayed({awaitCapabilities()},250)
+            }
+            awaitCapabilities();return
+        }
         if(!connect) {callback(null,"点击添加应用或连接应用目录，无需打开桌面串流");return}
         if(!device.online || !device.controllable) {callback(null,"该设备离线或未允许控制");return}
         if(device.occupants>0) {callback(null,"该设备已被占用；请先使用连接设备并明确确认抢占");return}
@@ -864,6 +883,8 @@ open class PicoActivity : Activity() {
     } }
 
     @Suppress("unused")
+    fun onXrQuickMenu(hand: Int) {ui.post {xrToolbar?.quickMenu(hand)}}
+    fun onXrMenuNavigate(direction: Int,confirm: Boolean) {ui.post {xrToolbar?.navigate(direction,confirm)}}
     fun onXrMenuClick(u: Float,v: Float) { ui.post { menuClicksHandled++;xrToolbar?.activate(u,v) } }
 
     @Suppress("unused")
