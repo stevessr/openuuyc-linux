@@ -3,7 +3,7 @@ import org.junit.Assert.*
 import org.junit.Test
 class PicoXrMenuHitTest {
     @Test fun linuxStyleToolbarAndSettingsMatchRenderedRects() {
-        for(i in 0..7) {val r=PicoXrMenuHit.toolbarRect(i);assertEquals(i,PicoXrMenuHit.toolbar((r[0]+r[2])/2400,(r[1]+r[3])/800))}
+        for(i in 0..10) {val r=PicoXrMenuHit.toolbarRect(i);assertEquals(i,PicoXrMenuHit.toolbar((r[0]+r[2])/2400,(r[1]+r[3])/1600))}
         for(i in 0..11) {val r=PicoXrMenuHit.settingsRect(i);assertEquals(i,PicoXrMenuHit.settings((r[0]+r[2])/2400,(r[1]+r[3])/800))}
         assertNull(PicoXrMenuHit.toolbar(.5f,.95f)) // rail is never an action
         assertNull(PicoXrMenuHit.settings(.5f,.95f))
@@ -24,5 +24,15 @@ class PicoXrMenuHitTest {
     @Test fun hiddenConfirmationRowsAreNotClickable() {
         assertNull(PicoXrMenuHit.cell(150f/1200,204f/400,4))
         assertEquals(0,PicoXrMenuHit.cell(150f/1200,100f/400,4))
+    }
+    @Test fun radialTargetsDoNotOverlapOrEscapeControllerCard() {
+        val rects=(0..10).map(PicoXrMenuHit::toolbarRect)
+        rects.forEachIndexed {i,r->
+            assertTrue(r[0]>=0 && r[1]>=0 && r[2]<=1200 && r[3]<=800)
+            for(j in i+1 until rects.size) {
+                val other=rects[j]
+                assertFalse(r[0]<other[2] && r[2]>other[0] && r[1]<other[3] && r[3]>other[1])
+            }
+        }
     }
 }

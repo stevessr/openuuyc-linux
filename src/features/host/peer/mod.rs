@@ -732,7 +732,17 @@ impl Peer {
         let diagnostics_binding: Arc<Mutex<Option<CancellationToken>>> = Default::default();
         let diagnostics_lease = handle.clone();
         let diagnostics_connected = connected.clone();
+        #[cfg(target_os="linux")]
+        let pcvr=crate::pcvr::host::Session::new(handle.clone(),connected.clone());
         connection.on_data_channel(Box::new(move |channel| {
+            #[cfg(target_os="linux")]
+            if matches!(channel.label(),crate::pcvr::host::CONTROL|crate::pcvr::host::TRACKING) {
+                pcvr.bind(channel,channel_cancel.clone());return Box::pin(async {});
+            }
+            if channel.label()==crate::features::host::quick_apps::CHANNEL {
+                crate::features::host::quick_apps::bind(channel,diagnostics_lease.clone(),diagnostics_connected.clone(),channel_cancel.clone());
+                return Box::pin(async {});
+            }
             if diagnostics_extension && channel.label() == crate::diagnostics::remote::CHANNEL {
                 channel_kcp.bind_stream(channel.id(), false);
                 let token = crate::diagnostics::remote::bind_host(

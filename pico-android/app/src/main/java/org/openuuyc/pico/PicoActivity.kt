@@ -63,6 +63,15 @@ open class PicoActivity : Activity() {
     private val xrPaneVisible=java.util.concurrent.atomic.AtomicIntegerArray(6)
     @Volatile private var xrActivePane=0
     @Volatile private var xrSettingsSession: UuDirectSession?=null
+    private val xrQuickAppNames=java.util.concurrent.ConcurrentHashMap<Int,String>()
+    private fun quickAppConnections(): List<Pair<String,UuDirectSession>> {
+        val result=mutableListOf<Pair<String,UuDirectSession>>()
+        session?.let {result.add(xrDeviceAlias to it)}
+        xrExtraSessions.entries.sortedBy {it.key}.forEach {(pane,direct)->
+            if(result.none {it.second===direct}) result.add((xrQuickAppNames[pane] ?: "连接 ${pane+1}") to direct)
+        }
+        return result
+    }
     private fun currentXrSession()=xrSettingsSession ?: xrExtraSessions[xrActivePane] ?: session
 
     private var panelMicButton: Button?=null
@@ -83,8 +92,20 @@ open class PicoActivity : Activity() {
 
     private var xrFollowing = false
     private var xrTouchMode=false
+    private external fun nativeSetPcvrProbe(enabled: Boolean)
+    private var pcvrProbe=false
+    private var pcvrPointerProbe=false
+    private val pointerProbeStats=PicoPointerProbeStats()
+    private external fun nativeSetFocusDots(enabled: Boolean)
+    private external fun nativeSetPointerProbe(enabled: Boolean)
+    private val pcvrProbeStats=PicoPcvrProbeStats()
+    @Volatile internal var pcvrProbeStopped=false; private set
     private external fun nativeStop()
     private external fun nativeDockMenu(pane: Int)
+    private external fun nativeSetEnvironment(mode: Int,color: Int,opacity: Int,brightness: Int,flow: Boolean,seed: Int)
+    private external fun nativeSetEnvironmentImage(width: Int,height: Int,rgba: ByteArray?)
+    private var uploadedEnvironmentImage:PicoXrAppearance.EnvironmentImage?=null
+    private external fun nativeSetControllerMenu(layout: Int,hand: Int)
     private external fun nativeSetMenuPortrait(portrait: Boolean)
     private external fun nativeSetWindowAspect(pane: Int,width: Int,height: Int)
     private external fun nativeSetWindowVisible(index: Int, visible: Boolean)
@@ -102,6 +123,7 @@ open class PicoActivity : Activity() {
     private var xrThread: Thread? = null
     private var panelVideo: PicoPanelVideoView? = null
     private var remoteKeyboard: PicoRemoteKeyboard? = null
+    private var xrKeyboardTarget: UuDirectSession?=null
     private var smartIme = true
     private var lastRemoteTap = 0L
     private var lastSessionMessage = ""
@@ -116,8 +138,14 @@ open class PicoActivity : Activity() {
         xrAppearance=PicoXrAppearance(this)
         passthroughEnabled=xrAppearance.mr
         System.loadLibrary("openuuyc_pico")
+        nativeSetFocusDots(xrAppearance.focusDots)
+        nativeSetControllerMenu(0,xrAppearance.menuHand)
         worker.execute {xrAppearance.prepareBackground();ui.post {if(!isDestroyed && running.get()) applyXrAppearance()}}
         status = TextView(this)
+        if(this is XrActivity && intent.getBooleanExtra("openuuyc.pcvr.probe",false) &&
+            applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            pcvrProbe=true;pcvrPointerProbe=intent.getBooleanExtra("openuuyc.pcvr.pointer",false);startPcvrProbe();return
+        }
         if (this is XrActivity || this is PanelViewerActivity) {
             val pending = pendingViewer.getAndSet(null)
             if (pending == null) { finish(); return }
@@ -136,12 +164,97 @@ open class PicoActivity : Activity() {
         restoreLogin()
     }
 
+    private val appDirectorySessions=mutableMapOf<String,UuDirectSession>()
+    private val appDirectoryLoading=mutableSetOf<String>()
+    private var appDirectoryEpoch=0
+    private fun closeAppDirectories() {
+        ++appDirectoryEpoch;appDirectoryLoading.clear()
+        appDirectorySessions.values.toList().forEach {it.close()};appDirectorySessions.clear()
+    }
+    private fun deviceAppSession(device: UuDevice): UuDirectSession? =
+        (if(device.id==xrDeviceId) session else xrExtraDeviceIds.entries.firstOrNull {it.value==device.id}?.key?.let {xrExtraSessions[it]}) ?: appDirectorySessions[device.id]
+
+    private fun loadDeviceQuickApps(device: UuDevice,connect: Boolean,callback: (List<org.openuuyc.pico.uu.UuQuickApps.App>?,String?)->Unit,forFiles: Boolean=false) {
+        val direct=deviceAppSession(device)
+        if(direct!=null) {if(forFiles) callback(emptyList(),null) else direct.quickApps.list(callback);return}
+        if(!connect) {callback(null,"点击添加应用或连接应用目录，无需打开桌面串流");return}
+        if(!device.online || !device.controllable) {callback(null,"该设备离线或未允许控制");return}
+        if(device.occupants>0) {callback(null,"该设备已被占用；请先使用连接设备并明确确认抢占");return}
+        android.app.AlertDialog.Builder(this).setTitle("连接 ${device.alias} 的${if(forFiles) "文件管理" else "应用目录"}？")
+            .setMessage("将建立该设备的纯数据控制连接，不协商音视频轨道、不打开桌面画面。文件管理遵循远端文件权限，应用启动另需 Linux OpenUUYC 的远程终端授权；离开页面或打开串流后释放连接。")
+            .setNegativeButton("取消") {_,_->callback(null,"已取消应用连接")}
+            .setOnCancelListener {callback(null,"已取消应用连接")}
+            .setPositiveButton("连接") {_,_->
+                if(!appDirectoryLoading.add(device.id)) {callback(null,"该设备正在连接，请稍候");return@setPositiveButton}
+                val epoch=appDirectoryEpoch
+                worker.submit {
+                    try {
+                        val room=api.join(device,false)
+                        ui.post {
+                            if(isDestroyed || epoch!=appDirectoryEpoch) {org.openuuyc.pico.uu.UuRoomRelease.cancel(room);return@post}
+                            try {
+                                val connection=UuDirectSession(applicationContext,room,api.identity.copy(),::message)
+                                connection.applicationsOnly=true
+                                appDirectorySessions[device.id]=connection
+                                connection.onDisposed={ui.post {if(appDirectorySessions[device.id]===connection) appDirectorySessions.remove(device.id)}}
+                                connection.start(null)
+                                val deadline=android.os.SystemClock.elapsedRealtime()+30000
+                                fun poll() {
+                                    if(isDestroyed || epoch!=appDirectoryEpoch || appDirectorySessions[device.id]!==connection) {appDirectoryLoading.remove(device.id);callback(null,"应用连接已关闭");return}
+                                    if(forFiles && connection.filesReady) {appDirectoryLoading.remove(device.id);callback(emptyList(),null);return}
+                                    if(!forFiles && connection.quickApps.initialized) {appDirectoryLoading.remove(device.id);connection.quickApps.list(callback);return}
+                                    if(android.os.SystemClock.elapsedRealtime()>=deadline) {
+                                        appDirectoryLoading.remove(device.id);appDirectorySessions.remove(device.id);connection.close()
+                                        callback(null,"应用连接超时：远端可能不支持快速启动扩展或尚未授权");return
+                                    }
+                                    ui.postDelayed({poll()},250)
+                                }
+                                poll()
+                            } catch(error: Exception) {
+                                appDirectoryLoading.remove(device.id);appDirectorySessions.remove(device.id)?.close()
+                                org.openuuyc.pico.uu.UuRoomRelease.cancel(room);callback(null,error.message ?: "应用连接失败")
+                            }
+                        }
+                    } catch(error: Exception) {ui.post {appDirectoryLoading.remove(device.id);callback(null,error.message ?: "应用连接失败")}}
+                }
+            }.show()
+    }
+
+    private var pendingTransferDocument: ((android.net.Uri)->Unit)?=null
+    private fun pickTransferDocument(create: Boolean,name: String,selected: (android.net.Uri)->Unit) {
+        if(pendingTransferDocument!=null) {message("请先完成当前文件选择");return}
+        pendingTransferDocument=selected
+        val intent=Intent(if(create) Intent.ACTION_CREATE_DOCUMENT else Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE);type="*/*"
+            if(create) putExtra(Intent.EXTRA_TITLE,name)
+        }
+        try {startActivityForResult(intent,8345)} catch(error: Exception) {pendingTransferDocument=null;message(error.message ?: "系统文件选择器不可用")}
+    }
+
+    private fun showDeviceFiles(device: UuDevice) {
+        loadDeviceQuickApps(device,true,{_,error->
+            val direct=deviceAppSession(device)
+            if(error!=null || direct==null) message(error ?: "文件连接不可用")
+            else PicoFilesMenu.show(this,direct,::message,::pickTransferDocument)
+        },forFiles=true)
+    }
+
+    private fun launchDeviceQuickApp(device: UuDevice,app: org.openuuyc.pico.uu.UuQuickApps.App) {
+        val direct=deviceAppSession(device) ?: run {message("该设备未连接，请先连接");return}
+        android.app.AlertDialog.Builder(this).setTitle("${device.alias} · ${app.name}")
+            .setMessage(if(app.vr) "仅在此设备启动 VR 游戏；尚无内置双眼画面。" else "在此设备启动应用？")
+            .setNegativeButton("取消",null).setPositiveButton("启动") {_,_->
+                if(deviceAppSession(device)!==direct) {message("该设备连接已变化，请刷新应用列表");return@setPositiveButton}
+                direct.quickApps.launch(app,launchOnlyAck=app.vr) {_,result->message("${device.alias} · $result")}
+            }.show()
+    }
+
     private fun buildPanel() {
         loginView = PicoLoginView(this, ::login, ::refresh, ::logout,
             { enabled -> passthroughEnabled = enabled; nativeSetPassthroughEnabled(enabled) },
             ::toggleCamera, cameraPreview.preview, passthroughEnabled,
             { device -> connect(device) }, ::restoreLogin,
-            { device -> connect(device, PicoViewerMode.IMMERSIVE) }, ::smsLogin)
+            { device -> connect(device, PicoViewerMode.IMMERSIVE) }, ::smsLogin, {PicoQuickAppsMenu.showConnections(this,quickAppConnections(),::message)}, {device,connect,callback->loadDeviceQuickApps(device,connect,callback)}, ::launchDeviceQuickApp, ::closeAppDirectories, ::showDeviceFiles)
         status = loginView!!.status
         qrImage = loginView!!.qrImage
         setContentView(loginView)
@@ -192,6 +305,7 @@ open class PicoActivity : Activity() {
     }
 
     private fun logout() {
+        closeAppDirectories()
         android.app.AlertDialog.Builder(this)
             .setTitle("退出登录？").setMessage("将清除本机加密保存的登录凭证，不会移除电脑上的账号。")
             .setNegativeButton("取消", null).setPositiveButton("退出登录") { _, _ ->
@@ -330,6 +444,7 @@ open class PicoActivity : Activity() {
                 .setNegativeButton("取消", null).setPositiveButton("确认抢占") { _, _ -> connect(device, mode, true) }.show()
             return
         }
+        closeAppDirectories()
         val ticket = joinGate.begin() ?: return
         message("加入 UU 远控房间：${device.alias}")
         worker.submit {
@@ -431,10 +546,12 @@ open class PicoActivity : Activity() {
                 android.app.AlertDialog.Builder(this).setTitle("创建虚拟显示器？").setMessage("将在远端请求创建1920×1080显示器。")
                     .setNegativeButton("取消",null).setPositiveButton("确认") {_,_-> try {check(direct.createVirtualDisplay());message("请求已发送，等待远端屏幕列表")} catch(error: Exception) {message(error.message ?: "虚拟屏未创建")} }.show()
             }
+            action("文件管理") {PicoFilesMenu.show(this,direct,::message,::pickTransferDocument)}
+            action("游戏 / 应用") {PicoQuickAppsMenu.showConnections(this,quickAppConnections(),::message)}
             action("设置") { PicoRemoteSettingsDialog.show(this, direct, smartIme, { enabled ->
                 smartIme = enabled; getPreferences(MODE_PRIVATE).edit().putBoolean("smart_ime", enabled).apply()
             }, ::message) }
-            action("键盘") { keyboard.hide();PicoKeyboardPopup.show(this,toolbar,direct,keyboard::show) }
+            action("键盘") { keyboard.hide();PicoKeyboardPopup.show(this,toolbar,direct,keyboard::show,keyboard::showVoiceInput) }
             panelMicButton=action("麦克风：关") {toggleMicrophone(direct)}
             panelClipboardButton=action("剪贴板：关") {direct.setClipboardEnabled(!direct.clipboardEnabled)}
             val inputMode = Button(this).apply {
@@ -465,12 +582,31 @@ open class PicoActivity : Activity() {
         }
     }
 
+    private fun startPcvrProbe() {
+        // Only an internal debug Activity/instrumentation can reach this path.
+        // No UU login, remote media, microphone, clipboard or network is started.
+        setContentView(status);status.text="内置 PCVR 双眼投影诊断（非远端游戏画面）"
+        nativeSetPcvrProbe(!pcvrPointerProbe);nativeSetPointerProbe(pcvrPointerProbe);nativeSetPassthroughEnabled(false)
+        for(i in 0..5) nativeSetWindowVisible(i,false)
+        running.set(true)
+        xrThread=Thread({
+            try {nativeRun(this)} finally {
+                pcvrProbeStopped=true
+                ui.post {
+                    stopSession();xrSurfaces.values.forEach {it.release()};xrSurfaces.clear()
+                    xrToolbar?.close();xrToolbar=null;xrWindowFrame?.close();xrWindowFrame=null
+                    if(!isDestroyed) finish()
+                }
+            }
+        },"OpenUUYC-PCVR-Probe").also {it.start()}
+    }
+
     private fun startXrSession(room: UuRoom, identity: UuIdentity) {
         try {
             session = UuDirectSession(applicationContext, room, identity, ::message,
                 { index, visible -> if(index !in xrReservedSlots) {xrPaneVisible.set(index,if(visible) 1 else 0);nativeSetWindowVisible(index, visible)} }) {
                 ui.post { if (!isDestroyed) {closePrimaryStream();message("主串流已断开，其他设备不受影响；可打开主页面重新连接")} }
-            }
+            }.also {it.immersiveRendering=true}
             session?.onDisposed={ui.post {
                 xrClosingPrimary.toList().forEach {pane->xrReservedSlots.remove(pane);xrPaneVisible.set(pane,0);nativeSetWindowVisible(pane,false)}
                 xrClosingPrimary.clear()
@@ -478,7 +614,7 @@ open class PicoActivity : Activity() {
             session?.windowInfoListener={pane,_,name,width,height-> ui.post {
                 if(pane !in xrReservedSlots) {nativeSetWindowAspect(pane,width,height);xrWindowFrame?.title(pane,"$xrDeviceAlias - $name")}
             } }
-            remoteKeyboard=PicoRemoteKeyboard(this,{currentXrSession()?.text(it)==true},{code,down->currentXrSession()?.key(code,down)==true})
+            remoteKeyboard=PicoRemoteKeyboard(this,{xrKeyboardTarget?.text(it)==true},{code,down->currentXrSession()?.key(code,down)==true})
             setContentView(remoteKeyboard)
             running.set(true)
             xrThread = Thread({
@@ -510,7 +646,9 @@ open class PicoActivity : Activity() {
     }
 
     private fun openXrHome() {
-        xrSettingsSession=null;nativeDockMenu(-1);message("正在载入主页面设备列表…")
+        // The caller owns placement: root navigation detaches explicitly,
+        // while window-device menus and refresh retain the monitor anchor.
+        xrSettingsSession=null;message("正在载入主页面设备列表…")
         worker.submit {
             try {
                 if(!::api.isInitialized) api=UuNrdApi(applicationContext)
@@ -539,6 +677,7 @@ open class PicoActivity : Activity() {
                         extra=UuDirectSession(applicationContext,room,api.identity.copy(),{message("${device.alias} · $it")},
                             {index,visible->if(index==0) {xrPaneVisible.set(pane,if(visible) 1 else 0);nativeSetWindowVisible(pane,visible)}},
                             {ui.post {xrExtraSessions[pane]?.close()}})
+                        extra.immersiveRendering=true
                         extra.windowInfoListener={index,_,name,width,height->if(index==0) ui.post {
                             if(xrExtraSessions[pane]===extra) {nativeSetWindowAspect(pane,width,height);xrWindowFrame?.title(pane,"${device.alias} - $name")}
                         }}
@@ -549,7 +688,7 @@ open class PicoActivity : Activity() {
                                 if(running.get() && xrMainAlive && pane>0) xrSurfaces[pane]?.let {session?.addWindowSurface(pane,it)}
                             }
                         }}
-                        xrExtraSessions[pane]=extra;xrExtraDeviceIds[pane]=device.id
+                        xrExtraSessions[pane]=extra;xrQuickAppNames[pane]=device.alias;xrExtraDeviceIds[pane]=device.id
                         worker.execute {
                             try {
                                 if(!running.get()) {extra.close();org.openuuyc.pico.uu.UuRoomRelease.cancel(room);return@execute}
@@ -579,11 +718,12 @@ open class PicoActivity : Activity() {
     @Deprecated("Activity result compatibility")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if(requestCode==8345) {val selected=pendingTransferDocument;pendingTransferDocument=null;if(resultCode==RESULT_OK) data?.data?.let {selected?.invoke(it)};return}
         if(requestCode==8342) {
             if(resultCode==RESULT_OK) data?.data?.let {uri -> worker.execute {
                 val result=runCatching {xrAppearance.importImage(uri)}
                 ui.post {if(!isDestroyed) {
-                    if(result.isSuccess) {xrAppearance.update(false,xrAppearance.color,xrAppearance.visibility);applyXrAppearance();xrToolbar?.setMr(false);xrToolbar?.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness);message("自定义图片已保存，已切换到图片背景")}
+                    if(result.isSuccess) {xrAppearance.update(false,xrAppearance.color,xrAppearance.visibility);applyXrAppearance();xrToolbar?.setMr(false);xrToolbar?.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness,xrAppearance.flow);message("自定义图片已保存，已切换到图片背景")}
                     else message(result.exceptionOrNull()?.message ?: "图片加载失败")
                 }}
             }}
@@ -612,7 +752,7 @@ open class PicoActivity : Activity() {
             xrAppearance.useImage(enabled);xrAppearance.prepareBackground()
             ui.post {if(!isDestroyed) {
                 applyXrAppearance()
-                xrToolbar?.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness)
+                xrToolbar?.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness,xrAppearance.flow)
                 if(enabled && !xrAppearance.custom) message("请先选择自定义图片")
             }}
         }
@@ -622,6 +762,7 @@ open class PicoActivity : Activity() {
         worker.execute {
             val result=runCatching {
                 when(action) {
+                    "flow" -> xrAppearance.toggleFlow()
                     "regenerate" -> {check(!xrAppearance.custom && PicoBackgroundPattern.find(xrAppearance.presetId).procedural) {"请先选择程序生成背景"};xrAppearance.regenerate()}
                     else -> if(action.startsWith("brightness:")) xrAppearance.setBrightness(action.substringAfter(":").toInt()) else xrAppearance.selectPreset(action)
                 }
@@ -629,7 +770,7 @@ open class PicoActivity : Activity() {
             ui.post {if(!isDestroyed) {
                 if(result.isSuccess) {
                     applyXrAppearance();xrToolbar?.setMr(xrAppearance.mr)
-                    xrToolbar?.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness)
+                    xrToolbar?.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness,xrAppearance.flow)
                     message("背景已保存 · ${if(xrAppearance.custom) "自定义图片" else PicoBackgroundPattern.find(xrAppearance.presetId).label}")
                 } else message(result.exceptionOrNull()?.message ?: "背景生成失败")
             }}
@@ -639,6 +780,13 @@ open class PicoActivity : Activity() {
     private fun applyXrAppearance() {
         passthroughEnabled=xrAppearance.mr
         nativeSetPassthroughEnabled(passthroughEnabled)
+        val opacity=if(passthroughEnabled) ((100-xrAppearance.visibility)*255/100) else 255
+        val image=xrAppearance.environmentImage()
+        if(image!==uploadedEnvironmentImage) {
+            nativeSetEnvironmentImage(image?.width ?: 0,image?.height ?: 0,image?.rgba);uploadedEnvironmentImage=image
+        }
+        nativeSetEnvironment(if(xrAppearance.custom) 12 else PicoBackgroundPattern.find(xrAppearance.presetId).mode,
+            xrAppearance.color,opacity,xrAppearance.brightness,xrAppearance.flow,xrAppearance.seed)
         xrWindowFrame?.background(xrAppearance.color,xrAppearance.backgroundImage(),
             if(passthroughEnabled) ((100-xrAppearance.visibility)*255/100) else 255,xrAppearance.brightness)
     }
@@ -656,9 +804,12 @@ open class PicoActivity : Activity() {
             }
             if (index == 6 && running.get()) {
                 xrToolbar?.close()
-                xrToolbar = PicoXrToolbar(surface, { currentXrSession() }, ::nativeSetFollowView, { session?.showAllWindows();nativeResetLayout() }, { enabled -> xrTouchMode=enabled }, { mode -> if(mode==PicoKeyboardMode.SYSTEM) remoteKeyboard?.show() else remoteKeyboard?.hide() }, { mr,color,opacity -> xrAppearance.update(mr,color,opacity);applyXrAppearance() }, { xrSettingsSession=null;nativeDockMenu(-1) }, ::openXrHome, ::connectXrDevice, ::pickXrBackground, ::setXrCustomBackground, ::changeXrBackground, ::nativeSetMenuPortrait, {xrExtraDeviceIds.values.toSet()+if(xrMainAlive) setOf(xrDeviceId) else emptySet()}) {
+                xrToolbar = PicoXrToolbar(surface, { currentXrSession() }, ::nativeSetFollowView, { session?.showAllWindows();nativeResetLayout() }, { enabled -> xrTouchMode=enabled }, { mode -> when(mode) {PicoKeyboardMode.SYSTEM->{xrKeyboardTarget=currentXrSession();remoteKeyboard?.show()};PicoKeyboardMode.VOICE->{xrKeyboardTarget=currentXrSession();remoteKeyboard?.showVoiceInput()};else->{xrKeyboardTarget=null;remoteKeyboard?.hide()}} }, { mr,color,opacity -> xrAppearance.update(mr,color,opacity);applyXrAppearance() }, { xrSettingsSession=null;nativeDockMenu(-1) }, ::openXrHome, ::connectXrDevice, ::pickXrBackground, ::setXrCustomBackground, ::changeXrBackground, ::nativeSetMenuPortrait, {xrExtraDeviceIds.values.toSet()+if(xrMainAlive) setOf(xrDeviceId) else emptySet()}) {
                     stopSession(); finishViewer()
-                }.also { it.setMr(passthroughEnabled);it.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness) }
+                } .also { it.setLocalVrApps({callback->worker.execute {
+                    val apps=runCatching {PicoLocalVrApps.list(this)}.getOrDefault(emptyList())
+                    ui.post {if(!isDestroyed) callback(apps)}
+                }},{app->runCatching {PicoLocalVrApps.launch(this,app)}.onFailure {error->message(error.message ?: "VR 应用启动失败")}});it.setQuickAppConnections(::quickAppConnections);it.setControllerMenu(xrAppearance.menuHand) {layout,hand->xrAppearance.setMenuHand(hand);nativeSetControllerMenu(layout,hand)};it.setFocusDots(xrAppearance.focusDots) {enabled->xrAppearance.setFocusDots(enabled);nativeSetFocusDots(enabled)};it.setMr(passthroughEnabled);it.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness,xrAppearance.flow) }
                 return@post
             }
             if (!running.get() || index !in 0..5) { surface.release(); return@post }
@@ -706,28 +857,58 @@ open class PicoActivity : Activity() {
     } }
 
     @Suppress("unused")
-    fun onXrMenuClick(u: Float,v: Float) { ui.post { xrToolbar?.activate(u,v) } }
+    fun onXrMenuClick(u: Float,v: Float) { ui.post { menuClicksHandled++;xrToolbar?.activate(u,v) } }
 
     @Suppress("unused")
+    // Called on the XR render thread. No network traffic or allocations when disabled.
+    fun onXrTrackingEnabled(): Boolean = pcvrProbe || UuDirectSession.vrTrackingTarget()!=null
+    fun onXrTracking(bytes: ByteArray) {
+        if(pcvrProbe) pcvrProbeStats.accept(bytes) else UuDirectSession.vrTrackingTarget()?.vr?.frame(bytes)
+    }
+    private val inputDiagnostics=java.util.concurrent.ThreadPoolExecutor(1,1,0L,java.util.concurrent.TimeUnit.MILLISECONDS,
+        java.util.concurrent.ArrayBlockingQueue<Runnable>(1),java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy())
+    private var menuClicksHandled=0L
+    fun onXrInputDiagnostics(json: String) {
+        if(json.length>2048 || inputDiagnostics.isShutdown) return
+        runCatching {inputDiagnostics.execute {
+            runCatching {
+                val report=org.json.JSONObject(json).put("menuClicksHandled",menuClicksHandled)
+                val tmp=java.io.File(filesDir,"xr-input-diagnostics.tmp")
+                tmp.writeText(report.toString());tmp.renameTo(java.io.File(filesDir,"xr-input-diagnostics.json"))
+            }
+        }}
+    }
+    fun onXrMenuProbe(flags: Int,x: Float,y: Float,z: Float) {
+        if(pcvrPointerProbe) pointerProbeStats.menu(flags,x,y,z)
+    }
+    fun onXrPointerProbe(mask: Int,lx: Float,ly: Float,lz: Float,rx: Float,ry: Float,rz: Float) {
+        if(!pcvrPointerProbe) return
+        pointerProbeStats.accept(mask,floatArrayOf(lx,ly,lz,rx,ry,rz))
+        if(pointerProbeStats.samples%60==0L) {
+            val temporary=java.io.File(filesDir,"pointer-probe.json.tmp")
+            runCatching {temporary.writeText(pointerProbeStats.report().toString());check(temporary.renameTo(java.io.File(filesDir,"pointer-probe.json")))}
+        }
+    }
+    fun onXrStereoProbe(frames: Long,lw: Int,lh: Int,rw: Int,rh: Int,ipd: Float) {
+        if(!pcvrProbe) return
+        val report=pcvrProbeStats.report(frames,lw,lh,rw,rh,ipd)
+        val temporary=java.io.File(filesDir,"pcvr-probe.json.tmp")
+        runCatching {
+            temporary.writeText(report.toString());check(temporary.renameTo(java.io.File(filesDir,"pcvr-probe.json")))
+        }
+    }
+
     fun onXrFollowState(enabled: Boolean) { ui.post { xrFollowing=enabled;xrToolbar?.followState(enabled) } }
 
-    override fun onKeyDown(keyCode: Int,event: android.view.KeyEvent): Boolean {
-        if(this is XrActivity && keyCode==android.view.KeyEvent.KEYCODE_BUTTON_B) {
-            nativeSetFollowView(false);return true
+    private data class HoverFrame(val pane: Int,val u: Float,val v: Float,val down: Boolean)
+    private val hoverFrames=PicoLatestHover<HoverFrame>({task->ui.post {task()}},{event->
+        if(!isDestroyed && running.get()) {
+            xrWindowFrame?.pointer(event.pane,event.down)
+            xrToolbar?.hover(if(event.pane==6) event.u else -1f,if(event.pane==6) event.v else -1f,event.down)
         }
-        return super.onKeyDown(keyCode,event)
-    }
-
-    @Deprecated("Legacy headset back button compatibility")
-    override fun onBackPressed() {
-        if(this is XrActivity && xrFollowing) { nativeSetFollowView(false); return }
-        super.onBackPressed()
-    }
-
+    })
     @Suppress("unused")
-    fun onXrHover(index: Int, u: Float, v: Float, down: Boolean) {
-        ui.post { xrWindowFrame?.pointer(index,u,v,down,xrTouchMode); xrToolbar?.hover(if(index==6) u else -1f, if(index==6) v else -1f, down) }
-    }
+    fun onXrHover(index: Int,u: Float,v: Float,down: Boolean) {hoverFrames.offer(HoverFrame(index,u,v,down))}
 
     @Suppress("unused")
     fun onScroll(pane: Int,delta: Int) {
@@ -742,17 +923,20 @@ open class PicoActivity : Activity() {
 
     @Suppress("unused")
     fun onXrError(reason: String) {
+        if(pcvrProbe) runCatching {java.io.File(filesDir,"pcvr-probe-error.txt").writeText(reason.take(512))}
         message("OpenXR：$reason")
         ui.post { stopSession() }
     }
 
     private fun stopSession() {
+        hoverFrames.clear();remoteKeyboard?.hide();xrKeyboardTarget=null
         loginEpoch.incrementAndGet()
         joinGate.stop()
         xrExtraSessions.values.toList().forEach {it.close()}
         session?.close()
         session = null
         if (running.getAndSet(false)) nativeStop()
+        if(pcvrProbe) {nativeSetPcvrProbe(false);nativeSetPointerProbe(false)}
         message("会话已断开")
     }
 
@@ -772,6 +956,7 @@ open class PicoActivity : Activity() {
     override fun onResume() {super.onResume();UuDirectSession.setApplicationFocused(true)}
 
     override fun onPause() {
+        if(pendingTransferDocument==null) closeAppDirectories()
         UuDirectSession.setApplicationFocused(false)
         panelVideo?.releasePointer(); remoteKeyboard?.releaseKeys(); xrToolbar?.releaseKeyboardKeys(); session?.releaseInputs()
         if (::cameraPreview.isInitialized) cameraPreview.stop()
@@ -784,9 +969,11 @@ open class PicoActivity : Activity() {
     }
 
     override fun onDestroy() {
+        closeAppDirectories()
         stopSession()
         if (::cameraPreview.isInitialized) cameraPreview.stop()
         joinGate.destroy()
+        inputDiagnostics.shutdownNow()
         worker.shutdownNow()
         if (::api.isInitialized) api.close()
         super.onDestroy()

@@ -1,9 +1,9 @@
 package org.openuuyc.pico
 
-internal enum class PicoKeyboardMode { SYSTEM,CUSTOM,FULL }
+internal enum class PicoKeyboardMode { SYSTEM,CUSTOM,FULL,VOICE }
 internal object PicoKeyboardLayout {
     fun rows(mode: PicoKeyboardMode): List<List<String>> = when(mode) {
-        PicoKeyboardMode.SYSTEM -> emptyList()
+        PicoKeyboardMode.SYSTEM,PicoKeyboardMode.VOICE -> emptyList()
         PicoKeyboardMode.CUSTOM -> listOf("1 2 3 4 5 6 7 8 9 0", "Q W E R T Y U I O P", "A S D F G H J K L", "Shift Z X C V B N M Backspace", "Ctrl Alt Tab Space Enter ← ↓ ↑ →")
         PicoKeyboardMode.FULL -> listOf("Esc F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12", "1 2 3 4 5 6 7 8 9 0 - = Backspace", "Tab Q W E R T Y U I O P [ ]", "Caps A S D F G H J K L ; ' Enter", "Shift Z X C V B N M , . / Home End", "Ctrl Win Alt Space Insert Delete PgUp PgDn ← ↓ ↑ →", "Num Num/ Num* Num- Num7 Num8 Num9 Num+ Num4 Num5 Num6 Num1 Num2 Num3 Num0 Num.")
     }.map { it.split(' ') }

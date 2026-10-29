@@ -18,11 +18,12 @@ internal object PicoXrSelectionCanvas {
     }
     fun draw(c: Canvas,title: String,rows: List<Row>,u: Float,v: Float) {
         val p=Paint(Paint.ANTI_ALIAS_FLAG)
-        c.drawColor(Color.rgb(22,26,33));p.textSize=24f;p.color=Color.rgb(156,167,184);c.drawText(title,24f,31f,p)
+        PicoXrMaterial.panel(c,1200f,400f);PicoXrMaterial.label(c,title,24f,31f,1152f,24f,medium=true)
+        if(rows.isEmpty()) PicoXrMaterial.label(c,"暂无可用项，请点击刷新重试",32f,110f,1100f,25f,muted=true)
         val height=if(rows.size>8) 28f else 34f
         rows.forEachIndexed {i,row ->
             val y=48f+i*height;val hovered=hit(u,v,rows.size)==i
-            if(row.selected || hovered) {p.color=if(hovered) Color.rgb(34,53,78) else Color.rgb(32,39,49);c.drawRoundRect(RectF(16f,y,1184f,y+height-3),7f,7f,p)}
+            if(row.selected || hovered) PicoXrMaterial.control(c,RectF(16f,y,1184f,y+height-3),row.selected,hovered,enabled=row.online || row.selected)
             p.style=Paint.Style.STROKE;p.strokeWidth=2f;p.color=Color.rgb(75,136,235)
             c.drawRoundRect(RectF(31f,y+5,56f,y+height-10),3f,3f,p);p.style=Paint.Style.FILL
             p.textSize=23f;p.color=Color.rgb(231,235,242)
@@ -32,6 +33,6 @@ internal object PicoXrSelectionCanvas {
             c.drawText(status,1160f-p.measureText(status),y+height-10,p)
         }
         listOf("上一页","下一页","刷新","返回").forEachIndexed {i,label -> p.color=if(hit(u,v,rows.size)==i+8) Color.rgb(75,136,235) else Color.rgb(156,167,184);p.textSize=20f;c.drawText(label,i*300f+28,363f,p)}
-        p.color=if(v>=.92f) Color.rgb(75,136,235) else Color.rgb(128,138,152);c.drawRoundRect(RectF(400f,374f,800f,390f),8f,8f,p)
+        PicoXrMaterial.handle(c,1200f,400f,v>=.92f)
     }
 }

@@ -2,9 +2,13 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
     <application android:name="org.openuuyc.pico.spatial.OpenUuSpatialApplication"
         android:label="OpenUUYC Spatial Preview" android:icon="@drawable/openuuyc_brand"
         android:theme="@style/OpenUuSpatialTheme" android:allowBackup="false" android:usesCleartextTraffic="false">
+        <service android:name="org.openuuyc.pico.uu.host.UuHostCaptureService" android:exported="false" android:foregroundServiceType="mediaProjection"/>
+        <activity android:name="org.openuuyc.pico.uu.host.UuHostCaptureActivity" android:exported="false"/>
         <activity android:name="org.openuuyc.pico.uu.UuMicrophonePermissionActivity" android:exported="false" android:theme="@android:style/Theme.Translucent.NoTitleBar"/>
         <activity android:name="org.openuuyc.pico.spatial.OpenUuSpatialLaunchActivity" android:exported="true">
             <intent-filter>

@@ -18,7 +18,7 @@ import android.widget.*
 import org.openuuyc.pico.uu.UuDevice
 import org.openuuyc.pico.PicoTheme as T
 
-/** Linux control-center layout adapted to a resizable PICO Android panel. */
+/** Responsive Android control center; XR remains an explicit separate action. */
 internal class PicoLoginView(
     context: Context,
     private val onLogin: () -> Unit,
@@ -31,7 +31,12 @@ internal class PicoLoginView(
     private val onConnect: (UuDevice) -> Unit,
     private val onRestore: (() -> Unit)? = null,
     private val onImmersiveConnect: ((UuDevice) -> Unit)? = null,
-    private val onSmsLogin: (() -> Unit)? = null
+    private val onSmsLogin: (() -> Unit)? = null,
+    private val onQuickApps: (() -> Unit)? = null,
+    private val loadDeviceApps: ((UuDevice, Boolean, (List<org.openuuyc.pico.uu.UuQuickApps.App>?,String?)->Unit)->Unit)? = null,
+    private val launchDeviceApp: ((UuDevice,org.openuuyc.pico.uu.UuQuickApps.App)->Unit)? = null,
+    private val closeDeviceApps: (() -> Unit)? = null,
+    private val onDeviceFiles: ((UuDevice)->Unit)? = null
 ) : FrameLayout(context) {
     private val state = PicoPanelState()
     private var restoreRetry = false
@@ -94,6 +99,11 @@ internal class PicoLoginView(
     private val loginDivider = divider(true)
     private val center = row()
     private val sidebar = column()
+    private val sidebarDivider = divider(true)
+    private val accountButton = button("账号") {
+        android.app.AlertDialog.Builder(context).setTitle(accountLabel.text).setMessage("登录状态保存在本机；退出登录会清除本机保存的账号凭据。")
+            .setNegativeButton("返回",null).setPositiveButton("退出登录") {_,_-> onLogout()}.show()
+    }
     private val navigation = column()
     private val accountLabel = label("已登录", 14f)
     private val main = column()
@@ -171,11 +181,11 @@ internal class PicoLoginView(
         sidebar.addView(label("●  PICO 客户端", 11f, T.GREEN)); sidebar.gap(12)
         sidebar.addView(button("退出登录", action = onLogout), LinearLayout.LayoutParams(-1, dp(44)))
         center.addView(sidebar, LinearLayout.LayoutParams(dp(T.SIDEBAR_WIDTH), -1))
-        center.addView(divider(true))
+        center.addView(sidebarDivider)
         main.setPadding(dp(28), dp(24), dp(28), dp(20))
         val heading = row()
         heading.addView(pageTitle, LinearLayout.LayoutParams(0, -2, 1f))
-        heading.addView(label("PICO / OPENXR", 12f, T.MUTED))
+        heading.addView(accountButton,LinearLayout.LayoutParams(-2,dp(44)))
         main.addView(heading); main.gap(8)
         main.addView(centerStatus); main.gap(22)
         main.addView(pageBody, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -183,7 +193,9 @@ internal class PicoLoginView(
 
         val tools = row()
         tools.addView(search, LinearLayout.LayoutParams(0, dp(44), 1f))
-        tools.addView(button("刷新", action = onRefresh), LinearLayout.LayoutParams(-2, dp(44)).apply { marginStart = dp(12) })
+        tools.addView(button("清除") {search.setText("")},LinearLayout.LayoutParams(-2,dp(44)).apply {marginStart=dp(8)})
+        onQuickApps?.let { launch -> tools.addView(button("游戏 / 应用", action = launch), LinearLayout.LayoutParams(-2, dp(44)).apply { marginStart = dp(8) }) }
+        tools.addView(button("刷新设备", action = onRefresh), LinearLayout.LayoutParams(-2, dp(44)).apply { marginStart = dp(12) })
         devicePage.addView(tools); devicePage.gap(14)
         devicePage.addView(HorizontalScrollView(context).apply { isHorizontalScrollBarEnabled = false; isFillViewport = true; addView(filterBar) }); devicePage.gap(12)
         devicePage.addView(countLabel); devicePage.gap(14)
@@ -196,6 +208,10 @@ internal class PicoLoginView(
             override fun afterTextChanged(s: Editable?) {}
         })
 
+        settingsPage.addView(label("作为被控端",16f,bold=true));settingsPage.gap(12)
+        settingsPage.addView(label("开发中 · 尚未接通 UU 被控信令，不会将本机标记为在线可控。",13f,T.MUTED))
+        settingsPage.addView(button("屏幕捕获授权与停止") {context.startActivity(android.content.Intent(context,org.openuuyc.pico.uu.host.UuHostCaptureActivity::class.java))},LinearLayout.LayoutParams(-1,dp(48)))
+        settingsPage.gap(24)
         settingsPage.addView(label("显示与环境", 16f, bold = true)); settingsPage.gap(14)
         val passthrough = Switch(context).apply {
             text = "现实透视背景：" + if (passthroughEnabled) "开启" else "关闭"; textSize = 14f; setTextColor(T.TEXT); isChecked = passthroughEnabled
@@ -227,11 +243,11 @@ internal class PicoLoginView(
         for ((page, title) in listOf(PicoPanelState.Page.DEVICES to "我的设备", PicoPanelState.Page.SETTINGS to "连接设置", PicoPanelState.Page.ABOUT to "关于")) {
             val active = state.page == page
             navigation.addView(button(title) { selectPage(page) }.apply {
-                gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                gravity = if(currentWidth<600) Gravity.CENTER else Gravity.CENTER_VERTICAL or Gravity.START
                 background = box(if (active) T.SELECTED else T.SIDEBAR, T.CONTROL_RADIUS)
                 setTextColor(if (active) T.TEXT else T.MUTED)
                 contentDescription = title
-            }, LinearLayout.LayoutParams(-1, dp(44)).apply { bottomMargin = dp(6) })
+            }, if(currentWidth<600) LinearLayout.LayoutParams(0,dp(56),1f) else LinearLayout.LayoutParams(-1, dp(44)).apply { bottomMargin = dp(6) })
         }
     }
 
@@ -265,7 +281,13 @@ internal class PicoLoginView(
         }, LinearLayout.LayoutParams(-2, dp(44)))
     }
 
+    private var selectedDeviceId: String? = null
+    private var appLoadGeneration=0
     private fun renderDevices() {
+        selectedDeviceId?.let {id ->
+            state.devices.firstOrNull {it.id==id}?.let {renderDevicePage(it);return}
+            selectedDeviceId=null
+        }
         val visible = state.visibleDevices()
         countLabel.text = "${visible.size} 台设备  ·  ${state.devices.count { it.online }} 台在线"
         deviceGrid.removeAllViews()
@@ -278,42 +300,123 @@ internal class PicoLoginView(
             empty.gap(10); empty.addView(label("检查电脑是否已登录同一个 UU 账号，或调整搜索条件。", 13f, T.MUTED))
             deviceGrid.addView(empty, LinearLayout.LayoutParams(-1, -2)); return
         }
-        val columns = if (currentWidth >= 980) 2 else 1
-        for (group in visible.chunked(columns)) {
-            val line = row().apply { gravity = Gravity.TOP }
-            for ((index, device) in group.withIndex()) {
-                line.addView(deviceCard(device), LinearLayout.LayoutParams(0, -2, 1f).apply {
-                    if (index > 0) marginStart = dp(14)
-                })
-            }
-            if (group.size < columns) line.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f).apply { marginStart = dp(14) })
-            deviceGrid.addView(line, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(14) })
+        for(device in visible) {
+            deviceGrid.addView(deviceCard(device),LinearLayout.LayoutParams(-1,-2).apply {bottomMargin=dp(14)})
         }
     }
 
-    private fun deviceCard(device: UuDevice) = column().apply {
-        setPadding(dp(18), dp(18), dp(18), dp(16)); background = box(T.SURFACE, stroke = T.LINE)
-        val header = row()
-        header.addView(MonitorGlyph(context), LinearLayout.LayoutParams(dp(34), dp(34)))
-        header.addView(label(device.alias, 16f, bold = true).apply {
-            maxLines = 1; ellipsize = TextUtils.TruncateAt.END
-        }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(12) })
-        addView(header); gap(14)
-        val reason = when { !device.online -> "离线"; device.occupants > 0 -> "已占用"; !device.controllable -> "未允许控制"; else -> "在线 · 可连接" }
-        addView(label("●  $reason", 13f, if (!device.online) T.MUTED else if (!PicoPanelState.canConnect(device)) T.AMBER else T.GREEN)); gap(18)
-        val actions = row()
-        actions.addView(button(if (device.occupants > 0) "抢占连接" else "远程连接", true) { if (device.online && device.controllable) onConnect(device) }.apply {
-            isEnabled = device.online && device.controllable
-            contentDescription = "连接 ${device.alias}，$reason"
-        }, LinearLayout.LayoutParams(0, dp(44), 1f))
-        onImmersiveConnect?.let { immersive ->
-            actions.addView(button("沉浸式连接") { if (device.online && device.controllable) immersive(device) }.apply {
-                isEnabled = device.online && device.controllable
-                contentDescription = "沉浸式连接 ${device.alias}，$reason"
-            }, LinearLayout.LayoutParams(-2, dp(44)).apply { marginStart = dp(8) })
+    private fun deviceCard(device: UuDevice) = LinearLayout(context).apply {
+        val wide=currentWidth>=950
+        orientation=if(wide) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        gravity=Gravity.CENTER_VERTICAL;setPadding(dp(16),dp(16),dp(16),dp(16))
+        background=android.graphics.drawable.StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_pressed),box(T.SELECTED,12,T.ACCENT))
+            addState(intArrayOf(android.R.attr.state_focused),box(T.SELECTED,12,T.ACCENT))
+            addState(intArrayOf(),box(T.SURFACE,12,T.LINE))
         }
-        addView(actions)
+        val identity=row()
+        val preview=FrameLayout(context).apply {
+            background=GradientDrawable(GradientDrawable.Orientation.TL_BR,intArrayOf(0xff315d88.toInt(),0xff142944.toInt(),T.BG)).apply {cornerRadius=dp(10).toFloat()}
+            addView(MonitorGlyph(context),FrameLayout.LayoutParams(dp(44),dp(44),Gravity.CENTER))
+            contentDescription="远程设备"
+        }
+        identity.addView(preview,LinearLayout.LayoutParams(if(wide) dp(112) else dp(72),if(wide) dp(72) else dp(60)))
+        val titles=column().apply {setPadding(dp(18),0,dp(12),0)}
+        titles.addView(label(device.alias,18f,bold=true).apply {maxLines=1;ellipsize=TextUtils.TruncateAt.END})
+        titles.gap(7);titles.addView(label("ID  ${device.id}",12f,T.MUTED).apply {maxLines=1;ellipsize=TextUtils.TruncateAt.END})
+        identity.addView(titles,LinearLayout.LayoutParams(0,-2,1f))
+        addView(identity,if(wide) LinearLayout.LayoutParams(0,-2,1f) else LinearLayout.LayoutParams(-1,-2))
+        val controls=row().apply {gravity=Gravity.CENTER_VERTICAL}
+        val reason=when {!device.online->"离线";!device.controllable->"未允许控制";device.occupants>0->"已占用";else->"在线"}
+        controls.addView(label("● $reason",13f,if(!device.online) T.MUTED else if(!device.controllable || device.occupants>0) T.AMBER else T.GREEN).apply {
+            setPadding(dp(12),dp(8),dp(12),dp(8));background=box(if(device.online) T.SELECTED else T.BG,8)
+        },LinearLayout.LayoutParams(if(wide) dp(112) else 0,-2,if(wide) 0f else 1f).apply {marginEnd=dp(14)})
+        controls.addView(button(if(device.occupants>0) "抢占连接" else "连接") {onConnect(device)}.apply {
+            isEnabled=device.online && device.controllable;contentDescription="普通连接 ${device.alias}"
+        },LinearLayout.LayoutParams(-2,dp(46)).apply {marginEnd=dp(10)})
+        onImmersiveConnect?.let {connect->controls.addView(button("沉浸式连接",true) {connect(device)}.apply {
+            isEnabled=device.online && device.controllable;contentDescription="沉浸式连接 ${device.alias}"
+        },LinearLayout.LayoutParams(-2,dp(46)))}
+        addView(controls,LinearLayout.LayoutParams(if(wide) -2 else -1,-2).apply {if(!wide) topMargin=dp(14)})
+        isClickable=true;isFocusable=true
+        contentDescription="打开 ${device.alias} 的设备菜单"
+        setOnClickListener {selectedDeviceId=device.id;renderDevicePage(device)}
+        identity.setOnClickListener {selectedDeviceId=device.id;renderDevicePage(device)}
+    }
 
+    private fun renderDevicePage(device: UuDevice) {
+        val generation=++appLoadGeneration
+        deviceGrid.removeAllViews()
+        countLabel.text="${device.alias} · 设备菜单"
+        val page=column().apply {setPadding(dp(18),dp(18),dp(18),dp(18));background=box(T.SURFACE,stroke=T.LINE)}
+        deviceGrid.addView(page,LinearLayout.LayoutParams(-1,-2))
+        page.addView(button("‹ 返回设备列表") {closeDeviceApps?.invoke();selectedDeviceId=null;++appLoadGeneration;renderDevices()})
+        page.gap(16)
+        val wide=currentWidth>=850
+        val hero=LinearLayout(context).apply {
+            orientation=if(wide) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+            gravity=Gravity.CENTER_VERTICAL;setPadding(dp(22),dp(22),dp(22),dp(22))
+            background=box(T.BG,18,T.LINE)
+        }
+        val identity=row()
+        identity.addView(MonitorGlyph(context).apply {setPadding(dp(14),dp(14),dp(14),dp(14));background=box(T.SURFACE,12,T.LINE)},LinearLayout.LayoutParams(dp(82),dp(82)))
+        val titles=column().apply {setPadding(dp(18),0,dp(12),0)}
+        titles.addView(label(device.alias,26f,bold=true))
+        titles.gap(8);titles.addView(label("● ${if(device.online) "在线" else "离线"}",14f,if(device.online) T.GREEN else T.MUTED))
+        titles.gap(8);titles.addView(label("设备 ID：${device.id}",12f,T.MUTED))
+        identity.addView(titles,LinearLayout.LayoutParams(0,-2,1f))
+        hero.addView(identity,if(wide) LinearLayout.LayoutParams(0,-2,1f) else LinearLayout.LayoutParams(-1,-2))
+        hero.addView(button(if(device.occupants>0) "抢占连接" else "连接设备",true) {onConnect(device)}.apply {isEnabled=device.online && device.controllable},LinearLayout.LayoutParams(if(wide) dp(160) else -1,dp(48)).apply {if(!wide) topMargin=dp(16)})
+        page.addView(hero);page.gap(14)
+        val actions=row()
+        onImmersiveConnect?.let {connect ->actions.addView(button("沉浸式连接") {connect(device)}.apply {isEnabled=device.online && device.controllable},LinearLayout.LayoutParams(0,dp(46),1f))}
+        onDeviceFiles?.let {open ->actions.addView(button("文件管理") {open(device)}.apply {isEnabled=device.online && device.controllable},LinearLayout.LayoutParams(0,dp(46),1f).apply {marginStart=dp(10)})}
+        actions.addView(button("刷新设备") {onRefresh()},LinearLayout.LayoutParams(0,dp(46),1f).apply {marginStart=dp(10)})
+        page.addView(actions);page.gap(22)
+        val details=LinearLayout(context).apply {orientation=if(wide) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL}
+        fun infoBlock(title: String,entries: List<Pair<String,String>>): LinearLayout = column().apply {
+            setPadding(dp(12),dp(10),dp(12),dp(10));addView(label(title,18f,bold=true));gap(14)
+            entries.forEach {(key,value)->
+                addView(row().apply {
+                    setPadding(0,dp(12),0,dp(12));addView(label(key,14f,T.MUTED),LinearLayout.LayoutParams(0,-2,1f))
+                    addView(label(value,14f).apply {maxLines=2;ellipsize=TextUtils.TruncateAt.END},LinearLayout.LayoutParams(0,-2,1.3f))
+                });addView(divider())
+            }
+        }
+        val hardware=infoBlock("硬件信息",listOf("主板" to "未提供","处理器" to "未提供","内存" to "未提供","显卡" to "未提供"))
+        val metadata=infoBlock("设备信息",listOf("设备 ID" to device.id,"连接权限" to if(device.controllable) "允许控制" else "未允许控制","当前连接" to device.occupants.toString(),"客户端版本" to "未提供"))
+        for(block in listOf(hardware,metadata)) details.addView(block,if(wide) LinearLayout.LayoutParams(0,-2,1f) else LinearLayout.LayoutParams(-1,-2))
+        page.addView(details);page.gap(20);page.addView(divider());page.gap(18)
+        page.addView(label("应用与游戏",18f,bold=true))
+        val list=column();val info=label("正在读取该设备的应用…",13f,T.MUTED)
+        page.addView(info);page.addView(list)
+        var available=emptyList<org.openuuyc.pico.uu.UuQuickApps.App>()
+        val prefs=context.getSharedPreferences("device_quick_apps",Context.MODE_PRIVATE)
+        val key="apps_${device.id}"
+        fun renderApps() {
+            list.removeAllViews()
+            val pinned=prefs.getStringSet(key,emptySet()).orEmpty()
+            available.sortedWith(compareByDescending<org.openuuyc.pico.uu.UuQuickApps.App> {it.name.startsWith("VRChat",true)}.thenByDescending {it.vr}.thenByDescending {it.id in pinned}.thenBy {it.name.lowercase()}).forEach {app ->
+                list.addView(button((if(app.id in pinned) "★ " else "")+app.name) {launchDeviceApp?.invoke(device,app)}.apply {isEnabled=app.enabled})
+            }
+        }
+        page.gap(10)
+        page.addView(button("＋ 添加应用") {
+            if(available.isEmpty()) {loadDeviceApps?.invoke(device,true) {_,error->post {if(selectedDeviceId==device.id) {if(error!=null) info.text=error else renderDevicePage(device)}}};return@button}
+            android.app.AlertDialog.Builder(context).setTitle("添加到 ${device.alias} 的快捷应用")
+                .setItems(available.map {it.name}.toTypedArray()) {_,index ->
+                    val pinned=prefs.getStringSet(key,emptySet()).orEmpty().toMutableSet()
+                    pinned.add(available[index].id);prefs.edit().putStringSet(key,pinned).apply();renderApps()
+                }.setNegativeButton("取消",null).show()
+        })
+        page.addView(button("连接 / 刷新应用目录") {loadDeviceApps?.invoke(device,true) {_,error->post {if(selectedDeviceId==device.id) {if(error!=null) info.text=error else renderDevicePage(device)}}}})
+        val loader=loadDeviceApps
+        if(loader==null) info.text="应用目录暂不可用"
+        else loader(device,false) {apps,error ->post {
+            if(generation!=appLoadGeneration || selectedDeviceId!=device.id) return@post
+            available=apps.orEmpty();info.text=error ?: if(available.isEmpty()) "该设备未提供可启动应用" else "${available.size} 个可用应用 · VR 游戏优先"
+            renderApps()
+        }}
     }
 
     fun showQr(bitmap: Bitmap) { qrImage.setImageBitmap(bitmap); qrImage.visibility = VISIBLE; qrPlaceholder.visibility = GONE }
@@ -345,6 +448,24 @@ internal class PicoLoginView(
     }
     fun reflow(widthDp: Int) {
         currentWidth = widthDp
+        val mobile=widthDp<600
+        (navigation.parent as? ViewGroup)?.removeView(navigation)
+        center.removeAllViews()
+        center.orientation=if(mobile) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+        center.gravity=Gravity.NO_GRAVITY
+        navigation.orientation=if(mobile) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        accountButton.visibility=if(mobile) VISIBLE else GONE
+        main.setPadding(dp(if(mobile) 16 else 28),dp(if(mobile) 12 else 24),dp(if(mobile) 16 else 28),dp(if(mobile) 8 else 20))
+        if(mobile) {
+            center.addView(main,LinearLayout.LayoutParams(-1,0,1f))
+            navigation.setBackgroundColor(T.SIDEBAR)
+            center.addView(navigation,LinearLayout.LayoutParams(-1,dp(60)))
+        } else {
+            sidebar.addView(navigation,2)
+            center.addView(sidebar,LinearLayout.LayoutParams(dp(T.SIDEBAR_WIDTH),-1))
+            center.addView(sidebarDivider,LinearLayout.LayoutParams(dp(1),-1))
+            center.addView(main,LinearLayout.LayoutParams(0,-1,1f))
+        }
         val narrow = widthDp < 720
         loginCard.layoutParams = LinearLayout.LayoutParams(dp(minOf(800, (widthDp - 48).coerceAtLeast(260))), -2)
         loginColumns.orientation = if (narrow) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL

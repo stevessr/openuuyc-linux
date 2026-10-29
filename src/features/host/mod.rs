@@ -22,6 +22,7 @@ pub(crate) mod parameters;
 pub(crate) mod peer;
 pub(crate) mod power;
 mod protection;
+pub(crate) mod quick_apps;
 mod settings;
 pub(crate) mod terminal;
 mod track;

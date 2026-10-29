@@ -197,8 +197,11 @@ impl Transmitter {
                 continue;
             };
             if !source.current(frame.generation)
-                || frame.created.elapsed() > Duration::from_millis(100)
+                || frame.created.elapsed() > Duration::from_millis(40)
             {
+                // A stale capture must not leave an older partial Opus packet behind.
+                pcm.clear();
+                marker = true;
                 continue;
             }
             let next_encoding = source.encoding();
@@ -256,6 +259,12 @@ impl Transmitter {
             if pcm.len() < RATE as usize * config.packet_ms as usize / 1000 * channels {
                 continue;
             }
+            // Allow the negotiated packetization interval, but no extra stale backlog.
+            if first_capture.elapsed() > Duration::from_millis(u64::from(config.packet_ms) + 40) {
+                pcm.clear();
+                marker = true;
+                continue;
+            }
             let loss = self.loss.load(Ordering::Relaxed).min(100) as u8;
             let encoded = encoder
                 .set_packet_loss(loss)
@@ -303,32 +312,46 @@ impl Transmitter {
                     wall_clock.1 + wall_clock.0.elapsed(),
                 )),
             ];
-            match track.write_rtp_with_extensions(&packet, &extensions).await {
-                Ok(n) if n > 0 => {
-                    self.sent.fetch_add(1, Ordering::Relaxed);
-                    self.octets.fetch_add(length as u64, Ordering::Relaxed);
-                    let mut clock = lock(&self.sent_clock);
-                    let now = Instant::now();
-                    let first = clock
-                        .filter(|c| c.generation == generation)
-                        .map_or(now, |c| c.first);
-                    *clock = Some(SentClock {
-                        timestamp: packet.header.timestamp,
-                        at: first_capture,
-                        generation,
-                        first,
-                    });
-                    drop(clock);
-                    source.report_wake().notify_one();
-                    marker = false;
-                }
-                Ok(_) => marker = true,
-                Err(e) => {
-                    source.send_error(format!("音频发送失败：{e}"));
+            if first_capture.elapsed() > Duration::from_millis(u64::from(config.packet_ms) + 40) {
+                marker = true;
+                continue;
+            }
+            let write = tokio::time::timeout(
+                Duration::from_millis(25),
+                track.write_rtp_with_extensions(&packet, &extensions),
+            )
+            .await;
+            match write {
+                Err(_) => {
                     marker = true;
                 }
+                Ok(result) => match result {
+                    Ok(n) if n > 0 => {
+                        self.sent.fetch_add(1, Ordering::Relaxed);
+                        self.octets.fetch_add(length as u64, Ordering::Relaxed);
+                        let mut clock = lock(&self.sent_clock);
+                        let now = Instant::now();
+                        let first = clock
+                            .filter(|c| c.generation == generation)
+                            .map_or(now, |c| c.first);
+                        *clock = Some(SentClock {
+                            timestamp: packet.header.timestamp,
+                            at: first_capture,
+                            generation,
+                            first,
+                        });
+                        drop(clock);
+                        source.report_wake().notify_one();
+                        marker = false;
+                    }
+                    Ok(_) => marker = true,
+                    Err(e) => {
+                        source.send_error(format!("音频发送失败：{e}"));
+                        marker = true;
+                    }
+                },
             }
-            // A failed write may already have encrypted/submitted the packet.
+            // A failed/timed-out write may already have encrypted/submitted the packet.
             // Never reuse its SRTP sequence number on a later payload.
             sequence = sequence.wrapping_add(1);
         }

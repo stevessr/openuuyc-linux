@@ -15,6 +15,8 @@ use std::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+const MAX_QUEUED_BLOCKS:usize=4; // 10ms capture blocks, bounded 40ms backlog
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DefaultDevices {
@@ -121,7 +123,9 @@ impl Audio {
             media_allowed: AtomicBool::new(true),
             recover: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
-            frames: ArrayQueue::new(10),
+            // Loopback produces 10ms blocks. Retain at most 40ms, not 100ms
+            // of stale desktop sound when transport/encoding briefly stalls.
+            frames: ArrayQueue::new(MAX_QUEUED_BLOCKS),
             wake: Notify::new(),
             report_wake: Notify::new(),
             transmitter: Transmitter::default(),
@@ -496,5 +500,16 @@ impl Retry {
         let delay = [100, 250, 500, 1000][self.failures.min(3) as usize];
         self.failures = self.failures.saturating_add(1);
         self.at = now + Duration::from_millis(delay);
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    #[test]
+    fn overloaded_loopback_retains_only_recent_four_blocks() {
+        let queue=crossbeam_queue::ArrayQueue::new(super::MAX_QUEUED_BLOCKS);
+        for block in 0..10 {queue.force_push(block);}
+        let mut retained=Vec::new();while let Some(block)=queue.pop(){retained.push(block);}
+        assert_eq!(retained,vec![6,7,8,9]);
     }
 }

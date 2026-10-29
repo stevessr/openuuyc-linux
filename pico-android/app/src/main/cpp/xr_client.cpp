@@ -2,11 +2,17 @@
 // up to three independent world-space quads can display separate UU RTP
 // tracks, with each Android decoder producing into its own Surface.
 #include <jni.h>
+#include "pcvr_protocol.h"
+#include "pcvr_projection_probe.h"
+#include "xr_environment.h"
 #include "xr_surface_callback.h"
 #include "xr_panel_geometry.h"
 #include "xr_pose_math.h"
 #include "xr_pointer_feedback.h"
+#include "xr_frame_hit.h"
 #include "xr_video_resolution.h"
+#include "xr_menu_anchor.h"
+#include "xr_controller_menu.h"
 #include "xr_panel_depth.h"
 #include "xr_menu_click.h"
 #include "xr_grip_hold.h"
@@ -23,6 +29,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <vector>
 #include <string>
 #include <thread>
@@ -31,15 +38,22 @@
 #include <initializer_list>
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "OpenUUYC-PICO", __VA_ARGS__)
+static std::mutex environment_mutex;
+static XrEnvironmentSettings environment_settings;
 static std::atomic<bool> stop_requested{false};
+static std::atomic<bool> pcvr_probe_requested{false};
+static std::atomic<bool> pointer_probe_requested{false};
 static std::atomic<uint32_t> window_visible_mask{1u};
 static std::atomic<bool> passthrough_requested{true};
 static std::atomic<bool> layout_reset{false};
 static std::atomic<float> panel_aspects[6]{{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f}};
 static PanelGeometry panels[6] = {{0.f,0.f,1.65f},{-1.55f,0.f,1.25f},{1.55f,0.f,1.25f},{0.f,1.3f,1.25f},{-1.55f,1.3f,1.25f},{1.55f,1.3f,1.25f}};
 static bool toolbar_available = false;
-static PanelGeometry menu_panel{0.f,-.82f,1.65f};
+static PanelGeometry menu_panel=default_menu_panel();
 static std::atomic<bool> menu_portrait{false};
+static std::atomic<int> controller_menu_layout{0}; // root, landscape page, portrait page, collapsed
+static std::atomic<int> controller_menu_hand{0};
+static bool controller_menu_available=false;
 static bool menu_grab=false;
 static bool menu_grip=false;
 static std::atomic<int> menu_host{-1};
@@ -75,12 +89,18 @@ static bool panel_ray(const XrPosef &aim, const PanelGeometry &p, float &x, floa
 
 
 
+static std::atomic<bool> focus_dots_enabled{false};
+static int controller_debug_mask=0;
+static int diagnostic_selected=-1,diagnostic_target[2]{-1,-1};
+static uint64_t diagnostic_menu_clicks=0;
 static bool ray_visible[2]={false,false};
+static bool ray_line_visible[2]={false,false};
 static XrPosef ray_poses[2]{};
 static XrPosef focus_poses[2]{};
 static float ray_lengths[2]={2,2};
 static bool focus_pressed[2]={false,false};
 static int preferred_hand=1;
+static XrPointerMotion pointer_motion[2];
 static void update_free_ray(int hand,const XrPosef &aim,const XrPosef &eye,float distance=2.f) {
     const auto d=rotate_vector(aim.orientation,{0.f,0.f,-1.f});
     const auto b=ray_basis({d.x,d.y,d.z},{eye.position.x-aim.position.x,eye.position.y-aim.position.y,eye.position.z-aim.position.z});
@@ -179,10 +199,10 @@ static XrPath path(XrInstance instance, const char *name) {
 struct Actions {
     XrActionSet set = XR_NULL_HANDLE;
     XrAction aim = XR_NULL_HANDLE;
+    XrAction tracked_grip = XR_NULL_HANDLE;
+    XrSpace tracked_hands[2] = {XR_NULL_HANDLE,XR_NULL_HANDLE};
     XrAction click = XR_NULL_HANDLE;
     XrAction grip = XR_NULL_HANDLE;
-    XrAction cancel_follow = XR_NULL_HANDLE;
-    XrAction toggle_follow = XR_NULL_HANDLE;
     XrAction scroll = XR_NULL_HANDLE;
     XrActionSpaceCreateInfo unused{}; // non-owning action reference
     XrSpace hands[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
@@ -203,6 +223,9 @@ struct Actions {
         info.countSubactionPaths = 2;
         info.subactionPaths = hand_paths;
         if (!xr_ok(xrCreateAction(set, &info, &aim), "create aim action")) return false;
+        std::strcpy(info.actionName,"tracked_grip");
+        std::strcpy(info.localizedActionName,"PCVR controller grip pose");
+        if(!xr_ok(xrCreateAction(set,&info,&tracked_grip),"create tracked grip action")) return false;
         info.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
         std::strcpy(info.actionName, "click");
         std::strcpy(info.localizedActionName, "Trigger click");
@@ -210,12 +233,6 @@ struct Actions {
         std::strcpy(info.actionName,"window_grip");
         std::strcpy(info.localizedActionName,"Hold inner grip to move window");
         if(!xr_ok(xrCreateAction(set,&info,&grip),"create grip action")) return false;
-        std::strcpy(info.actionName,"cancel_follow");
-        std::strcpy(info.localizedActionName,"B stop following");
-        if(!xr_ok(xrCreateAction(set,&info,&cancel_follow),"create B action")) return false;
-        std::strcpy(info.actionName,"toggle_follow");
-        std::strcpy(info.localizedActionName,"A toggle camera follow");
-        if(!xr_ok(xrCreateAction(set,&info,&toggle_follow),"create A action")) return false;
         info.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
         std::strcpy(info.actionName, "scroll_y");
         std::strcpy(info.localizedActionName, "Remote mouse scroll");
@@ -236,24 +253,21 @@ struct Actions {
                 {aim, path(instance, "/user/hand/right/input/aim/pose")},
                 {click, path(instance, simple ? "/user/hand/left/input/select/click" : "/user/hand/left/input/trigger/click")},
                 {click, path(instance, simple ? "/user/hand/right/input/select/click" : "/user/hand/right/input/trigger/click")},
+                {tracked_grip,path(instance,"/user/hand/left/input/grip/pose")},
+                {tracked_grip,path(instance,"/user/hand/right/input/grip/pose")},
                 {scroll, path(instance, "/user/hand/left/input/thumbstick/y")},
                 {scroll, path(instance, "/user/hand/right/input/thumbstick/y")},
                 {grip,path(instance,"/user/hand/left/input/squeeze/click")},
-                {grip,path(instance,"/user/hand/right/input/squeeze/click")},
-                {cancel_follow,path(instance,"/user/hand/right/input/b/click")},
-                {toggle_follow,path(instance,"/user/hand/right/input/a/click")}
+                {grip,path(instance,"/user/hand/right/input/squeeze/click")}
             };
             XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggested.interactionProfile = path(instance, profile);
             suggested.suggestedBindings = bindings;
-            suggested.countSuggestedBindings = simple ? 4 : 10;
+            suggested.countSuggestedBindings = simple ? 6 : 10;
             if (suggested.interactionProfile != XR_NULL_PATH) {
                 const auto result=xrSuggestInteractionProfileBindings(instance,&suggested);
-                if(XR_FAILED(result) && !simple) {
-                    LOGE("PICO profile A/B binding unavailable (%d); retaining pointer bindings",int(result));
-                    suggested.countSuggestedBindings=8;
-                    xrSuggestInteractionProfileBindings(instance,&suggested);
-                }
+                LOGE("Controller binding %s: %d",profile,int(result));
+
             }
         }
         XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
@@ -266,15 +280,68 @@ struct Actions {
             space.subactionPath = hand_paths[i];
             space.poseInActionSpace = identity_pose();
             if (!xr_ok(xrCreateActionSpace(session, &space, &hands[i]), "controller aim space")) return false;
+            space.action=tracked_grip;
+            if(!xr_ok(xrCreateActionSpace(session,&space,&tracked_hands[i]),"controller tracked grip space")) return false;
         }
         return true;
     }
 
     void destroy() {
+        for(auto hand:tracked_hands) if(hand!=XR_NULL_HANDLE) xrDestroySpace(hand);
         for (auto hand : hands) if (hand != XR_NULL_HANDLE) xrDestroySpace(hand);
         if (set != XR_NULL_HANDLE) xrDestroyActionSet(set);
     }
 };
+
+static void emit_pcvr_tracking(JNIEnv* env,jobject activity,jmethodID enabled,jmethodID callback,
+                               XrSession session,XrSpace world,XrSpace view,Actions& actions,XrTime time,bool focused) {
+    if(!env->CallBooleanMethod(activity,enabled)) return;
+    static uint64_t sequence=0;
+    OuvrFrame frame{};std::memcpy(frame.magic,"OUVR",4);frame.version=1;frame.sequence=++sequence;
+    frame.xr_time=static_cast<uint64_t>(time);
+    frame.sample_time=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    for(int i=0;i<3;++i) {
+        auto& out=frame.devices[i];
+        if(!focused) continue;
+        if(i>0) {
+            XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};
+            query.action=actions.tracked_grip;query.subactionPath=actions.hand_paths[i-1];
+            XrActionStatePose pose{XR_TYPE_ACTION_STATE_POSE};
+            if(XR_FAILED(xrGetActionStatePose(session,&query,&pose)) || !pose.isActive) continue;
+            for(int button=0;button<2;++button) {
+                query.action=button?actions.grip:actions.click;
+                XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+                if(XR_SUCCEEDED(xrGetActionStateBoolean(session,&query,&state)) && state.isActive && state.currentState)
+                    out.buttons|=1u<<button;
+            }
+        }
+        XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
+        XrSpaceLocation location{XR_TYPE_SPACE_LOCATION,&velocity};
+        if(XR_FAILED(xrLocateSpace(i==0?view:actions.tracked_hands[i-1],world,time,&location))) continue;
+        if(location.locationFlags&XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) {
+            out.flags|=1;const auto& q=location.pose.orientation;
+            out.orientation[0]=q.x;out.orientation[1]=q.y;out.orientation[2]=q.z;out.orientation[3]=q.w;
+        }
+        if(location.locationFlags&XR_SPACE_LOCATION_POSITION_VALID_BIT) {
+            out.flags|=2;const auto& p=location.pose.position;
+            out.position[0]=p.x;out.position[1]=p.y;out.position[2]=p.z;
+        }
+        if(velocity.velocityFlags&XR_SPACE_VELOCITY_LINEAR_VALID_BIT) {
+            out.flags|=4;const auto& v=velocity.linearVelocity;
+            out.linear[0]=v.x;out.linear[1]=v.y;out.linear[2]=v.z;
+        }
+        if(velocity.velocityFlags&XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) {
+            out.flags|=8;const auto& v=velocity.angularVelocity;
+            out.angular[0]=v.x;out.angular[1]=v.y;out.angular[2]=v.z;
+        }
+    }
+    if(!ouvr_valid(frame)) return;
+    auto bytes=env->NewByteArray(sizeof(frame));
+    if(bytes) {
+        env->SetByteArrayRegion(bytes,0,sizeof(frame),reinterpret_cast<const jbyte*>(&frame));
+        env->CallVoidMethod(activity,callback,bytes);env->DeleteLocalRef(bytes);
+    }
+}
 
 static XrVector3f rotate_vector(const XrQuaternionf &q, XrVector3f v) {
     // v' = v + 2*q.xyz cross (q.xyz cross v + q.w*v)
@@ -290,102 +357,96 @@ static XrVector3f rotate_vector(const XrQuaternionf &q, XrVector3f v) {
 
 static bool intersect_toolbar(const XrPosef &aim,float &u,float &v) {
     float x,y;
-    if(!toolbar_available || !panel_ray(aim,menu_panel,x,y)) return false;
+    if(!toolbar_available || (menu_host.load()<0 && !controller_menu_available) || !panel_ray(aim,menu_panel,x,y)) return false;
     u=x/menu_panel.width+.5f;v=.5f-y/(menu_panel.width*menu_panel.aspect);
     return u>=0 && u<=1 && v>=0 && v<=1;
 }
 
-static bool intersect_quad(const XrPosef &aim, float &u, float &v, int &pane) {
+static bool intersect_quad(const XrPosef &aim,float &u,float &v,int &pane) {
     const uint32_t visible=window_visible_mask.load();
+    float closest=1e30f;bool found=false;
     for(int i=0;i<6;++i) {
         if(!(visible&(1u<<i))) continue;
-        float x,y;
+        float x=0,y=0;
         if(!panel_ray(aim,panels[i],x,y)) continue;
-        const float w=panels[i].width,h=w*panels[i].aspect;
-        if(frame_available && y>h*.5f && y<h*.58f && x>w*.24f && x<w*.37f) {pane=43+i;u=x;v=y;return true;}
-        if(frame_available && y>h*.5f && y<h*.58f) {
-            if(x>-w*.44f && x<-w*.26f) {pane=49+i;u=x;v=y;return true;}
-            if(x>-w*.23f && x<-w*.18f) {pane=67+i;u=x;v=y;return true;}
-            if(x>-w*.17f && x<-w*.12f) {pane=73+i;u=x;v=y;return true;}
-            if(x>-w*.10f && x<w*.23f) {pane=55+i;u=x;v=y;return true;}
-            if(x>w*.39f && x<w*.44f) {pane=61+i;u=x;v=y;return true;}
-        }
-        // All four corner handles, close button and a separate grab rail.
-        if(frame_available && std::fabs(x)>=w*.38f && std::fabs(x)<=w*.53f && std::fabs(y)>=h*.42f && std::fabs(y)<=h*.58f) {
-            const int corner=(y<0?2:0)+(x>0?1:0);pane=13+i*4+corner;u=x;v=y;return true;
-        }
-        if(frame_available && y < -h/2 && y >= -h*.58f) {
-            if(x>w*.27f && x<w*.36f) {pane=37+i;u=x;v=y;return true;}
-            if(std::fabs(x)<=w*.25f) {pane=7+i;u=x/w+.5f;v=.5f-y/h;return true;}
-        }
-        u=x/w+.5f;v=.5f-y/h;
-        if(u>=0 && u<=1 && v>=0 && v<=1) {pane=i;return true;}
+        float hit_u=0,hit_v=0;
+        const int target=xr_frame_target(i,x,y,panels[i].width,panels[i].width*panels[i].aspect,frame_available,hit_u,hit_v);
+        if(target<0) continue;
+        const auto point=panel_point(panels[i],x,y);
+        const float dx=point.x-aim.position.x,dy=point.y-aim.position.y,dz=point.z-aim.position.z;
+        const float distance=dx*dx+dy*dy+dz*dz;
+        if(distance<closest) {closest=distance;pane=target;u=hit_u;v=hit_v;found=true;}
     }
-    return false;
+    return found;
 }
 
 static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmethodID scroll_method, jmethodID hover_method, jmethodID menu_method, jmethodID window_close, jmethodID window_menu,
                           XrSession session, XrSpace world, XrSpace menu_space, XrSpace view_space, Actions &actions,
                           XrTime timestamp, bool &last_down, float &old_u, float &old_v,
                           int &last_pane, XrTime &last_scroll_time) {
+    controller_debug_mask=0;diagnostic_target[0]=diagnostic_target[1]=-1;
     ray_visible[0]=ray_visible[1]=false;
+    ray_line_visible[0]=ray_line_visible[1]=false;
+    XrPosef frame_aims[2]{};
+    bool trigger_held[2]{};
     XrActiveActionSet active{actions.set, XR_NULL_PATH};
     XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
     sync.countActiveActionSets = 1;
     sync.activeActionSets = &active;
     if (XR_FAILED(xrSyncActions(session, &sync))) return;
-    XrActionStateGetInfo back_query{XR_TYPE_ACTION_STATE_GET_INFO};
-    back_query.action=actions.cancel_follow;back_query.subactionPath=actions.hand_paths[1];
-    XrActionStateBoolean back{XR_TYPE_ACTION_STATE_BOOLEAN};
-    if(XR_SUCCEEDED(xrGetActionStateBoolean(session,&back_query,&back)) && back.isActive && back.currentState && back.changedSinceLastSync) {
-        follow_view.store(false);grabbed_pane=-1;menu_grab=false;interaction_hand=-1;
-        if(last_down && last_pane<6) env->CallVoidMethod(activity,method,last_pane,old_u,old_v,JNI_FALSE);
-        last_down=false;return;
-    }
-    XrActionStateGetInfo follow_query{XR_TYPE_ACTION_STATE_GET_INFO};
-    follow_query.action=actions.toggle_follow;follow_query.subactionPath=actions.hand_paths[1];
-    XrActionStateBoolean toggle{XR_TYPE_ACTION_STATE_BOOLEAN};
-    if(XR_SUCCEEDED(xrGetActionStateBoolean(session,&follow_query,&toggle)) && toggle.isActive && toggle.currentState && toggle.changedSinceLastSync) {
-        if(follow_view.load()) follow_view.store(false);
-        else {
-            std::lock_guard<std::mutex> lock(follow_pose_mutex);
-            XrSpaceLocation offset{XR_TYPE_SPACE_LOCATION};
-            const auto valid=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-            const auto click_time=toggle.lastChangeTime>0?toggle.lastChangeTime:timestamp;
-            follow_requested_valid=XR_SUCCEEDED(xrLocateSpace(world,view_space,click_time,&offset)) && (offset.locationFlags&valid)==valid;
-            if(!follow_requested_valid)
-                follow_requested_valid=XR_SUCCEEDED(xrLocateSpace(world,view_space,timestamp,&offset)) && (offset.locationFlags&valid)==valid;
-            if(follow_requested_valid) {follow_requested_offset=offset.pose;follow_view.store(true);}
-            else LOGE("A follow: camera-relative tracking unavailable; keeping world layout");
-        }
-        if(last_down && last_pane<6) env->CallVoidMethod(activity,method,last_pane,old_u,old_v,JNI_FALSE);
-        last_down=false;grabbed_pane=-1;menu_grab=false;menu_grip=false;grip_dragging=false;interaction_hand=-1;
-        trigger_blocked[0]=trigger_blocked[1]=true;grip_holds[0].reset();grip_holds[1].reset();return;
-    }
     // Evaluate BOTH hands before choosing. An idle right-hand desktop hover
     // must never starve a left-hand menu click (or vice versa).
     XrPointerIntent intents[2];
     XrSpaceLocation eye{XR_TYPE_SPACE_LOCATION};
     const auto eye_flags=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
     const bool eye_valid=XR_SUCCEEDED(xrLocateSpace(view_space,world,timestamp,&eye)) && (eye.locationFlags&eye_flags)==eye_flags;
+    const bool docked=menu_host.load()<0;
+    if(docked && menu_grab) {menu_grab=false;menu_grip=false;interaction_hand=-1;}
+    const int dock_hand=controller_menu_hand.load();
+    if(docked) {
+        controller_menu_available=false;
+        XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};query.action=actions.tracked_grip;query.subactionPath=actions.hand_paths[dock_hand];
+        XrActionStatePose active{XR_TYPE_ACTION_STATE_POSE};
+        XrSpaceLocation grip{XR_TYPE_SPACE_LOCATION};
+        if(eye_valid && XR_SUCCEEDED(xrGetActionStatePose(session,&query,&active)) && active.isActive &&
+           XR_SUCCEEDED(xrLocateSpace(actions.tracked_hands[dock_hand],world,timestamp,&grip)) && (grip.locationFlags&eye_flags)==eye_flags) {
+            const auto& q=grip.pose.orientation;const auto& p=grip.pose.position;const auto& e=eye.pose.position;
+            menu_panel=controller_menu_panel({{q.x,q.y,q.z,q.w},{p.x,p.y,p.z}},{e.x,e.y,e.z},dock_hand,menu_panel.width,menu_panel.aspect);
+            controller_menu_available=true;
+        }
+    }
+
     for(int hand=0;hand<2;++hand) {
+        XrActionStateGetInfo pose_query{XR_TYPE_ACTION_STATE_GET_INFO};
+        pose_query.action=actions.aim;pose_query.subactionPath=actions.hand_paths[hand];
+        XrActionStatePose pose_state{XR_TYPE_ACTION_STATE_POSE};
+        if(XR_FAILED(xrGetActionStatePose(session,&pose_query,&pose_state)) || !pose_state.isActive) continue;
         XrSpaceLocation aim{XR_TYPE_SPACE_LOCATION};
         const auto flags=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
         if(XR_FAILED(xrLocateSpace(actions.hands[hand],world,timestamp,&aim)) || (aim.locationFlags&flags)!=flags) continue;
-        intents[hand].tracked=true;
+        intents[hand].tracked=true;frame_aims[hand]=aim.pose;
+        const auto aim_direction=rotate_vector(aim.pose.orientation,{0,0,-1});
+        intents[hand].moved=pointer_motion[hand].update(aim.pose.position.x,aim.pose.position.y,aim.pose.position.z,aim_direction.x,aim_direction.y,aim_direction.z);
         float u=0,v=0;int target=-1;
-        intents[hand].menu=intersect_toolbar(aim.pose,u,v);
+        intents[hand].menu=(!docked || hand!=dock_hand) && intersect_toolbar(aim.pose,u,v);
         intents[hand].hit=intents[hand].menu;
         if(intents[hand].menu) target=6;
         else intents[hand].hit=intersect_quad(aim.pose,u,v,target);
+        diagnostic_target[hand]=intents[hand].hit?target:-1;
         XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};query.subactionPath=actions.hand_paths[hand];
         XrActionStateBoolean trigger{XR_TYPE_ACTION_STATE_BOOLEAN},grip{XR_TYPE_ACTION_STATE_BOOLEAN};
         query.action=actions.click;xrGetActionStateBoolean(session,&query,&trigger);
         query.action=actions.grip;xrGetActionStateBoolean(session,&query,&grip);
+        if(grip.isActive) controller_debug_mask|=1<<(hand+2);
+        if(grip.isActive && grip.currentState) controller_debug_mask|=1<<(hand+4);
+        trigger_held[hand]=trigger.isActive && trigger.currentState;
         intents[hand].pressed=(trigger.isActive && trigger.currentState) || (grip.isActive && grip.currentState);
         intents[hand].rising=(trigger.changedSinceLastSync && trigger.currentState) || (grip.changedSinceLastSync && grip.currentState);
         focus_pressed[hand]=intents[hand].pressed;
-        if(eye_valid && !xr_stream_content(intents[hand].hit,target)) {
+        // Pointer pose is per-hand, per-XR-frame, in the same layout space as
+        // the windows. It must not depend on selected-hand arbitration or the
+        // Java UI/atlas redraw rate (which previously left a stationary dot).
+        if(eye_valid) {
             float distance=2;
             const int owner=xr_control_owner(target);
             const PanelGeometry *panel=target==6?&menu_panel:(owner>=0?&panels[owner]:nullptr);
@@ -395,24 +456,33 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
                 const auto dx=point.x-aim.pose.position.x,dy=point.y-aim.pose.position.y,dz=point.z-aim.pose.position.z;
                 distance=std::sqrt(dx*dx+dy*dy+dz*dz);
             }
+            if(intents[hand].hit) distance=std::max(.05f,distance-.003f);
             update_free_ray(hand,aim.pose,eye.pose,distance);
+            ray_line_visible[hand]=!xr_stream_content(intents[hand].hit,target);
         }
     }
+    for(int hand=0;hand<2;++hand) if(!intents[hand].tracked) pointer_motion[hand].reset();
+    if(docked && intents[1-dock_hand].menu && !trigger_held[dock_hand]) {
+        // Carrying/squeezing the menu hand must not steal the opposite ray.
+        intents[dock_hand].moved=false;intents[dock_hand].pressed=false;intents[dock_hand].rising=false;
+    }
     const int selected_hand=xr_choose_pointer(intents,interaction_hand,preferred_hand);
+    diagnostic_selected=selected_hand;
     if(selected_hand>=0) preferred_hand=selected_hand;
     for (int hand : {selected_hand}) {
         if(hand<0) continue;
         XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
-        if (XR_FAILED(xrLocateSpace(actions.hands[hand], world, timestamp, &location)) ||
-            (location.locationFlags & (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) !=
-            (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) continue;
+        if(!intents[hand].tracked) continue;
+        location.pose=frame_aims[hand];
         float u = 0.f, v = 0.f;
         int pane = 0;
         XrSpaceLocation menu_location{XR_TYPE_SPACE_LOCATION};
+        const auto menu_flags=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        bool menu_pose_valid=false;
+        if(menu_space==world) {menu_location.pose=location.pose;menu_pose_valid=true;}
+        else menu_pose_valid=XR_SUCCEEDED(xrLocateSpace(actions.hands[hand],menu_space,timestamp,&menu_location)) && (menu_location.locationFlags&menu_flags)==menu_flags;
         bool hit=false;
-        if (grabbed_pane<0 && XR_SUCCEEDED(xrLocateSpace(actions.hands[hand],menu_space,timestamp,&menu_location)) &&
-            (menu_location.locationFlags & (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) ==
-            (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+        if (grabbed_pane<0 && menu_pose_valid && (!docked || hand!=dock_hand)) {
             hit=intersect_toolbar(menu_location.pose,u,v); if(hit) pane=6;
         }
         if(!hit) hit=intersect_quad(location.pose,u,v,pane);
@@ -420,8 +490,8 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
         grip_query.action=actions.grip;grip_query.subactionPath=actions.hand_paths[hand];
         XrActionStateBoolean grip_state{XR_TYPE_ACTION_STATE_BOOLEAN};
         const bool grip_held=XR_SUCCEEDED(xrGetActionStateBoolean(session,&grip_query,&grip_state)) && grip_state.isActive && grip_state.currentState;
-        if(grip_held) trigger_blocked[hand]=true;
-        if(grip_held && hit && pane==6 && !menu_grab && grabbed_pane<0) {
+        if(grip_held && !(docked && hit && pane==6)) trigger_blocked[hand]=true;
+        if(!docked && grip_held && hit && pane==6 && !menu_grab && grabbed_pane<0) {
             if(last_down && last_pane<6) env->CallVoidMethod(activity,method,last_pane,old_u,old_v,JNI_FALSE);
             last_down=false;menu_grab=true;menu_grip=true;interaction_hand=hand;grab_u=u;grab_v=v;
             XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
@@ -440,7 +510,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
                 u=x/panels[grip_target].width+.5f;v=.5f-y/(panels[grip_target].width*panels[grip_target].aspect);
             }
         }
-        if(grip_held && grip_target<0 && !grip_dragging && grabbed_pane<0 && !menu_grab) {
+        if(grip_held && grip_target<0 && !grip_dragging && grabbed_pane<0 && !menu_grab && !(docked && hit && pane==6)) {
             if(last_down && last_pane<6) env->CallVoidMethod(activity,method,last_pane,old_u,old_v,JNI_FALSE);
             last_down=false;
             if(pointed>=0) interaction_hand=hand;
@@ -459,14 +529,14 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
         if(!trigger_down) trigger_blocked[hand]=false;
         bool down = (grip_dragging || (menu_grab && menu_grip))?grip_held:(trigger_down && !trigger_blocked[hand]);
         if (hover_method) env->CallVoidMethod(activity,hover_method,grip_dragging?(7+(grabbed_pane>=0?grabbed_pane:grip_target)):pane,u,v,down?JNI_TRUE:JNI_FALSE);
-        if(menu_grab || (!grip_dragging && pane==6 && v>=.92f)) {
+        if(menu_grab || (!docked && !grip_dragging && pane==6 && v>=.92f)) {
             if(down && !menu_grab && state.changedSinceLastSync) {
                 menu_grab=true;menu_grip=false;interaction_hand=hand;grab_u=u;grab_v=v;
                 XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
                 if(XR_SUCCEEDED(xrLocateSpace(view_space,menu_space,timestamp,&head))) menu_grab_origin={head.pose.position.x,head.pose.position.y,head.pose.position.z};
                 menu_grab_radius=orbit_radius(menu_panel,menu_grab_origin,u,v,menu_panel.aspect);
             }
-            if(menu_grab && down) {
+            if(menu_grab && down && menu_pose_valid) {
                 XrActionStateGetInfo q{XR_TYPE_ACTION_STATE_GET_INFO};q.action=actions.scroll;q.subactionPath=actions.hand_paths[hand];
                 XrActionStateFloat axis{XR_TYPE_ACTION_STATE_FLOAT};
                 if(XR_SUCCEEDED(xrGetActionStateFloat(session,&q,&axis)) && axis.isActive && std::fabs(axis.currentState)>.25f &&
@@ -493,19 +563,18 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
                 (offset.locationFlags & (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) ==
                 (XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
             if(follow_click_valid) follow_click_offset=offset.pose;
-            env->CallVoidMethod(activity,menu_method,u,v);
+            ++diagnostic_menu_clicks;env->CallVoidMethod(activity,menu_method,u,v);
         }
         if(pane>=49 && pane<79 && !grip_dragging) {
-            if(down && state.changedSinceLastSync && window_menu)
+            if(down && state.changedSinceLastSync && window_menu) {
+                if(pane<67) menu_host.store((pane-49)%6);
                 env->CallVoidMethod(activity,window_menu,(pane-49)%6,(pane-49)/6+1);
+            }
             last_down=down;last_pane=pane;return;
         }
         if(pane>=43 && pane<49 && !grip_dragging) {
             if(down && state.changedSinceLastSync && window_menu) {
                 menu_host.store(pane-43);
-                const auto &p=panels[pane-43];const auto point=panel_point(p,0,p.width*p.aspect/2-.275f);
-                const auto normal=panel_normal(p);
-                menu_panel={point.x+normal.x*.015f,point.y+normal.y*.015f,1.65f,p.yaw,point.z+normal.z*.015f,1.f/3.f,p.pitch};
                 env->CallVoidMethod(activity,window_menu,pane-43,0);
             }
             last_down=down;last_pane=pane;return;
@@ -618,8 +687,42 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetEnvironment(JNIEnv*,jobject,jint mode,jint color,jint opacity,jint brightness,jboolean flow,jint seed) {
+    std::lock_guard<std::mutex> lock(environment_mutex);
+    environment_settings.mode=std::clamp(int(mode),0,12);environment_settings.color=static_cast<uint32_t>(color);
+    environment_settings.opacity=std::clamp(int(opacity),0,255)/255.f;
+    environment_settings.brightness=std::clamp(int(brightness),25,100)/100.f;
+    environment_settings.flow=flow==JNI_TRUE;environment_settings.seed=seed;
+}
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetEnvironmentImage(JNIEnv* env,jobject,jint width,jint height,jbyteArray bytes) {
+    std::shared_ptr<XrEnvironmentImage> image;
+    if(bytes && width>0 && height>0 && width<=1024 && height<=1024 && env->GetArrayLength(bytes)==width*height*4) {
+        image=std::make_shared<XrEnvironmentImage>();image->width=width;image->height=height;image->rgba.resize(width*height*4);
+        env->GetByteArrayRegion(bytes,0,env->GetArrayLength(bytes),reinterpret_cast<jbyte*>(image->rgba.data()));
+    }
+    std::lock_guard<std::mutex> lock(environment_mutex);environment_settings.image=image;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetFocusDots(JNIEnv*,jobject,jboolean enabled) {focus_dots_enabled.store(enabled==JNI_TRUE);}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetPointerProbe(JNIEnv*,jobject,jboolean enabled) {pointer_probe_requested.store(enabled==JNI_TRUE);}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetPcvrProbe(JNIEnv*,jobject,jboolean enabled) {
+    pcvr_probe_requested.store(enabled==JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeStop(JNIEnv *, jobject) {
     stop_requested.store(true, std::memory_order_release);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetControllerMenu(JNIEnv*,jobject,jint layout,jint hand) {
+    controller_menu_layout.store(std::clamp(int(layout),0,3));controller_menu_hand.store(hand==1?1:0);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -662,8 +765,16 @@ Java_org_openuuyc_pico_PicoActivity_nativeSetPassthroughEnabled(JNIEnv *, jobjec
 extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject activity) {
     stop_requested.store(false, std::memory_order_release);
+    pointer_motion[0].reset();pointer_motion[1].reset();
     window_visible_mask.store(0u, std::memory_order_release);
+    controller_menu_available=false;
     jclass klass = env->GetObjectClass(activity);
+    jmethodID input_report=env->GetMethodID(klass,"onXrInputDiagnostics","(Ljava/lang/String;)V");
+    jmethodID menu_probe_report=env->GetMethodID(klass,"onXrMenuProbe","(IFFF)V");
+    jmethodID pointer_probe_report=env->GetMethodID(klass,"onXrPointerProbe","(IFFFFFF)V");
+    jmethodID probe_report=env->GetMethodID(klass,"onXrStereoProbe","(JIIIIF)V");
+    jmethodID tracking_enabled=env->GetMethodID(klass,"onXrTrackingEnabled","()Z");
+    jmethodID tracking_callback=env->GetMethodID(klass,"onXrTracking","([B)V");
     jmethodID ready = env->GetMethodID(klass, "onXrSurface", "(ILandroid/view/Surface;)V");
     jmethodID pointer = env->GetMethodID(klass, "onPointer", "(IFFZ)V");
     jmethodID window_menu=env->GetMethodID(klass,"onXrWindowMenu","(II)V");
@@ -684,9 +795,12 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     bool actual_follow=false;
     XrSpace following_space=XR_NULL_HANDLE;
     XrSwapchain swapchains[8] = {};
+    PcvrProjectionProbe pcvr_probe;
+    XrEnvironmentRenderer environment;
+    uint64_t input_frames=0;
     grip_dragging=false;grip_holds[0].reset();grip_holds[1].reset();
     menu_host.store(-1);menu_reset_requested.store(false);menu_portrait.store(false);
-    menu_panel={0.f,-.82f,1.65f};menu_grab=false;menu_grip=false;interaction_hand=-1;
+    menu_panel=default_menu_panel();menu_grab=false;menu_grip=false;interaction_hand=-1;
     {std::lock_guard<std::mutex> lock(follow_pose_mutex);follow_click_valid=false;follow_requested_valid=false;}
     toolbar_available = false; frame_available=false; grabbed_pane=-1; follow_view.store(false); layout_reset.store(true);
     EGLState egl;
@@ -731,6 +845,11 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             if (!found) { LOGE("Missing required extension: %s", needed); failure = "PICO OS lacks required OpenXR extension"; }
         }
         if (failure) break;
+        std::vector<const char*> enabled_extensions(std::begin(extensions),std::end(extensions));
+        for(const auto& ext:supported) if(std::strcmp(ext.extensionName,"XR_BD_controller_interaction")==0) {
+            enabled_extensions.push_back("XR_BD_controller_interaction");
+            LOGE("Enabling runtime-supported PICO controller interaction extension");break;
+        }
         XrInstanceCreateInfoAndroidKHR android_info{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
         android_info.applicationVM = vm;
         android_info.applicationActivity = activity;
@@ -739,8 +858,8 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         std::strcpy(create.applicationInfo.applicationName, "OpenUUYC PICO");
         std::strcpy(create.applicationInfo.engineName, "OpenUUYC");
         create.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
-        create.enabledExtensionCount = 3;
-        create.enabledExtensionNames = extensions;
+        create.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
+        create.enabledExtensionNames = enabled_extensions.data();
         if (!xr_ok(xrCreateInstance(&create, &instance), "create instance")) {
             failure = "Cannot create OpenXR instance"; break;
         }
@@ -816,7 +935,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             // Reserve the second runtime layer for the toolbar, then extra video.
             const uint32_t pane = slot == 0 ? 0 : slot == 1 ? 6 : slot == 2 ? 7 : slot-2;
             swapchain_info.width = pane == 7 ? 2400 : pane == 6 ? 1200 : video_edge;
-            swapchain_info.height = pane == 6 ? 400 : pane == 7 ? 3232 : video_edge;
+            swapchain_info.height = pane == 6 ? 2000 : pane == 7 ? 3232 : video_edge;
             jobject surface = nullptr;
             if (!xr_ok(create_surface(session, &swapchain_info, &swapchains[pane], &surface),
                        "create pane swapchain") || !surface) {
@@ -831,6 +950,9 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             }
         }
         if (failure) break;
+        if(pcvr_probe_requested.load() && !pcvr_probe.initialize(instance,system,session)) {
+            failure="PCVR stereo projection probe initialization failed";break;
+        }
         while (!stop_requested.load(std::memory_order_acquire)) {
             XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
             while (xrPollEvent(instance, &event) == XR_SUCCESS) {
@@ -890,16 +1012,28 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                         {std::lock_guard<std::mutex> lock(follow_pose_mutex);follow_click_valid=false;follow_requested_valid=false;}
                         panels[0]={0.f,0.f,1.65f}; panels[1]={-1.55f,0.f,1.25f}; panels[2]={1.55f,0.f,1.25f};
                         panels[3]={0.f,1.3f,1.25f};panels[4]={-1.55f,1.3f,1.25f};panels[5]={1.55f,1.3f,1.25f};
-                        menu_panel={0,-.82f,1.65f};menu_host.store(-1);
+                        menu_panel=default_menu_panel();menu_host.store(-1);
                         grabbed_pane=-1;menu_grab=false;layout_reset.store(false);
                         if(follow_report) env->CallVoidMethod(activity,follow_report,JNI_FALSE);
                     }
                 }
             }
-            if(menu_reset_requested.exchange(false)) menu_panel={0,-.82f,1.65f};
-            menu_panel.width=menu_portrait.load()?.85f:1.65f;
-            menu_panel.aspect=menu_portrait.load()?1000.f/600.f:1.f/3.f;
+            if(menu_reset_requested.exchange(false)) menu_panel=default_menu_panel();
+            const int menu_layout=controller_menu_layout.load();
+            if(menu_host.load()<0) {
+                menu_panel.width=menu_layout==3?.15f:menu_layout==2?.30f:menu_layout==0?.42f:.50f;
+                menu_panel.aspect=menu_layout==0?2.f/3.f:menu_layout==2?1000.f/600.f:1.f/3.f;
+            } else {
+                menu_panel.width=menu_portrait.load()?.48f:.80f;
+                menu_panel.aspect=menu_portrait.load()?1000.f/600.f:1.f/3.f;
+            }
             for(int i=0;i<6;++i) {panels[i].aspect=panel_aspects[i].load();panels[i].width=std::min(panels[i].width,panel_max_width(panels[i].aspect));}
+            const int host=menu_host.load();
+            if(host>=0 && host<6 && !menu_grab) {
+                if(window_visible_mask.load() & (1u<<host))
+                    menu_panel=panel_menu_above(panels[host],menu_panel.width,menu_panel.aspect);
+                else {menu_host.store(-1);menu_panel=default_menu_panel();}
+            }
             XrCompositionLayerQuad quads[16]{};
             const XrCompositionLayerBaseHeader *layers[16]{};
             const bool requested_follow=follow_view.load();
@@ -963,10 +1097,25 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 env->CallVoidMethod(activity, pointer, previous_pane, previous_u, previous_v, JNI_FALSE);
                 previous_down = false;
             }
-            if(!input_focused || !state.shouldRender) ray_visible[0]=ray_visible[1]=false;
+            if(tracking_enabled && tracking_callback && action_ready)
+                emit_pcvr_tracking(env,activity,tracking_enabled,tracking_callback,session,world,view,actions,state.predictedDisplayTime,input_focused && state.shouldRender);
+            if(!input_focused || !state.shouldRender) {ray_visible[0]=ray_visible[1]=false;controller_menu_available=false;}
+            if(pointer_probe_requested.load() && pointer_probe_report) {
+                const auto& a=focus_poses[0].position;const auto& b=focus_poses[1].position;
+                const int mask=(ray_visible[0]?1:0)|(ray_visible[1]?2:0);
+                env->CallVoidMethod(activity,pointer_probe_report,jint(mask),a.x,a.y,a.z,b.x,b.y,b.z);
+                if(menu_probe_report) env->CallVoidMethod(activity,menu_probe_report,jint(input_focused?(controller_debug_mask|(menu_grab?64:0)):0),menu_panel.x,menu_panel.y,menu_panel.z);
+            }
             uint32_t layer_count = 0;
-            if(frame_available && max_layers>=4) {
-                auto &bg=quads[layer_count];bg.type=XR_TYPE_COMPOSITION_LAYER_QUAD;bg.space=view;
+            XrEnvironmentSettings backdrop;
+            {std::lock_guard<std::mutex> lock(environment_mutex);backdrop=environment_settings;}
+            const XrCompositionLayerBaseHeader* background_layer=nullptr;
+            if(state.shouldRender && backdrop.opacity>0 && !pcvr_probe_requested.load() && environment.initialize(instance,system,session))
+                background_layer=environment.render(world,state.predictedDisplayTime,backdrop);
+            if(background_layer) layers[layer_count++]=background_layer;
+            else if(backdrop.opacity>0 && frame_available && max_layers>=4) {
+                // Conservative fallback is world-fixed, never attached to VIEW.
+                auto &bg=quads[layer_count];bg.type=XR_TYPE_COMPOSITION_LAYER_QUAD;bg.space=world;
                 bg.eyeVisibility=XR_EYE_VISIBILITY_BOTH;bg.pose=identity_pose(-10);bg.size={40,26.666667f};
                 bg.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                 bg.subImage.swapchain=swapchains[7];bg.subImage.imageRect={{0,2432},{1200,800}};
@@ -974,12 +1123,14 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             }
             const uint32_t visible = window_visible_mask.load(std::memory_order_acquire);
             for (uint32_t index = 0; index < 7; ++index) {
-                if (swapchains[index] == XR_NULL_HANDLE || (index != 6 && !(visible & (1u << index))))
+                if (swapchains[index] == XR_NULL_HANDLE || (index==6 && menu_host.load()<0 && !controller_menu_available) || (index != 6 && !(visible & (1u << index))))
                     continue;
                 auto &quad = quads[layer_count];
                 quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
                 quad.space = index==6?(active_space):active_space;
                 quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                // Menus and rounded video both supply premultiplied alpha.
+                quad.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                 quad.pose = identity_pose(index == 6 ? menu_panel.z : panels[index].z);
                 quad.pose.position.x = index == 6 ? menu_panel.x : panels[index].x;
                 quad.pose.position.y = index == 6 ? menu_panel.y : panels[index].y;
@@ -987,7 +1138,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 quad.size.width = index == 6 ? menu_panel.width : panels[index].width;
                 quad.size.height = index == 6 ? menu_panel.width*menu_panel.aspect : quad.size.width * panels[index].aspect;
                 quad.subImage.swapchain = swapchains[index];
-                quad.subImage.imageRect = index == 6 ? XrRect2Di{{0,0},{1200,400}} : XrRect2Di{{0,0},{static_cast<int32_t>(video_edge),static_cast<int32_t>(video_edge)}};
+                quad.subImage.imageRect = index == 6 ? XrRect2Di{{0,0},{1200,2000}} : XrRect2Di{{0,0},{static_cast<int32_t>(video_edge),static_cast<int32_t>(video_edge)}};
                 quad.subImage.imageArrayIndex = 0;
                 layers[layer_count++] = reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad);
             }
@@ -1005,7 +1156,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             }
             // Menu hit testing has priority; keep its composition layer topmost too.
             for(uint32_t i=0;i+1<layer_count;++i) {
-                if(reinterpret_cast<const XrCompositionLayerQuad *>(layers[i])->subImage.swapchain==swapchains[6]) {
+                if(layers[i]->type==XR_TYPE_COMPOSITION_LAYER_QUAD && reinterpret_cast<const XrCompositionLayerQuad *>(layers[i])->subImage.swapchain==swapchains[6]) {
                     const auto *menu=layers[i];
                     for(uint32_t j=i;j+1<layer_count;++j) layers[j]=layers[j+1];
                     layers[layer_count-1]=menu;break;
@@ -1015,11 +1166,10 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 // One ray + one camera-facing cursor per pointer. With six
                 // windows prioritize the active hand, without exceeding runtime
                 // layer count; with spare layers show both complete pointers.
-                for(int hand:{preferred_hand,1-preferred_hand}) if(ray_visible[hand] && layer_count+2<=max_layers) {
-                    auto &ray=quads[layer_count];ray.type=XR_TYPE_COMPOSITION_LAYER_QUAD;
-                    ray.space=active_space;ray.eyeVisibility=XR_EYE_VISIBILITY_BOTH;ray.pose=ray_poses[hand];
-                    ray.size={.003f,ray_lengths[hand]};ray.subImage.swapchain=swapchains[7];ray.subImage.imageRect={{0,2400},{32,32}};
-                    layers[layer_count++]=reinterpret_cast<const XrCompositionLayerBaseHeader *>(&ray);
+                // Dots take priority over rays under the runtime's layer budget.
+                // BOTH hand dots update independently even when only one hand
+                // owns the remote click/drag. No Canvas cursor is involved.
+                for(int hand:{preferred_hand,1-preferred_hand}) if(focus_dots_enabled.load() && ray_visible[hand] && layer_count<max_layers) {
                     auto &cursor=quads[layer_count];cursor.type=XR_TYPE_COMPOSITION_LAYER_QUAD;
                     cursor.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                     cursor.space=active_space;cursor.eyeVisibility=XR_EYE_VISIBILITY_BOTH;cursor.pose=focus_poses[hand];
@@ -1027,6 +1177,39 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                     cursor.subImage.swapchain=swapchains[7];cursor.subImage.imageRect={{focus_pressed[hand]?64:32,2400},{32,32}};
                     layers[layer_count++]=reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cursor);
                 }
+                for(int hand:{preferred_hand,1-preferred_hand}) if(ray_visible[hand] && ray_line_visible[hand] && layer_count<max_layers) {
+                    auto &ray=quads[layer_count];ray.type=XR_TYPE_COMPOSITION_LAYER_QUAD;
+                    ray.space=active_space;ray.eyeVisibility=XR_EYE_VISIBILITY_BOTH;ray.pose=ray_poses[hand];
+                    ray.size={.003f,ray_lengths[hand]};ray.subImage.swapchain=swapchains[7];ray.subImage.imageRect={{0,2400},{32,32}};
+                    layers[layer_count++]=reinterpret_cast<const XrCompositionLayerBaseHeader *>(&ray);
+                }
+            }
+            if(input_report && ++input_frames%90==0) {
+                char profiles[2][256]{};
+                for(int hand=0;hand<2;++hand) {
+                    XrInteractionProfileState profile{XR_TYPE_INTERACTION_PROFILE_STATE};
+                    if(XR_SUCCEEDED(xrGetCurrentInteractionProfile(session,actions.hand_paths[hand],&profile)) && profile.interactionProfile!=XR_NULL_PATH) {
+                        uint32_t length=0;xrPathToString(instance,profile.interactionProfile,sizeof(profiles[hand]),&length,profiles[hand]);
+                    }
+                }
+                char report[1024];std::snprintf(report,sizeof(report),
+                    R"json({"frames":%llu,"focused":%s,"selected":%d,"leftTarget":%d,"rightTarget":%d,"gripMask":%d,"menuGrab":%s,"menuClicks":%llu,"leftProfile":"%s","rightProfile":"%s"})json",
+                    static_cast<unsigned long long>(input_frames),input_focused?"true":"false",diagnostic_selected,diagnostic_target[0],diagnostic_target[1],controller_debug_mask,menu_grab?"true":"false",static_cast<unsigned long long>(diagnostic_menu_clicks),profiles[0],profiles[1]);
+                auto text=env->NewStringUTF(report);if(text) {env->CallVoidMethod(activity,input_report,text);env->DeleteLocalRef(text);}
+            }
+            bool probe_submitted=false;
+            if(pcvr_probe_requested.load() && state.shouldRender) {
+                const auto result=pcvr_probe.render(world,state.predictedDisplayTime);
+                if(result==PcvrProjectionProbe::Result::Error) {
+                    failure="PCVR stereo projection probe rendering failed";
+                    XrFrameEndInfo empty{XR_TYPE_FRAME_END_INFO};empty.displayTime=state.predictedDisplayTime;
+                    empty.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;xrEndFrame(session,&empty);break;
+                }
+                // Probe replaces desktop quads. No ray/menu layer casts are made
+                // after this point. Remote video will require frame-associated poses.
+                probe_submitted=result==PcvrProjectionProbe::Result::Ready;
+                layers[0]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&pcvr_probe.layer);
+                layer_count=probe_submitted?1:0;
             }
             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
             end.displayTime = state.predictedDisplayTime;
@@ -1039,7 +1222,9 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                     : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             end.layerCount = state.shouldRender ? layer_count : 0u;
             end.layers = end.layerCount ? layers : nullptr;
-            if (!xr_ok(xrEndFrame(session, &end), "submit composition layers")) break;
+            if (!xr_ok(xrEndFrame(session, &end), "submit composition layers")) {failure="OpenXR composition submission failed";break;}
+            if(probe_submitted && probe_report && pcvr_probe.frames%60==0)
+                env->CallVoidMethod(activity,probe_report,jlong(pcvr_probe.frames),jint(pcvr_probe.width[0]),jint(pcvr_probe.height[0]),jint(pcvr_probe.width[1]),jint(pcvr_probe.height[1]),jfloat(pcvr_probe.ipd()));
         }
     } while (false);
 
@@ -1050,6 +1235,8 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         previous_down = false;
     }
     if (running) xrEndSession(session);
+    environment.destroy();
+    pcvr_probe.destroy();
     actions.destroy();
     for (auto chain : swapchains) if (chain != XR_NULL_HANDLE) xrDestroySwapchain(chain);
     if (following_space != XR_NULL_HANDLE) xrDestroySpace(following_space);

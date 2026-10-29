@@ -44,6 +44,8 @@ struct Cli {
 #[cfg(target_os = "linux")]
 #[derive(Subcommand)]
 enum PicoVrCommand {
+    /// 安装并注册 OpenUUYC 内置 OpenVR 追踪诊断驱动（不启动外部客户端）
+    BuiltinInstall,
     /// 检查 WiVRn、WayVR 和 OpenXR 运行时
     Doctor,
     /// 打开 WiVRn 配对管理器
@@ -378,6 +380,7 @@ fn main() -> Result<()> {
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),
         #[cfg(target_os = "linux")]
         Commands::PicoVr { command } => match command {
+            PicoVrCommand::BuiltinInstall => openuuyc::pcvr::install_driver(),
             PicoVrCommand::Doctor => pico_vr::doctor(),
             PicoVrCommand::Setup => pico_vr::setup(),
             PicoVrCommand::Launch { .. } => unreachable!("VR launch normalized to GUI"),

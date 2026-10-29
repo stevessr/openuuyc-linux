@@ -258,6 +258,17 @@ impl DeviceCenterApp {
         }
     }
     fn host_settings_controls(&mut self, ui: &mut egui::Ui) {
+        #[cfg(target_os="linux")]
+        {
+            section(ui,"内置 PCVR · 实验组件");
+            ui.label("当前仅支持头显/双手追踪诊断，尚无双眼画面，不会启动 VRChat 或外部串流客户端。");
+            if ui.button("安装 / 更新 OpenUUYC 内置 OpenVR 驱动").clicked() {
+                self.status=match crate::pcvr::install_driver() {
+                    Ok(())=>StatusMessage::success("内置追踪驱动已安装；请自行重启 SteamVR 后，在 PICO 沉浸菜单启用追踪诊断"),
+                    Err(e)=>StatusMessage::error(e.to_string()),
+                };
+            }
+        }
         section(ui, "被控设置");
         let host = self.host.clone();
         let mut allowed = host.as_ref().is_some_and(|h| h.allowed());

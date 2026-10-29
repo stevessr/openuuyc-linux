@@ -13,6 +13,7 @@ fn main() {
             .manifest_required()
             .expect("compile Windows application icon");
     }
+    if target_os == "linux" { build_pcvr_driver(); }
     build_neteq(windows);
     build_fonts();
     // The virtual audio device is a Windows kernel driver package.
@@ -131,4 +132,14 @@ fn build_neteq(windows: bool) {
     } else {
         println!("cargo:rustc-link-lib=stdc++");
     }
+}
+
+fn build_pcvr_driver() {
+    for path in ["drivers/pcvr/driver.cpp", "pico-android/app/src/main/cpp/pcvr_protocol.h", "drivers/pcvr/vendor/openvr_driver.h", "drivers/pcvr/driver.vrdrivermanifest"] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let compiler=cc::Build::new().cpp(true).get_compiler();
+    let output=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("driver_openuuyc.so");
+    let status=compiler.to_command().args(["-std=c++17","-shared","-fPIC","-O2","-fvisibility=hidden","drivers/pcvr/driver.cpp","-o"]).arg(output).status().expect("compile built-in PCVR driver");
+    assert!(status.success(),"built-in PCVR driver compilation failed");
 }

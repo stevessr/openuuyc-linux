@@ -1,0 +1,65 @@
+//! Fixed-size, bounded binary tracking frames shared with drivers/pcvr/protocol.h.
+use anyhow::{Result, ensure};
+pub(crate) const FRAME_BYTES: usize = 224;
+pub(crate) fn sequence(frame: &[u8]) -> Result<u64> {
+    ensure!(
+        frame.len() == FRAME_BYTES && &frame[..4] == b"OUVR",
+        "invalid tracking frame"
+    );
+    ensure!(
+        u32::from_le_bytes(frame[4..8].try_into()?) == 1,
+        "unsupported tracking version"
+    );
+    let sequence = u64::from_le_bytes(frame[8..16].try_into()?);
+    ensure!(sequence > 0, "zero sequence");
+    for device in frame[32..].chunks_exact(64) {
+        let flags = u32::from_le_bytes(device[..4].try_into()?);
+        let buttons = u32::from_le_bytes(device[4..8].try_into()?);
+        ensure!(
+            flags <= 15 && buttons <= 3 && device[60..64] == [0; 4],
+            "invalid tracking flags"
+        );
+        let mut values = [0f32; 13];
+        for (i, b) in device[8..60].chunks_exact(4).enumerate() {
+            values[i] = f32::from_le_bytes(b.try_into()?);
+            ensure!(values[i].is_finite(), "nonfinite pose");
+            if !(3..7).contains(&i) {
+                ensure!(values[i].abs() <= 1000., "pose out of range");
+            }
+        }
+        if flags & 1 != 0 {
+            let norm: f32 = values[3..7].iter().map(|v| v * v).sum();
+            ensure!((0.98..=1.02).contains(&norm), "invalid quaternion");
+        }
+    }
+    Ok(sequence)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn frame() -> Vec<u8> {
+        let mut f = vec![0; 224];
+        f[..4].copy_from_slice(b"OUVR");
+        f[4] = 1;
+        f[8] = 1;
+        f
+    }
+    #[test]
+    fn accepts_lost_tracking_but_not_zero_sequence_or_wrong_sizes() {
+        assert_eq!(sequence(&frame()).unwrap(), 1);
+        assert!(sequence(&frame()[..223]).is_err());
+        let mut f = frame();
+        f[8] = 0;
+        assert!(sequence(&f).is_err());
+    }
+    #[test]
+    fn rejects_nonfinite_and_invalid_quaternion() {
+        let mut f = frame();
+        f[32] = 3;
+        assert!(sequence(&f).is_err());
+        f[64..68].copy_from_slice(&1f32.to_le_bytes());
+        assert!(sequence(&f).is_ok());
+        f[40..44].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(sequence(&f).is_err());
+    }
+}

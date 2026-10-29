@@ -1,11 +1,9 @@
 package org.openuuyc.pico
 
 import android.content.Context
-import android.text.Editable
 import android.text.InputType
 import android.view.KeyEvent
 import android.view.View
-import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
@@ -18,43 +16,83 @@ internal class PicoRemoteKeyboard(
 ) : View(context) {
     private val held = mutableSetOf<Int>()
     init { isFocusable = true; isFocusableInTouchMode = true; importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
+    private var dialog: android.app.AlertDialog?=null
+    private var editor: android.widget.EditText?=null
+    internal val nativeEditor: android.widget.EditText? get()=editor
+    private var editorGeneration=0
+    /** Use a real native EditText/window token; the old 1px custom View wasn't a reliable IME host. */
     fun show() {
-        requestFocus()
-        post { (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(this, InputMethodManager.SHOW_IMPLICIT) }
-    }
-    fun hide() {
-        (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(windowToken,0)
-        clearFocus();releaseKeys()
-    }
-    fun releaseKeys() { held.toList().forEach { key(it, false) }; held.clear() }
-    override fun onCheckIsTextEditor() = true
-    override fun onCreateInputConnection(info: EditorInfo): InputConnection {
-        info.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-        info.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_NONE
-        return object : BaseInputConnection(this, true) {
-            private val buffer = Editable.Factory.getInstance().newEditable("")
-            override fun getEditable() = buffer
-            override fun commitText(value: CharSequence?, newCursorPosition: Int): Boolean {
-                val committed = value?.toString().orEmpty()
-                val sent = committed.isEmpty() || text(committed)
-                if (sent) buffer.clear()
-                return sent
+        val activity=context as? android.app.Activity ?: return
+        if(activity.isFinishing || activity.isDestroyed) return
+        if(dialog?.isShowing==true) {requestIme();return}
+        releaseKeys()
+        val input=object: android.widget.EditText(context) {
+            override fun onCreateInputConnection(info: EditorInfo): InputConnection? {
+                val connection=super.onCreateInputConnection(info)
+                info.imeOptions=(info.imeOptions and EditorInfo.IME_FLAG_NO_ENTER_ACTION.inv()) or
+                    EditorInfo.IME_ACTION_SEND or EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
+                info.actionLabel="发送";info.actionId=EditorInfo.IME_ACTION_SEND
+                info.hintLocales=android.os.LocaleList.getDefault()
+                return connection
             }
-            override fun finishComposingText(): Boolean {
-                val value = buffer.toString()
-                if (value.isNotEmpty() && !text(value)) return false
-                buffer.clear(); return true
-            }
-            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
-                if (buffer.isNotEmpty()) return super.deleteSurroundingText(beforeLength, afterLength)
-                repeat(beforeLength.coerceIn(0, 32)) { key(8, true); key(8, false) }
-                repeat(afterLength.coerceIn(0, 32)) { key(46, true); key(46, false) }
-                return true
-            }
-            override fun sendKeyEvent(event: KeyEvent) = dispatchRemoteKey(event)
-            override fun performEditorAction(editorAction: Int): Boolean { key(13, true); key(13, false); return true }
+        }.apply {
+            inputType=InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            imeOptions=EditorInfo.IME_ACTION_SEND or EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
+            setSingleLine(false);minLines=2;maxLines=5
+            hint="使用系统键盘切换语言；候选词确认后，点发送"
+            filters=arrayOf(android.text.InputFilter.LengthFilter(16384))
+            setPadding(24,16,24,16)
         }
+        editor=input
+        val submission=PicoTextSubmission(text)
+        val native=android.app.AlertDialog.Builder(activity).setTitle("远程文本输入 · 系统键盘")
+            .setView(input).setPositiveButton("发送",null).setNegativeButton("取消",null)
+            .setNeutralButton("系统键盘语音",null).create()
+        dialog=native;editorGeneration++
+        fun send() {
+            if(submission.submit(input.text.toString())) native.dismiss()
+            else android.widget.Toast.makeText(context,"文本未发送，请检查连接后重试",android.widget.Toast.LENGTH_SHORT).show()
+        }
+        input.setOnEditorActionListener {_,action,event ->
+            if(action in setOf(EditorInfo.IME_ACTION_SEND,EditorInfo.IME_ACTION_DONE,EditorInfo.IME_ACTION_GO) ||
+                (event?.keyCode==KeyEvent.KEYCODE_ENTER && event.isCtrlPressed && event.action==KeyEvent.ACTION_DOWN)) {send();true} else false
+        }
+        native.setOnShowListener {
+            native.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or android.view.WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+            native.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            native.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {send()}
+            native.getButton(android.app.AlertDialog.BUTTON_NEUTRAL).setOnClickListener {showVoiceInput()}
+            input.requestFocus();requestIme()
+        }
+        native.setOnDismissListener {
+            submission.cancel();editorGeneration++
+            (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(input.windowToken,0)
+            if(dialog===native) {dialog=null;editor=null}
+            input.text.clear();releaseKeys()
+        }
+        native.show()
     }
+    private fun requestIme() {
+        val input=editor ?: return
+        val generation=editorGeneration
+        fun attempt(left: Int) {
+            if(generation!=editorGeneration || dialog?.isShowing!=true) return
+            input.requestFocus()
+            if(input.isAttachedToWindow && input.hasWindowFocus()) {
+                val ime=context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                ime.restartInput(input)
+                ime.showSoftInput(input,InputMethodManager.SHOW_IMPLICIT)
+                if(android.os.Build.VERSION.SDK_INT>=30) input.windowInsetsController?.show(android.view.WindowInsets.Type.ime())
+            } else if(left>0) input.postDelayed({attempt(left-1)},150)
+        }
+        input.post {attempt(6)}
+    }
+    fun showVoiceInput() {
+        show()
+        android.widget.Toast.makeText(context,"请点击 PICO 系统键盘的麦克风进行语音输入，完成后点发送",android.widget.Toast.LENGTH_LONG).show()
+    }
+    fun hide() {editorGeneration++;dialog?.dismiss();dialog=null;editor=null;clearFocus();releaseKeys()}
+    fun releaseKeys() { held.toList().forEach { key(it, false) }; held.clear() }
     private fun dispatchRemoteKey(event: KeyEvent): Boolean {
         val vk = vk(event.keyCode) ?: return false
         val down = event.action == KeyEvent.ACTION_DOWN

@@ -8,7 +8,7 @@ import android.widget.PopupWindow
 import org.openuuyc.pico.uu.UuDirectSession
 
 internal object PicoKeyboardPopup {
-    fun show(activity: Activity,anchor: View,session: UuDirectSession,system: ()->Unit) {
+    fun show(activity: Activity,anchor: View,session: UuDirectSession,system: ()->Unit,voice: ()->Unit=system) {
         val keys=PicoKeyboardKeys(session::key)
         var mode=PicoKeyboardMode.CUSTOM
         lateinit var popup: PopupWindow
@@ -23,10 +23,11 @@ internal object PicoKeyboardPopup {
                 if(event.actionMasked==MotionEvent.ACTION_UP) {
                     val u=event.x/width;val v=event.y/height
                     if(v*400 in 48f..90f && u in 0f..<1f) {
-                        keys.release();val choice=(u*4).toInt()
-                        if(choice==3) popup.dismiss() else {
+                        keys.release();val choice=(u*5).toInt()
+                        if(choice==4) popup.dismiss() else {
                             mode=PicoKeyboardMode.entries[choice]
                             if(mode==PicoKeyboardMode.SYSTEM) {popup.dismiss();system()}
+                            if(mode==PicoKeyboardMode.VOICE) {popup.dismiss();voice()}
                         }
                     } else PicoKeyboardLayout.keyAt(mode,u,v)?.let(keys::pressed)
                     invalidate();performClick()

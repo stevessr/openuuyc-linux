@@ -55,9 +55,12 @@ internal class UuDirectSession(
     private val onWindowVisibility: (Int, Boolean) -> Unit = { _, _ -> },
     private val onUnexpectedDisconnect: () -> Unit = {}
 ) : AutoCloseable {
+    var applicationsOnly=false
+    var immersiveRendering=false
     companion object {
         private val appFocused=AtomicBoolean(false)
         private val live=java.util.concurrent.ConcurrentHashMap.newKeySet<UuDirectSession>()
+        fun vrTrackingTarget()=live.firstOrNull {it.vr.active}
         fun setApplicationFocused(value: Boolean) {
             appFocused.set(value)
             live.forEach {it.clipboardBinding.focusChanged();if(!value) it.stopMicrophoneForFocus() else it.postRtc {it.updateMicrophone()}}
@@ -122,6 +125,18 @@ internal class UuDirectSession(
             if(track!=null) {runCatching {microphoneTransceiver?.sender?.setTrack(null,false)};runCatching {track.dispose()};runCatching {source?.dispose()}}
         }
     }
+    val transfers=UuFileTransfers(next={synchronized(this) {nextRequestSeq++}},send={packet,bulk->
+        synchronized(this) {
+            val channel=if(bulk) channels.firstOrNull {it.label()=="FILE_DATA_CHANNEL" && it.state()==DataChannel.State.OPEN} ?: textChannel else textChannel
+            !closed.get() && channel?.state()==DataChannel.State.OPEN && channel.bufferedAmount()<1024*1024 && channel.send(DataChannel.Buffer(ByteBuffer.wrap(packet),false))
+        }
+    })
+    val filesReady: Boolean get()=textChannel?.state()==DataChannel.State.OPEN
+    val files=UuFileManager(
+        next={synchronized(this) {nextRequestSeq++}},
+        send={packet->synchronized(this) {!closed.get() && textChannel?.state()==DataChannel.State.OPEN && textChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(packet),false))==true}})
+    val quickApps=UuQuickApps()
+    val vr=UuPcvrSession()
     private val http = OkHttpClient.Builder().pingInterval(0, TimeUnit.SECONDS)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
@@ -222,7 +237,7 @@ internal class UuDirectSession(
     }
     private val audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
         .setAudioAttributes(AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setUsage(AudioAttributes.USAGE_GAME)
             .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
             .build())
         // WebRTC onTrack callbacks arrive on native worker threads without
@@ -239,10 +254,10 @@ internal class UuDirectSession(
     private val remoteIce = UuIceCandidateQueue<IceCandidate>()
     private val appControlId = UUID.randomUUID().toString()
 
-    @Synchronized fun start(xrSurface: Surface) {
+    @Synchronized fun start(xrSurface: Surface?) {
         check(!started && !closed.get())
         started = true;live.add(this)
-        windowSurfaces[0] = xrSurface
+        if(xrSurface!=null) windowSurfaces[0] = xrSurface
         PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(context).createInitializationOptions())
         localProfiles = runCatching { UuLocalDecoders.profiles() }.getOrDefault(localProfiles)
         remoteSettings.localCodecs = localProfiles.map { it.codec }.toSet()
@@ -252,7 +267,7 @@ internal class UuDirectSession(
                 if (closed.get()) return@synchronized
                 if (heldKeys.isNotEmpty()) sendControl("{\"heartbeat\":\"kbd_heartbeat\"}".toByteArray(Charsets.UTF_8))
                 diagnosticTicks++
-                if (diagnosticTicks in listOf(3, 8, 15, 30)) reportMediaStats()
+                if (diagnosticTicks in listOf(3, 8, 15, 30) || diagnosticTicks>30 && diagnosticTicks%15==0) reportMediaStats()
                 improvePortraitQuality()
                 when (health.check()) {
                     UuSessionHealth.Warning.SIGNAL_TIMEOUT -> {
@@ -340,13 +355,13 @@ internal class UuDirectSession(
     private fun reportMediaStats() {
         peer?.getStats { report ->
             if (closed.get()) return@getStats
-            val summaries = report.statsMap.values.mapNotNull { stat ->
+            val summaries = report.statsMap.values.sortedBy {if(it.type=="inbound-rtp" && it.members["kind"]=="audio") 0 else 1}.mapNotNull { stat ->
                 val m = stat.members
                 when (stat.type) {
                     "transport" -> "transport(dtls=${m["dtlsState"]},ice=${m["iceState"]},sent=${m["bytesSent"]},recv=${m["bytesReceived"]})"
                     "candidate-pair" -> if (m["nominated"] == true || m["state"] == "succeeded")
                         "pair(state=${m["state"]},nominated=${m["nominated"]},sent=${m["bytesSent"]},recv=${m["bytesReceived"]})" else null
-                    "inbound-rtp" -> "rtp(kind=${m["kind"]},bytes=${m["bytesReceived"]},frames=${m["framesReceived"]},decoded=${m["framesDecoded"]})"
+                    "inbound-rtp" -> if(m["kind"]=="audio") UuAudioLatency.summary(m) else "rtp(kind=${m["kind"]},bytes=${m["bytesReceived"]},frames=${m["framesReceived"]},decoded=${m["framesDecoded"]})"
                     "data-channel" -> "sctp(state=${m["state"]},sent=${m["messagesSent"]},recv=${m["messagesReceived"]})"
                     else -> null
                 }
@@ -554,7 +569,9 @@ internal class UuDirectSession(
                 val created=EglRenderer("OpenUUYC-PICO-pane-$index");output=created
                 // EGL allocation waits for native threads. Never hold the session
                 // monitor or run this on the Android menu/UI thread.
-                created.init(base.eglBaseContext,EglBase.CONFIG_PLAIN,GlRectDrawer())
+                created.init(base.eglBaseContext,
+                    if(immersiveRendering) EglBase.CONFIG_RGBA else EglBase.CONFIG_PLAIN,
+                    if(immersiveRendering) org.webrtc.OpenUuRoundedDrawer() else GlRectDrawer())
                 created.setLayoutAspectRatio(0f) // full frame; OpenXR quad supplies true display aspect
                 created.createEglSurface(xrSurface)
                 synchronized(this) {
@@ -663,7 +680,12 @@ internal class UuDirectSession(
         egl = localEgl
         windowSurfaces.forEach { (index, xrSurface) -> attachRenderer(index, xrSurface, localEgl) }
         updateWindows()
+        val engine=if(applicationsOnly) PeerConnectionFactory.builder().createPeerConnectionFactory() else {
         val adm=org.webrtc.audio.JavaAudioDeviceModule.builder(context)
+            .setUseLowLatency(true)
+            .setUseStereoOutput(true)
+            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
             .setAudioRecordErrorCallback(object: org.webrtc.audio.JavaAudioDeviceModule.AudioRecordErrorCallback {
                 private fun fail() {audioModule?.setMicrophoneMute(true);micState.stop();postRtc {updateMicrophone()};emit("本机麦克风录音失败，已关闭回传")}
                 override fun onWebRtcAudioRecordInitError(error: String) {fail()}
@@ -671,16 +693,21 @@ internal class UuDirectSession(
                 override fun onWebRtcAudioRecordError(error: String) {fail()}
             }).createAudioDeviceModule()
         adm.setMicrophoneMute(true);audioModule=adm
-        val engine = PeerConnectionFactory.builder()
+        PeerConnectionFactory.builder()
             .setAudioDeviceModule(adm)
             .setVideoDecoderFactory(decoder)
             .setVideoEncoderFactory(org.webrtc.DefaultVideoEncoderFactory(localEgl.eglBaseContext, false, true))
             .createPeerConnectionFactory()
+        }
         factory = engine
         val config = PeerConnection.RTCConfiguration(info.iceServers.map { server ->
             PeerConnection.IceServer.builder(server.urls)
                 .setUsername(server.username).setPassword(server.credential).createIceServer()
-        }).apply { sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN }
+        }).apply {
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            audioJitterBufferMaxPackets=8
+            audioJitterBufferFastAccelerate=true
+        }
         peer = engine.createPeerConnection(config, object : PeerConnection.Observer {
             override fun onSignalingChange(state: PeerConnection.SignalingState?) {}
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) { postRtc {
@@ -740,27 +767,34 @@ internal class UuDirectSession(
         // for desktop/auxiliary video track selection.
         // Reserve an Opus sender without creating an AudioSource/AudioRecord.
         // Real recording is attached only after permission + remote policy gates.
+        if(!applicationsOnly) {
         microphoneTransceiver=connection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
             RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV))
         microphoneTransceiver?.sender?.setStreams(listOf("audio_0"))
         repeat(5) {
             connection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, options)
         }
+        }
         for (label in listOf(
             "CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL",
-            "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL"
-        )) {
-            val channel = connection.createDataChannel(label, DataChannel.Init().apply { ordered = true })
+            "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL", UuQuickApps.CHANNEL, UuPcvrSession.CONTROL, UuPcvrSession.TRACKING
+        ).filter { !applicationsOnly || it !in setOf("STREAMER_DATA_CHANNEL",UuPcvrSession.CONTROL,UuPcvrSession.TRACKING) }) {
+            val channel = connection.createDataChannel(label, DataChannel.Init().apply { ordered = label!=UuPcvrSession.TRACKING; if(label==UuPcvrSession.TRACKING) maxRetransmits=0 })
             if (channel != null) {
                 channels.add(channel)
                 listenChannel(channel)
             }
         }
-        connection.createOffer(sdpObserver(onCreated = { desc ->
+        connection.createOffer(sdpObserver(onCreated = offer@{ generated ->
+            val desc=SessionDescription(generated.type,UuAudioOffer.lowLatency(generated.description))
+            val mediaLines=generated.description.lineSequence().count {it.startsWith("m=audio ") || it.startsWith("m=video ")}
+            emit("连接用途：${if(applicationsOnly) "应用/文件纯数据" else "桌面串流"}，音视频 m-line=$mediaLines")
+            if(applicationsOnly && mediaLines!=0) {emit("纯数据连接出现媒体轨道，已中止");terminateUnexpectedly();return@offer}
+
             connection.setLocalDescription(sdpObserver(onSuccess = {
                 synchronized(this@UuDirectSession) {
                     if (closed.get()) return@synchronized
-                    val wireSdp = UuWire.uuOfferSdp(desc.description)
+                    val wireSdp = UuWire.uuOfferSdp(desc.description,if(applicationsOnly) "*" else "audio_0")
                     val zip = UuWire.gzip(wireSdp.toByteArray(StandardCharsets.UTF_8))
                     val ws = socket
                     if (ws == null || !ws.send(UuWire.offerHeader(info)) ||
@@ -793,6 +827,7 @@ internal class UuDirectSession(
 
     private fun attachAudio(track: MediaStreamTrack?) {
         if (track !is AudioTrack) return
+        if(applicationsOnly) {track.setEnabled(false);return}
         synchronized(this) {
             if (closed.get() || remoteAudio === track) return
             remoteAudio?.setEnabled(false)
@@ -822,6 +857,8 @@ internal class UuDirectSession(
                     emit("数据通道 $label：${channel.state()}")
                     if (channel.state() == DataChannel.State.OPEN) {
                         when (channel.label()) {
+                            UuQuickApps.CHANNEL -> quickApps.bind(channel)
+                            UuPcvrSession.CONTROL,UuPcvrSession.TRACKING -> vr.bind(channel)
                             "CONTROL_DATA_CHANNEL" -> {
                                 controlChannel = channel
                                 startPbHandshake()
@@ -833,6 +870,8 @@ internal class UuDirectSession(
                         }
                     } else if (channel.state() == DataChannel.State.CLOSED ||
                                channel.state() == DataChannel.State.CLOSING) {
+                        if(channel.label()==UuQuickApps.CHANNEL) quickApps.close()
+                        if(channel.label() in setOf(UuPcvrSession.CONTROL,UuPcvrSession.TRACKING)) vr.close()
                         val critical = channel === controlChannel || channel === textChannel
                         if (critical && !closed.get()) {
                             // Revoke the button while CONTROL is still writable.
@@ -859,10 +898,14 @@ internal class UuDirectSession(
                 postRtc {
                 synchronized(this@UuDirectSession) {
                     if (closed.get()) return@postRtc
+                    if(channel.label()==UuPcvrSession.CONTROL) {vr.receive(bytes);return@postRtc}
+                    if(channel.label()==UuQuickApps.CHANNEL) {quickApps.receive(bytes);return@postRtc}
+                    if(channel.label() in setOf("TEXT_DATA_CHANNEL","FILE_DATA_CHANNEL") && transfers.receive(bytes)) return@postRtc
                     val isControl = channel.label() == "CONTROL_DATA_CHANNEL"
                     if (!isControl && channel.label() != "TEXT_DATA_CHANNEL") return@postRtc
                     if (bytes.isNotEmpty() && bytes[0] == '{'.code.toByte()) return@postRtc
                     try {
+                        if(files.receive(bytes)) return@postRtc
                         if(clipboardWire.receive(bytes,clipboardBinding.enabled && appFocused.get() && inputReady())) return@postRtc
                         val payload = UuWire.decodeEnvelope(bytes)
                         payload.microphoneAck?.let {(id,code) -> micState.response(id,code);updateMicrophone();if(code!=0) emit("远端麦克风策略被拒绝：$code")}
@@ -979,6 +1022,7 @@ internal class UuDirectSession(
     }
 
     @Synchronized private fun maybeStartCapture() {
+        if(applicationsOnly) return
         if (negotiatedVideoTracks.isEmpty()) return
         val controlOpen = controlChannel?.state() == DataChannel.State.OPEN
         val textOpen = textChannel?.state() == DataChannel.State.OPEN
@@ -1188,7 +1232,7 @@ internal class UuDirectSession(
         // PeerConnection.dispose must not run on Observer/DataChannel callbacks.
         // Mark closed synchronously, then release on the Android main queue.
         audioModule?.setMicrophoneMute(true);micState.stop()
-        clipboardBinding.enable(false);live.remove(this)
+        clipboardBinding.enable(false);transfers.close();files.close();quickApps.close();vr.close();live.remove(this)
         deferredClose.request { rtcCallbacks.close();disposeAfterCallbacks() }
     }
 

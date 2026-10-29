@@ -22,17 +22,10 @@ internal class PicoXrWindowFrame(private val surface: Surface) {
     private var brightness=1f
     fun background(color: Int,image: Bitmap?,alpha: Int,brightness: Int) {background=color;backgroundImage=image;backgroundAlpha=alpha.coerceIn(0,255);this.brightness=brightness.coerceIn(25,100)/100f;draw()}
     private var hover=-1
-    private var pointerPane=-1
-    private var pointerU=0f
-    private var pointerV=0f
     private var pointerDown=false
-    private var lastDraw=0L
-    fun pointer(target: Int,u: Float,v: Float,down: Boolean,touchMode: Boolean) {
-        val pane=if(touchMode && target in 0..5 && u in 0f..1f && v in 0f..1f) target else -1
-        val now=android.os.SystemClock.uptimeMillis()
-        val changed=pane!=pointerPane || down!=pointerDown || target!=hover
-        if(!changed && (pane<0 || now-lastDraw<33 || (kotlin.math.abs(u-pointerU)<.002f && kotlin.math.abs(v-pointerV)<.002f))) return
-        hover=target;pointerPane=pane;pointerU=u;pointerV=v;pointerDown=down;lastDraw=now;draw()
+    fun pointer(target: Int,down: Boolean) {
+        if(target==hover && down==pointerDown) return
+        hover=target;pointerDown=down;draw()
     }
     fun hover(target: Int) { if(target!=hover) {hover=target;draw()} }
     fun draw() {
@@ -43,56 +36,63 @@ internal class PicoXrWindowFrame(private val surface: Surface) {
             val p=Paint(Paint.ANTI_ALIAS_FLAG)
             repeat(6) { pane ->
                 c.save();c.translate((pane%2)*1200f,(pane/2)*800f)
-                p.color=Color.argb(245,22,27,35)
-                c.drawRoundRect(RectF(100f,0f,1100f,54f),14f,14f,p)
-                p.color=if(hover==49+pane) Color.rgb(34,53,78) else Color.rgb(32,39,49)
-                c.drawRoundRect(RectF(110f,5f,330f,49f),7f,7f,p)
-                p.color=PicoTheme.TEXT;p.textSize=24f
+                val layout=PicoXrFrameLayout
+                val left=layout.WIDTH/2-layout.WIDTH/(2*layout.SCALE_X)
+                val right=layout.WIDTH-left
+                val bottom=layout.HEIGHT/2+layout.HEIGHT/(2*layout.SCALE_Y)
+                // Thin connected-device title bar; the video area stays transparent.
+                val header=android.graphics.Path().apply {
+                    addRoundRect(RectF(left,8f,right,55.2f),floatArrayOf(18f,18f,18f,18f,0f,0f,0f,0f),android.graphics.Path.Direction.CW)
+                }
+                p.color=Color.argb(239,19,23,29);c.drawPath(header,p)
+                p.style=Paint.Style.STROKE;p.strokeWidth=1.3f;p.color=Color.argb(85,168,184,205)
+                c.drawRoundRect(RectF(left,8f,right,bottom),18f,18f,p)
+                p.style=Paint.Style.FILL
+                fun region(values: FloatArray,target: Int,active: Boolean=false) {
+                    if(hover==target || active) PicoXrMaterial.control(c,RectF(values[0],values[1],values[2],values[3]),active,hover==target,pointerDown)
+                }
+                region(layout.device,49+pane)
+                region(layout.screen,55+pane)
+                p.style=Paint.Style.STROKE;p.strokeWidth=2.1f;p.color=PicoTheme.MUTED
+                c.drawRoundRect(RectF(64f,23f,85f,37f),2f,2f,p)
+                c.drawLine(74.5f,37f,74.5f,41f,p);c.drawLine(69f,41f,80f,41f,p)
+                p.style=Paint.Style.FILL
                 val device=titles[pane].substringBefore(" - ")+" ▾"
-                c.drawText(device.take(p.breakText(device,true,190f,null)),122f,35f,p)
+                PicoXrMaterial.label(c,device,98f,40f,214f,23f,medium=true)
+                p.color=Color.argb(62,182,194,210);c.drawRect(335f,21f,336f,43f,p)
+                val screen=titles[pane].substringAfter(" - ","屏幕")+" ▾"
+                PicoXrMaterial.label(c,screen,360f,40f,410f,23f)
                 for(slot in 0..1) {
                     val active=if(slot==0) microphones[pane] else clipboards[pane]
-                    val hovered=hover==(if(slot==0) 67 else 73)+pane
-                    val x=340f+slot*65
-                    p.color=if(active || hovered) Color.rgb(34,53,78) else Color.rgb(22,26,33)
-                    c.drawRoundRect(RectF(x,5f,x+55,49f),7f,7f,p)
-                    PicoToolbarIcons.draw(c,if(slot==0) "mic" else "clipboard",x+12,11f,30f,if(active || hovered) PicoTheme.ACCENT else PicoTheme.MUTED)
+                    val rect=if(slot==0) layout.microphone else layout.clipboard
+                    val target=(if(slot==0) 67 else 73)+pane
+                    region(rect,target)
+                    PicoToolbarIcons.draw(c,if(slot==0) "mic" else "clipboard",rect[0]+9,19f,25f,
+                        if(active || hover==target) PicoTheme.ACCENT else PicoTheme.MUTED)
                 }
-                p.color=if(hover==55+pane) PicoTheme.ACCENT else Color.rgb(34,53,78)
-                c.drawRoundRect(RectF(475f,5f,880f,49f),7f,7f,p)
-                p.color=PicoTheme.TEXT
-                val screen="▣ "+titles[pane].substringAfter(" - ","屏幕")
-                c.drawText(screen.take(p.breakText(screen,true,370f,null)),488f,35f,p)
-                p.color=PicoTheme.ACCENT;c.drawRect(490f,47f,866f,50f,p)
-                p.color=if(hover==43+pane) PicoTheme.ACCENT else Color.rgb(32,39,49)
-                c.drawRoundRect(RectF(900f,5f,1010f,49f),7f,7f,p)
-                p.color=Color.WHITE;c.drawText("画质",929f,35f,p)
-                p.color=if(hover==61+pane) PicoTheme.ACCENT else PicoTheme.TEXT;p.textSize=32f;c.drawText("+",1050f,37f,p)
-                val drag=hover==7+pane
+                region(layout.quality,43+pane);region(layout.add,61+pane)
+                p.style=Paint.Style.STROKE;p.strokeWidth=2f;p.color=if(hover==43+pane) PicoTheme.ACCENT else PicoTheme.MUTED
+                for(i in 0..2) {val y=24f+i*8;c.drawLine(922f,y,944f,y,p);c.drawCircle(if(i%2==0) 929f else 939f,y,2.4f,p)}
+                p.color=if(hover==61+pane) PicoTheme.ACCENT else PicoTheme.MUTED
+                c.drawLine(985f,32f,1005f,32f,p);c.drawLine(995f,22f,995f,42f,p)
                 val close=hover==37+pane
-                p.color=if(drag) PicoTheme.ACCENT else Color.rgb(128,138,152)
-                c.drawRoundRect(RectF(300f,762f,880f,786f),12f,12f,p)
-                p.color=if(close) Color.rgb(225,88,95) else Color.rgb(90,100,116)
-                c.drawRoundRect(RectF(910f,748f,1000f,798f),12f,12f,p)
-                p.color=Color.WHITE;p.strokeWidth=5f
-                c.drawLine(940f,762f,970f,786f,p);c.drawLine(970f,762f,940f,786f,p)
-                p.style=Paint.Style.STROKE;p.strokeWidth=6f
-                repeat(4) { corner ->
-                    p.color=if(hover==13+pane*4+corner) PicoTheme.ACCENT else Color.rgb(128,138,152)
-                    val right=corner%2==1;val bottom=corner>=2
-                    val x=if(right) 1184f else 16f;val y=if(bottom) 784f else 16f
-                    c.drawLine(x,y,x+if(right) -72f else 72f,y,p)
-                    c.drawLine(x,y,x,y+if(bottom) -46f else 46f,p)
+                p.style=Paint.Style.FILL;p.color=if(close) Color.argb(220,151,55,66) else Color.argb(42,230,96,107)
+                c.drawCircle(1125f,32f,15f,p)
+                p.style=Paint.Style.STROKE;p.strokeWidth=2.2f;p.color=if(close) Color.WHITE else Color.rgb(224,105,115)
+                c.drawArc(RectF(1117f,24f,1133f,40f),-55f,290f,false,p);c.drawLine(1125f,21f,1125f,31f,p)
+                // Compact PICO-style rail: grey until hovered, blue while moving.
+                p.style=Paint.Style.FILL;p.color=if(hover==7+pane) PicoTheme.ACCENT else Color.argb(214,100,110,123)
+                c.drawRoundRect(RectF(470f,766f,730f,782f),8f,8f,p)
+                p.style=Paint.Style.STROKE;p.strokeWidth=3f;p.strokeCap=Paint.Cap.ROUND
+                repeat(4) {corner ->
+                    // Quiet idle corners; only the active external resize handle lights up.
+                    p.color=if(hover==13+pane*4+corner) PicoTheme.ACCENT else Color.argb(36,184,199,217)
+                    val rightCorner=corner%2==1;val low=corner>=2
+                    val x=if(rightCorner) 1175f else 25f;val y=if(low) 752f else 12f
+                    c.drawLine(x,y,x+if(rightCorner) -20f else 20f,y,p)
+                    c.drawLine(x,y,x,y+if(low) -18f else 18f,p)
                 }
                 p.style=Paint.Style.FILL
-                if(pointerPane==pane) {
-                    val x=(.5f+(pointerU-.5f)/1.06f)*1200
-                    val y=(.5f+(pointerV-.5f)/1.16f)*800
-                    p.style=Paint.Style.FILL;p.color=Color.argb(110,0,0,0)
-                    c.drawCircle(x,y,if(pointerDown) 13f else 10f,p)
-                    p.color=if(pointerDown) PicoTheme.ACCENT else Color.WHITE
-                    c.drawCircle(x,y,if(pointerDown) 9f else 6f,p)
-                }
                 c.restore()
             }
             // Atlas-only white tile: reserved outside all window subimages.

@@ -208,3 +208,108 @@
   Both are opt-in; microphone capture requires Android permission, negotiated send
   direction, remote driver acknowledgement/open event and foreground app state.
   Remote microphone interoperability and live clipboard transfer remain unverified.
+
+## Monitor header popup placement (2026-10-28)
+
+- Header quality, device, display and virtual-display menus anchor above their
+  originating monitor. Nested landscape/portrait pages recompute clearance using
+  actual popup height and the monitor's yaw/pitch basis, including portrait screens.
+- Anchored menus track the monitor; explicit menu dragging detaches the anchor.
+  Root navigation retains its independent menu placement. Device-list refresh does
+  not reset the window anchor. Mic/clipboard switches do not move any popup.
+- Native geometry tests cover landscape/portrait hosts and popups, yaw and pitch;
+  these are not a substitute for headset pointer/visual acceptance.
+
+### Menu usability follow-up
+
+- Parameter submenus use portrait lists with selected values, eight-row paging,
+  explicit back navigation and an empty-capability message. Bitrate uses a readable
+  portrait slider with separate apply/cancel actions; pending requests still await ACK.
+- Screen selection can page beyond the first eight displays and opens on the current
+  display's page. Refresh clamps the page after topology changes. Navigating between
+  device, quality, display and virtual-display pages clears stale confirmation state.
+- Added pure hit-test checks for list spacing, empty-list navigation and invalid rays.
+  Headset visual/interaction validation remains pending while ADB is disconnected.
+
+## Android handset layout groundwork
+
+- Below 600 dp, use bottom navigation with a separate account action instead of
+  squeezing a desktop sidebar into a handset. Wider PICO panels retain the sidebar.
+- Device cards use a primary desktop-entry action, keep immersive entry explicit,
+  and show only actual device-list metadata in details (no invented hardware data).
+- Extended Android fixtures cover 390 dp -> wide layout round trips. Compilation
+  is not device execution: ADB is currently disconnected, so handset screenshots,
+  dialogs and live connection acceptance remain unverified. Official Android UU
+  reference screenshots are still needed for exact visual parity.
+
+## Immersive material and text-sampling pass
+
+- Shared rounded spatial surfaces use subtle gradients, inset silhouettes and fine
+  borders; selected/hover/pressed controls have distinct colors. Root actions now
+  use consistent line icons and a red disconnect affordance. No blur, readback or
+  additional compositor layers are used.
+- Menu Surface resolution is 1200×2000 (previously 1200×400). Rendering scales the
+  existing 1200×400 logical coordinates to actual Surface height, so portrait menus
+  use full vertical samples without changing native normalized input coordinates.
+  Main/menu physical aspect and monitor-above anchoring remain unchanged.
+- Added Android rendering fixtures for quality, list and bitrate panels, including
+  transparent-corner/material-alpha assertions and PNG capture. These fixtures have
+  not been executed or visually inspected without a connected Android device.
+
+
+## Unified MR menu chrome
+
+- The shared surface material now uses actual source alpha with a dark translucent
+  body and a lit rim, not opaque desktop cards or simulated camera blur. Native menu
+  quads enable premultiplied source-alpha blending; video quads remain opaque.
+- Root menus, parameter lists, quality/device menus, custom keyboard keys and all
+  stream title-bar controls share the same material and interaction states. Atlas
+  drawing uses a non-clearing sheet primitive so one header cannot erase others.
+- Rendering fixtures now assert translucent content rather than opaque content.
+  APK/test APK compilation is distinct from executing these fixtures or verifying
+  compositor appearance on PICO; those checks still require a connected headset.
+
+### Default independent-menu distance
+
+The independent menu now starts at local Z = -2.8 m instead of -2 m. Launch,
+layout reset, return-home and closed-host fallback all use `default_menu_panel()`.
+Width stays 1.65 m; monitor-attached popup placement and manual depth adjustment
+are unchanged. Native geometry assertions cover the default pose; perceived comfort
+and reachability still require headset validation.
+
+## Android controlled-host capture foundation (not UU host interoperability)
+
+- Settings -> capture authorization opens a private Activity and fresh system
+  MediaProjection consent. The private mediaProjection foreground service captures
+  WebRTC video frames locally, counts frames and tracks actual dimensions. It does
+  not store pixels, create a network listener, send media or advertise UU online.
+- Persistent notification and Activity expose stop. Grant cancellation, system
+  revocation, startup failure, 15-second no-frame timeout and service destruction
+  stop/release capture, texture helper and EGL. START_NOT_STICKY prevents unattended
+  restart; projection grants are not persisted. A process-wide busy guard prevents
+  a fast restart from racing old capture cleanup. No microphone capture is enabled.
+- Full UU hosting remains incomplete: account-bound host rendezvous/publication,
+  authenticated incoming-session policy, media send negotiation, UU control RPCs and
+  explicitly authorized Accessibility input are not yet implemented. No capability
+  flag was changed to pretend these are available. PICO MR/system capture scope
+  must be checked on hardware, not inferred from MediaProjection support.
+- Size-planner JVM tests and private-component manifest checks are local tests.
+  No connected headset is available for actual permission/capture/stop validation.
+
+## 内置 PCVR 第一阶段（追踪诊断，非游戏串流验收）
+
+1. 在新版 Linux OpenUUYC 被控设置安装内置驱动，自行重启 SteamVR；无需打开外部串流客户端。
+2. 同账号 PICO 连接本机，Linux 明确允许远程终端授权。在沉浸菜单「应用 → 内置 VR」开启追踪诊断。
+3. 观察计数递增及 fresh 状态；移动头部与左右手，验证三个 GenericTracker 的姿态，不应出现或切换假的 HMD。
+4. 拖动/跟随菜单和窗口，确认 LOCAL 空间追踪不跟随菜单变换。
+5. 关闭追踪、断连、撤销权限、头显失焦分别测试；驱动最多 250ms 后报告失联。重新连接后不得有遗留占用。
+6. 同时第二个会话/第二个 OpenUUYC 进程尝试开启，必须拒绝；驱动退出或崩溃重启应正常回收 socket。
+7. 双眼画面、输入绑定与 VRChat 游玩尚未实现，不可用桌面画面代替上述验收。
+
+### 2026-10-29 file management completion checkpoint (local)
+
+- Android: `assembleDebug`, JVM tests (213), and `lintDebug` passed in the temporary SDK/NDK build project using the repository sources.
+- Native geometry/input: all 14 standalone C++ test programs passed (JNI includes supplied for the surface callback test); Python launcher/protocol integration checks: 14 passed.
+- Rust focused regressions: quick-app authorization/catalog (3), PCVR tracking bridge (3), audio queue freshness (1) passed.
+- New FTP tests exercise official request framing, compressed/plain directory parity, path validation, upload block/save acknowledgements, download completion/length checks, and cancellation against a simulated peer.
+- The latest single-file transfer APK has NOT been validated against the real PICO/UU host. ADB discovery currently has no device. These results are not evidence of upload/download interoperability on the headset, folder batch transfer, persistent cross-session resume, or a complete PCVR HMD transport.

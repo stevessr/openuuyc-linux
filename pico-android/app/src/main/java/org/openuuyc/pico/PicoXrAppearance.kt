@@ -11,6 +11,29 @@ import java.io.File
 internal class PicoXrAppearance(private val context: Context) {
     private val prefs=context.getSharedPreferences("xr_appearance",Context.MODE_PRIVATE)
     private val imageFile=File(context.filesDir,"xr-background.img")
+    var menuHand=prefs.getInt("menu_hand",0).coerceIn(0,1); private set
+    fun setMenuHand(value: Int) {menuHand=value.coerceIn(0,1);prefs.edit().putInt("menu_hand",menuHand).apply()}
+    var focusDots=prefs.getBoolean("focus_dots",false); private set
+    fun setFocusDots(enabled: Boolean) {focusDots=enabled;prefs.edit().putBoolean("focus_dots",enabled).apply()}
+    var flow=prefs.getBoolean("background_flow",true); private set
+    fun toggleFlow() {flow=!flow;prefs.edit().putBoolean("background_flow",flow).apply()}
+    data class EnvironmentImage(val width: Int,val height: Int,val rgba: ByteArray)
+    @Volatile private var environmentImage: EnvironmentImage?=null
+    private var preparedImage: Bitmap?=null
+    fun environmentImage()=environmentImage
+    private fun prepareEnvironmentImage() {
+        val source=if(custom) image else null
+        if(source===preparedImage) return
+        preparedImage=source;environmentImage=null
+        if(source==null || source.isRecycled) return
+        val scale=minOf(1f,1024f/maxOf(source.width,source.height))
+        val reduced=if(scale<1f) Bitmap.createScaledBitmap(source,maxOf(1,(source.width*scale).toInt()),maxOf(1,(source.height*scale).toInt()),true) else source
+        val pixels=IntArray(reduced.width*reduced.height);reduced.getPixels(pixels,0,reduced.width,0,0,reduced.width,reduced.height)
+        val bytes=ByteArray(pixels.size*4)
+        for((i,c) in pixels.withIndex()) {bytes[i*4]=(c ushr 16).toByte();bytes[i*4+1]=(c ushr 8).toByte();bytes[i*4+2]=c.toByte();bytes[i*4+3]=(c ushr 24).toByte()}
+        environmentImage=EnvironmentImage(reduced.width,reduced.height,bytes)
+        if(reduced!==source) reduced.recycle()
+    }
     var mr=prefs.getBoolean("mr",true); private set
     var visibility=prefs.getInt("visibility",100).coerceIn(0,100); private set
     var color=prefs.getInt("color",Color.BLACK); private set
@@ -23,6 +46,7 @@ internal class PicoXrAppearance(private val context: Context) {
     private var generatedKey=""
     fun backgroundImage(): Bitmap?=if(custom) image else generated
     fun prepareBackground() {
+        prepareEnvironmentImage()
         val preset=PicoBackgroundPattern.find(presetId)
         if(custom || !preset.procedural) {generated=null;generatedKey="";return}
         val key="${preset.id}:$seed"
@@ -61,7 +85,7 @@ internal class PicoXrAppearance(private val context: Context) {
             }
             val decoded=decode(temp) ?: error("无法解析图片，请选择 PNG/JPEG/WebP")
             check(temp.renameTo(imageFile)) {"图片保存失败"}
-            image=decoded;useImage(true)
+            image=decoded;useImage(true);prepareBackground()
         } finally {temp.delete()}
     }
     private fun decode(file: File): Bitmap?=runCatching {

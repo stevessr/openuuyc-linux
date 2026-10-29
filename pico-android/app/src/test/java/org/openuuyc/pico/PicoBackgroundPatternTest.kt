@@ -5,8 +5,8 @@ import org.junit.Test
 
 class PicoBackgroundPatternTest {
     @Test fun allPresetsAreOpaqueAndDeterministic() {
-        assertEquals(10,PicoBackgroundPattern.presets.size)
-        assertEquals(10,PicoBackgroundPattern.presets.map {it.id}.distinct().size)
+        assertEquals(14,PicoBackgroundPattern.presets.size)
+        assertEquals(14,PicoBackgroundPattern.presets.map {it.id}.distinct().size)
         for(preset in PicoBackgroundPattern.presets) {
             val pixels=PicoBackgroundPattern.render(preset.id,96,64,7)
             assertEquals(6144,pixels.size)

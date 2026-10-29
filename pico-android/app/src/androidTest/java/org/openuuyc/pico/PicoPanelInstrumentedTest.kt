@@ -20,11 +20,17 @@ import java.io.File
 @Suppress("DEPRECATION")
 class PicoPanelInstrumentation : Instrumentation() {
     private var phase: String? = null
-    override fun onCreate(arguments: Bundle?) { phase = arguments?.getString("vault-phase"); super.onCreate(arguments); start() }
+    private var probeDurationMs=3000L
+    override fun onCreate(arguments: Bundle?) { phase = arguments?.getString("vault-phase"); probeDurationMs=(arguments?.getString("probe-seconds")?.toLongOrNull() ?: 3).coerceIn(3,30)*1000; super.onCreate(arguments); start() }
     override fun onStart() {
+        sendStatus(0,Bundle().apply {putString("stream","Fixture phase: $phase\n")})
         val error = AtomicReference<Throwable?>(null)
-        runOnMainSync {
-            try { when (phase) { "xr-menu" -> verifyXrGlobalMenu(); "quality" -> verifyQualityCanvas(); "profile" -> { val p=org.openuuyc.pico.uu.UuAndroidDeviceProfile.read(targetContext); check(p.memoryMiB>0 && p.cpu.isNotBlank() && p.screen.contains("x")); sendStatus(0,Bundle().apply {putString("stream","Hardware profile: CPU=${p.cpu}; memory=${p.memoryMiB} MiB; GPU=${p.video}; display=${p.screen}\n")}) }; "runtime" -> { val info=PicoRuntimeProbe.extensions(targetContext); check(!info.startsWith("error:")) { info }; sendStatus(0, Bundle().apply { putString("stream", "PICO runtime extensions:\n$info\n") }) }; "network-denied" -> verifyMissingNetworkPermission(); "network" -> verifyRtcStartup(); null -> verifyPanel(); else -> verifyVaultPhase(phase!!) } } catch (failure: Throwable) { error.set(failure) }
+        if(phase=="native-ime") {
+            try {verifyNativeIme()} catch(failure: Throwable) {error.set(failure)}
+        } else if(phase=="pcvr-stereo" || phase=="xr-pointer") {
+            try {verifyPcvrStereo()} catch(failure: Throwable) {error.set(failure)}
+        } else runOnMainSync {
+            try { when (phase) { "rounded-video" -> verifyRoundedVideo(); "controller-menu" -> verifyControllerMenu(); "focus-dots" -> verifyFocusDotsSetting(); "xr-menu" -> verifyXrGlobalMenu(); "quality" -> verifyQualityCanvas(); "profile" -> { val p=org.openuuyc.pico.uu.UuAndroidDeviceProfile.read(targetContext); check(p.memoryMiB>0 && p.cpu.isNotBlank() && p.screen.contains("x")); sendStatus(0,Bundle().apply {putString("stream","Hardware profile: CPU=${p.cpu}; memory=${p.memoryMiB} MiB; GPU=${p.video}; display=${p.screen}\n")}) }; "runtime" -> { val info=PicoRuntimeProbe.extensions(targetContext); check(!info.startsWith("error:")) { info }; sendStatus(0, Bundle().apply { putString("stream", "PICO runtime extensions:\n$info\n") }) }; "network-denied" -> verifyMissingNetworkPermission(); "network" -> verifyRtcStartup(); null -> verifyPanel(); else -> verifyVaultPhase(phase!!) } } catch (failure: Throwable) { error.set(failure) }
         }
         val result = Bundle()
         val failure = error.get()
@@ -32,8 +38,188 @@ class PicoPanelInstrumentation : Instrumentation() {
         result.putInt("tests", 1); result.putInt("failures", if (failure == null) 0 else 1)
         finish(if (failure == null) Activity.RESULT_OK else Activity.RESULT_CANCELED, result)
     }
+    private fun verifyPcvrStereo() {
+        val pointer=phase=="xr-pointer"
+        val report=File(targetContext.filesDir,if(pointer) "pointer-probe.json" else "pcvr-probe.json")
+        val error=File(targetContext.filesDir,"pcvr-probe-error.txt")
+        report.delete();error.delete()
+        val intent=android.content.Intent(targetContext,XrActivity::class.java)
+            .putExtra("openuuyc.pcvr.probe",true).putExtra("openuuyc.pcvr.pointer",pointer)
+            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        val monitor=addMonitor(XrActivity::class.java.name,null,false)
+        sendStatus(0,Bundle().apply {putString("stream","Launching internal stereo probe Activity\n")})
+        runOnMainSync {targetContext.startActivity(intent)}
+        val activity=waitForMonitorWithTimeout(monitor,10000) as? PicoActivity
+        removeMonitor(monitor)
+        checkNotNull(activity) {"PICO did not launch the internal XR Activity within 10 seconds"}
+        try {
+            val minimum=android.os.SystemClock.elapsedRealtime()+probeDurationMs
+            val deadline=minimum+25000
+            var value:org.json.JSONObject?=null
+            while(android.os.SystemClock.elapsedRealtime()<deadline) {
+                check(!error.exists()) {error.readText()}
+                if(report.exists()) {
+                    value=runCatching {org.json.JSONObject(report.readText())}.getOrNull()
+                    if((value?.optLong(if(pointer) "samples" else "projectionFrames") ?: 0)>=120 && android.os.SystemClock.elapsedRealtime()>=minimum) break
+                }
+                Thread.sleep(200)
+            }
+            val result=checkNotNull(value) {"No stereo projection report; wear/wake the headset and keep OpenUUYC focused"}
+            if(pointer) {
+                check(result.getLong("samples")>=120 && result.getLong("leftValid")>0 && result.getLong("rightValid")>0) {result.toString()}
+            } else {
+                check(result.getLong("projectionFrames")>=120 && result.getLong("headValid")>0) {result.toString()}
+                check(result.getDouble("ipdMeters") in 0.03..0.09) {result.toString()}
+                check(result.getInt("leftWidth")>0 && result.getInt("rightWidth")>0)
+            }
+            sendStatus(0,Bundle().apply {putString("stream","On-device stereo PROBE (not remote video): $result\n")})
+        } finally {
+            runOnMainSync {activity.finishAndRemoveTask()}
+            val deadline=android.os.SystemClock.elapsedRealtime()+5000
+            while(!activity.pcvrProbeStopped && android.os.SystemClock.elapsedRealtime()<deadline) Thread.sleep(50)
+            check(activity.pcvrProbeStopped) {"XR probe did not release its session within 5 seconds"}
+        }
+    }
+
     private fun assertEquals(expected: Any?, actual: Any?) { check(expected == actual) { "expected=$expected actual=$actual" } }
     private fun assertTrue(value: Boolean) { check(value) }
+    private fun verifyNativeIme() {
+        val monitor=addMonitor(PicoActivity::class.java.name,null,false)
+        runOnMainSync {targetContext.startActivity(android.content.Intent(targetContext,PicoActivity::class.java)
+            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK))}
+        val activity=waitForMonitorWithTimeout(monitor,10000)
+        removeMonitor(monitor)
+        checkNotNull(activity) {"PICO blocked the native IME fixture Activity"}
+        val output=mutableListOf<String>()
+        lateinit var keyboard:PicoRemoteKeyboard
+        try {
+            runOnMainSync {
+                keyboard=PicoRemoteKeyboard(activity,{output.add(it);true},{_,_->true})
+                activity.setContentView(keyboard);keyboard.show()
+            }
+            val deadline=android.os.SystemClock.elapsedRealtime()+5000
+            var active=false
+            while(android.os.SystemClock.elapsedRealtime()<deadline && !active) {
+                runOnMainSync {active=keyboard.nativeEditor?.let {(activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager).isActive(it)}==true}
+                if(!active) Thread.sleep(100)
+            }
+            check(active) {"System IME did not bind the native EditText"}
+            runOnMainSync {
+                val editor=checkNotNull(keyboard.nativeEditor)
+                val info=android.view.inputmethod.EditorInfo()
+                val input=checkNotNull(editor.onCreateInputConnection(info))
+                check(info.imeOptions and android.view.inputmethod.EditorInfo.IME_FLAG_FORCE_ASCII==0)
+                input.setComposingText("zhongwen",1)
+                check(output.isEmpty())
+                val value="中文 日本語 한국어 العربية e\u0301 👩🏽‍💻"
+                input.commitText(value,1)
+                check(output.isEmpty()) {"Composition must not be sent before confirmation"}
+                editor.onEditorAction(android.view.inputmethod.EditorInfo.IME_ACTION_SEND)
+                check(output==listOf(value)) {"Unicode text was altered or duplicated"}
+                keyboard.show()
+                val cancelled=checkNotNull(keyboard.nativeEditor).onCreateInputConnection(android.view.inputmethod.EditorInfo())!!
+                cancelled.setComposingText("未确认",1);keyboard.hide()
+                check(output.size==1) {"Cancelled text must not be sent"}
+            }
+            sendStatus(0,Bundle().apply {putString("stream","Native IME bound; multilingual Unicode/composition/confirm/cancel passed; no audio recording or remote transport used.\n")})
+        } finally {runOnMainSync {runCatching {keyboard.hide()};activity.finishAndRemoveTask()}}
+    }
+
+    private fun verifyRoundedVideo() {
+        val egl=org.webrtc.EglBase.create(null,org.webrtc.EglBase.CONFIG_PIXEL_RGBA_BUFFER)
+        val drawer=org.webrtc.OpenUuRoundedDrawer()
+        val textures=IntArray(4)
+        try {
+            egl.createPbufferSurface(256,256);egl.makeCurrent()
+            android.opengl.GLES20.glGenTextures(4,textures,0)
+            fun texture(index: Int,rgba: Boolean,value: Int) {
+                val format=if(rgba) android.opengl.GLES20.GL_RGBA else android.opengl.GLES20.GL_LUMINANCE
+                val bytes=if(rgba) byteArrayOf(255.toByte(),0,0,255.toByte()) else byteArrayOf(value.toByte())
+                val data=java.nio.ByteBuffer.allocateDirect(bytes.size).put(bytes).apply {position(0)}
+                android.opengl.GLES20.glBindTexture(android.opengl.GLES20.GL_TEXTURE_2D,textures[index])
+                android.opengl.GLES20.glTexParameteri(android.opengl.GLES20.GL_TEXTURE_2D,android.opengl.GLES20.GL_TEXTURE_MIN_FILTER,android.opengl.GLES20.GL_LINEAR)
+                android.opengl.GLES20.glTexParameteri(android.opengl.GLES20.GL_TEXTURE_2D,android.opengl.GLES20.GL_TEXTURE_MAG_FILTER,android.opengl.GLES20.GL_LINEAR)
+                android.opengl.GLES20.glTexParameteri(android.opengl.GLES20.GL_TEXTURE_2D,android.opengl.GLES20.GL_TEXTURE_WRAP_S,android.opengl.GLES20.GL_CLAMP_TO_EDGE)
+                android.opengl.GLES20.glTexParameteri(android.opengl.GLES20.GL_TEXTURE_2D,android.opengl.GLES20.GL_TEXTURE_WRAP_T,android.opengl.GLES20.GL_CLAMP_TO_EDGE)
+                android.opengl.GLES20.glTexImage2D(android.opengl.GLES20.GL_TEXTURE_2D,0,format,1,1,0,format,android.opengl.GLES20.GL_UNSIGNED_BYTE,data)
+            }
+            texture(0,true,0);for(i in 1..3) texture(i,false,128)
+            val matrix=FloatArray(16).apply {android.opengl.Matrix.setIdentityM(this,0)}
+            val pixels=java.nio.ByteBuffer.allocateDirect(256*256*4)
+            for((w,h) in listOf(1920 to 1080,1080 to 1920,256 to 256)) for(yuv in listOf(false,true)) {
+                if(yuv) drawer.drawYuv(textures.copyOfRange(1,4),matrix,w,h,0,0,256,256)
+                else drawer.drawRgb(textures[0],matrix,w,h,0,0,256,256)
+                pixels.position(0)
+                android.opengl.GLES20.glReadPixels(0,0,256,256,android.opengl.GLES20.GL_RGBA,android.opengl.GLES20.GL_UNSIGNED_BYTE,pixels)
+                check(android.opengl.GLES20.glGetError()==android.opengl.GLES20.GL_NO_ERROR)
+                fun alpha(x: Int,y: Int)=pixels.get((y*256+x)*4+3).toInt() and 255
+                check(alpha(128,128)>250 && alpha(0,128)>250)
+                for((x,y) in listOf(0 to 0,255 to 0,0 to 255,255 to 255)) check(alpha(x,y)<32) {"Rounded alpha not transparent: $w x $h, yuv=$yuv"}
+            }
+        } finally {
+            runCatching {drawer.release()};runCatching {android.opengl.GLES20.glDeleteTextures(4,textures,0)};egl.release()
+        }
+        sendStatus(0,Bundle().apply {putString("stream","RGB/YUV portrait/landscape rounded alpha probe passed; synthetic pixels, not remote media.\n")})
+    }
+
+    private fun verifyControllerMenu() {
+        val reader=android.media.ImageReader.newInstance(1200,800,android.graphics.PixelFormat.RGBA_8888,4)
+        val following=mutableListOf<Boolean>();val layouts=mutableListOf<Pair<Int,Int>>()
+        val menu=PicoXrToolbar(surface=reader.surface,session={null},followView={following.add(it)},reset={},touchMode={},keyboardModeChanged={},
+            appearance={_,_,_->},closeScreenMenu={},home={},connectImmersive={_,_->},pickBackground={},useImage={},
+            backgroundAction={},menuShape={},connectedIds={emptySet()},disconnect={})
+        fun clickRoot(index: Int) {
+            val r=PicoXrMenuHit.toolbarRect(index)
+            menu.activate((r[0]+r[2])/2400,(r[1]+r[3])/1600)
+            reader.acquireLatestImage()?.close()
+        }
+        try {
+            menu.setControllerMenu(0) {layout,hand->layouts.add(layout to hand)}
+            reader.acquireLatestImage()?.close();assertEquals(0 to 0,layouts.last())
+            clickRoot(8);assertEquals(listOf(true),following)
+            menu.followState(true);reader.acquireLatestImage()?.close()
+            clickRoot(9);assertEquals(listOf(true,false),following)
+            menu.followState(false);reader.acquireLatestImage()?.close()
+            clickRoot(10);assertEquals(3 to 0,layouts.last())
+            menu.activate(.5f,.5f);reader.acquireLatestImage()?.close();assertEquals(0 to 0,layouts.last())
+            clickRoot(3);assertEquals(1 to 0,layouts.last())
+            val hand=PicoXrMenuHit.settingsRect(7)
+            menu.activate((hand[0]+hand[2])/2400,(hand[1]+hand[3])/800)
+            reader.acquireLatestImage()?.close();assertEquals(1 to 1,layouts.last())
+        } finally {menu.close();reader.close()}
+    }
+
+    private fun verifyFocusDotsSetting() {
+        val prefs=targetContext.getSharedPreferences("xr_appearance",android.content.Context.MODE_PRIVATE)
+        val hadValue=prefs.contains("focus_dots")
+        val settings=PicoXrAppearance(targetContext)
+        val initial=settings.focusDots
+        if(!hadValue) assertTrue(!initial)
+        val reader=android.media.ImageReader.newInstance(1200,400,android.graphics.PixelFormat.RGBA_8888,4)
+        val menu=PicoXrToolbar(surface=reader.surface,session={null},followView={},reset={},touchMode={},keyboardModeChanged={},
+            appearance={_,_,_->},closeScreenMenu={},home={},connectImmersive={_,_->},pickBackground={},useImage={},
+            backgroundAction={},menuShape={},connectedIds={emptySet()},disconnect={})
+        var toggles=0
+        try {
+            menu.setFocusDots(initial) {settings.setFocusDots(it);toggles++}
+            reader.acquireLatestImage()?.close()
+            val space=PicoXrMenuHit.toolbarRect(3)
+            menu.activate((space[0]+space[2])/2400,(space[1]+space[3])/1600)
+            reader.acquireLatestImage()?.close()
+            val toggle=PicoXrMenuHit.settingsRect(6)
+            menu.activate((toggle[0]+toggle[2])/2400,(toggle[1]+toggle[3])/800)
+            assertEquals(!initial,PicoXrAppearance(targetContext).focusDots)
+            reader.acquireLatestImage()?.close()
+            menu.activate((toggle[0]+toggle[2])/2400,(toggle[1]+toggle[3])/800)
+            assertEquals(initial,PicoXrAppearance(targetContext).focusDots)
+            assertEquals(2,toggles)
+        } finally {
+            settings.setFocusDots(initial)
+            if(!hadValue) prefs.edit().remove("focus_dots").commit()
+            menu.close();reader.close()
+        }
+    }
+
     private fun verifyXrGlobalMenu() {
         val reader=android.media.ImageReader.newInstance(1200,400,android.graphics.PixelFormat.RGBA_8888,4)
         var home=0;var appearance=0
@@ -42,10 +228,10 @@ class PicoPanelInstrumentation : Instrumentation() {
             backgroundAction={},menuShape={},connectedIds={emptySet()},disconnect={})
         try {
             val homeRect=PicoXrMenuHit.toolbarRect(5)
-            menu.activate((homeRect[0]+homeRect[2])/2400,(homeRect[1]+homeRect[3])/800)
+            menu.activate((homeRect[0]+homeRect[2])/2400,(homeRect[1]+homeRect[3])/1600)
             assertEquals(1,home);reader.acquireLatestImage()?.close()
             val env=PicoXrMenuHit.toolbarRect(4)
-            menu.activate((env[0]+env[2])/2400,(env[1]+env[3])/800)
+            menu.activate((env[0]+env[2])/2400,(env[1]+env[3])/1600)
             reader.acquireLatestImage()?.close()
             val toggle=PicoXrMenuHit.settingsRect(0)
             menu.activate((toggle[0]+toggle[2])/2400,(toggle[1]+toggle[3])/800)
@@ -171,7 +357,23 @@ class PicoPanelInstrumentation : Instrumentation() {
         bitmap.recycle()
     }
 
+    private fun verifyXrMaterials() {
+        val bitmap=Bitmap.createBitmap(1200,2000,Bitmap.Config.ARGB_8888)
+        fun render(name: String,draw: (Canvas)->Unit) {
+            val c=Canvas(bitmap);c.scale(1f,5f);draw(c)
+            assertEquals(0,android.graphics.Color.alpha(bitmap.getPixel(0,0)))
+            val alpha=android.graphics.Color.alpha(bitmap.getPixel(600,1000))
+            assertTrue(alpha in 180..254) // Real alpha, not opaque painted faux glass.
+            File(targetContext.cacheDir,"pico-ui-xr-$name.png").outputStream().use {bitmap.compress(Bitmap.CompressFormat.PNG,100,it)}
+        }
+        render("quality") {PicoXrQualityCanvas.draw(it,null,.4f,.2f,false,"等待真实远端能力")}
+        render("options") {PicoXrOptionCanvas.draw(it,"编码偏好",listOf("自动","H.264","H.265"),0,0,30,.4f,.2f,"仅作绘制测试")}
+        render("bitrate") {PicoXrOptionCanvas.draw(it,"自定义码率",emptyList(),-1,0,120,.75f,.8f,"尚未应用")}
+        bitmap.recycle()
+    }
+
     private fun verifyPanel() {
+        verifyXrMaterials()
         run {
             val context = targetContext
             var login = 0; var refresh = 0; var logout = 0; var camera = 0; var restore = 0; var immersive = 0;var sms=0
@@ -192,7 +394,7 @@ class PicoPanelInstrumentation : Instrumentation() {
                 UuDevice("offline", "UI TEST · Offline", false, true, 0),
                 UuDevice("busy", "UI TEST · Occupied", true, true, 1)))
             capture(panel, "pico-ui-devices")
-            val connect = nodes(panel).filterIsInstance<Button>().filter { it.text.toString() == "远程连接" }
+            val connect = nodes(panel).filterIsInstance<Button>().filter { it.text.toString() == "进入桌面" }
             assertEquals(2, connect.size); assertEquals(1, connect.count { it.isEnabled })
             assertTrue(button(panel, "抢占连接").isEnabled)
             connect.first { it.isEnabled }.performClick(); assertEquals(listOf("linux"), connections)
@@ -207,6 +409,12 @@ class PicoPanelInstrumentation : Instrumentation() {
             button(panel, "打开 / 关闭相机预览").performClick(); assertEquals(1, camera)
             button(panel, "关于").performClick(); capture(panel, "pico-ui-about")
             button(panel, "我的设备").performClick(); capture(panel, "pico-ui-narrow", 600)
+            capture(panel,"pico-ui-phone",390)
+            assertTrue(button(panel,"账号").visibility==View.VISIBLE)
+            button(panel,"连接设置").performClick()
+            button(panel,"我的设备").performClick()
+            capture(panel,"pico-ui-phone-roundtrip",390)
+            capture(panel,"pico-ui-wide-roundtrip",1280)
             button(panel, "退出登录").performClick(); assertEquals(1, logout)
             panel.setLoginState(false, false); capture(panel, "pico-ui-login-narrow", 600)
             val presses = mutableListOf<Boolean>()

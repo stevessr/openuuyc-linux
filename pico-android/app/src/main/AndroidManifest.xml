@@ -8,8 +8,19 @@
     <uses-feature android:name="android.hardware.camera.any" android:required="false"/>
     <uses-feature android:name="android.hardware.vr.headtracking" android:required="true"/>
     <uses-feature android:glEsVersion="0x00030000" android:required="true"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+    <queries>
+        <intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent>
+        <intent><action android:name="android.intent.action.MAIN"/><category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD"/></intent>
+        <intent><action android:name="android.intent.action.MAIN"/><category android:name="com.oculus.intent.category.VR"/></intent>
+    </queries>
     <application android:icon="@drawable/openuuyc_brand" android:label="OpenUUYC PICO" android:theme="@android:style/Theme.Material.NoActionBar"
                  android:usesCleartextTraffic="false" android:allowBackup="false">
+        <!-- Match PICO official controller-only manifest: no handtracking metadata/permission. -->
+        <meta-data android:name="controller" android:value="1"/>
+        <service android:name="org.openuuyc.pico.uu.host.UuHostCaptureService" android:exported="false" android:foregroundServiceType="mediaProjection"/>
+        <activity android:name="org.openuuyc.pico.uu.host.UuHostCaptureActivity" android:exported="false"/>
         <activity android:name="org.openuuyc.pico.uu.UuMicrophonePermissionActivity" android:exported="false" android:theme="@android:style/Theme.Translucent.NoTitleBar"/>
         <activity android:name=".PicoActivity" android:exported="true"
                   android:resizeableActivity="true" android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density|uiMode">

@@ -4,11 +4,17 @@ on:
     branches: [linux-port, "feat/pico-vr-*"]
     paths:
       - "pico-android/**"
+      - "drivers/pcvr/**"
+      - "src/pcvr/**"
+      - "build.rs"
       - "src/application/viewer/pico_bridge.rs"
       - ".github/workflows/pico-android.yml"
   pull_request:
     paths:
       - "pico-android/**"
+      - "drivers/pcvr/**"
+      - "src/pcvr/**"
+      - "build.rs"
       - "src/application/viewer/pico_bridge.rs"
       - ".github/workflows/pico-android.yml"
   workflow_dispatch:
@@ -81,6 +87,15 @@ jobs:
           c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
             pico-android/app/src/test/cpp/xr_video_resolution_test.cpp -o /tmp/xr-video-resolution-test
           /tmp/xr-video-resolution-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_menu_anchor_test.cpp -o /tmp/xr-menu-anchor-test
+          /tmp/xr-menu-anchor-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_frame_hit_test.cpp -o /tmp/xr-frame-hit-test
+          /tmp/xr-frame-hit-test
+          c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_controller_menu_test.cpp -o /tmp/xr-controller-menu-test
+          /tmp/xr-controller-menu-test
       - name: Validate launcher and immersive Activity separation
         run: python3 -m unittest discover -s pico-android/scripts/tests -v
       - name: Validate ADB smoke script syntax
@@ -134,6 +149,13 @@ jobs:
         run: cargo fmt --all
       - name: Build desktop bridge
         run: cargo check --locked --bin OpenUUYC
+      - name: Validate built-in PCVR protocol and driver lifecycle
+        run: |
+          cargo test --locked --lib pcvr::protocol
+          c++ -std=c++17 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Wall -Wextra -Werror -Wno-unused-parameter \
+            drivers/pcvr/tests/driver_test.cpp -o /tmp/openuuyc-pcvr-test
+          /tmp/openuuyc-pcvr-test
       - name: Validate PICO bridge authentication and protocol
         run: cargo test --locked --lib pico_bridge -- --nocapture
 
