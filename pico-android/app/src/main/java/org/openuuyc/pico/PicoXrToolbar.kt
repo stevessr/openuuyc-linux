@@ -270,7 +270,7 @@ internal class PicoXrToolbar(
                     4,5 -> {environmentPage=true;notice="环境 · MR 与背景"}
                     6 -> {closeScreenMenu();home()}
                     7 -> {
-                        options("应用与 VR 游戏",listOf("远端快速应用","内置 VR 追踪诊断（无双眼画面）","本机 VR 应用 / 游戏"),-1) {entry ->
+                        options("应用与 VR 游戏",listOf("远端快速应用","内置 VR 追踪诊断（无双眼画面）","本机 VR 应用 / 游戏","此连接的 VR 后端"),-1) {entry ->
                             android.os.Handler(android.os.Looper.getMainLooper()).post {
                                 if(entry==2) {
                                     localVrApps {apps ->
@@ -285,6 +285,17 @@ internal class PicoXrToolbar(
                                     return@post
                                 }
                                 val direct=session()
+                                if(entry==3) {
+                                    if(direct==null) {status("先连接 Linux OpenUUYC");return@post}
+                                    direct.quickApps.runtime {value,error->
+                                        if(value==null) status(error ?: "远端不支持后端设置") else {
+                                            val keys=listOf("open_xr_first","open_xr_only","steam_vr")
+                                            options("VR 后端 · 下次连接生效",listOf("OpenXR 优先 / SteamVR 备用","仅内置 OpenXR","SteamVR 备用"),keys.indexOf(value.optString("preference"))) {choice->
+                                                direct.quickApps.setRuntime(keys[choice],::status)
+                                            };draw()
+                                        }
+                                    };return@post
+                                }
                                 if(entry==1 && direct==null) {status("请先连接 Linux OpenUUYC");return@post}
                                 if(entry==1 && direct!=null) {
                                     options("内置 VR · 追踪诊断",listOf("开启追踪桥接","停止追踪桥接","刷新状态：${direct.vr.status}"),-1) {choice ->

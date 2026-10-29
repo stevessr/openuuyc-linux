@@ -44,6 +44,21 @@ struct Cli {
 #[cfg(target_os = "linux")]
 #[derive(Subcommand)]
 enum PicoVrCommand {
+    #[command(hide=true)]
+    RuntimeProbe,
+    /// 查看内置 OpenXR/SteamVR 后端优先级和组件状态
+    RuntimeStatus,
+    /// 选择后端：openxr-first（默认）、openxr-only、steamvr
+    RuntimePreference { value: String },
+    /// 从已构建目录安装 Monado/xrizer 组件；不切换系统运行时
+    ComponentsInstall { directory: std::path::PathBuf },
+    /// 无 SteamVR 时显式创建最小 OpenVR 配置；已有配置不会覆盖
+    ComponentsInitOpenvr,
+    /// 在选定的内置 OpenXR/SteamVR 环境下启动应用；--openvr 启用 xrizer
+    Run {
+        #[arg(long)] openvr: bool,
+        #[arg(required=true,num_args=1..,last=true)] command: Vec<std::ffi::OsString>,
+    },
     /// 安装并注册 OpenUUYC 内置 OpenVR 追踪诊断驱动（不启动外部客户端）
     BuiltinInstall,
     /// 检查 WiVRn、WayVR 和 OpenXR 运行时
@@ -380,6 +395,22 @@ fn main() -> Result<()> {
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),
         #[cfg(target_os = "linux")]
         Commands::PicoVr { command } => match command {
+            PicoVrCommand::RuntimeProbe => {println!("{}",serde_json::to_string(&openuuyc::pcvr::runtime_probe::probe()?)?);Ok(())},
+            PicoVrCommand::RuntimeStatus => {
+                println!("{}",openuuyc::pcvr::runtime::status());
+                let plan=openuuyc::pcvr::runtime::plan()?;
+                println!("{}",serde_json::to_string_pretty(&plan.probe()?)?);
+                println!("Steam OpenVR 启动选项：{}",plan.steam_options(openuuyc::pcvr::runtime::Api::OpenVr)?);
+                Ok(())
+            },
+            PicoVrCommand::RuntimePreference {value} => {
+                use openuuyc::pcvr::runtime::Preference;
+                let preference=match value.as_str() {"openxr-first"=>Preference::OpenXrFirst,"openxr-only"=>Preference::OpenXrOnly,"steamvr"=>Preference::SteamVr,_=>anyhow::bail!("支持 openxr-first、openxr-only、steamvr")};
+                openuuyc::pcvr::runtime::set_preference(preference)
+            },
+            PicoVrCommand::ComponentsInstall {directory} => {println!("组件安装到 {}",openuuyc::pcvr::runtime::install(&directory)?.display());Ok(())},
+            PicoVrCommand::ComponentsInitOpenvr => openuuyc::pcvr::runtime::init_openvr(),
+            PicoVrCommand::Run {openvr,command} => openuuyc::pcvr::runtime::run(if openvr {openuuyc::pcvr::runtime::Api::OpenVr} else {openuuyc::pcvr::runtime::Api::OpenXr},&command),
             PicoVrCommand::BuiltinInstall => openuuyc::pcvr::install_driver(),
             PicoVrCommand::Doctor => pico_vr::doctor(),
             PicoVrCommand::Setup => pico_vr::setup(),

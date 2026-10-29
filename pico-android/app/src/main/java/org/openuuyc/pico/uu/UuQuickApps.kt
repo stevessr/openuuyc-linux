@@ -48,6 +48,8 @@ internal class UuQuickApps {
         }
         synchronized(this) {apps=result};callback(result,null)
     }
+    fun runtime(callback: (JSONObject?,String?)->Unit) = send(JSONObject().put("op","vr-runtime")) {value,error->callback(value?.optJSONObject("runtime"),error)}
+    fun setRuntime(preference: String,callback: (String)->Unit) = send(JSONObject().put("op","vr-runtime-set").put("backend",preference)) {value,error->callback(error ?: value?.optString("message") ?: "后端设置失败")}
     fun launch(app: App,launchOnlyAck: Boolean=false,callback: (Boolean,String)->Unit) {
         if(!app.enabled) {main.post {callback(false,"内置 VR 尚未就绪，未启动应用")};return}
         if(app.vr && !launchOnlyAck) {main.post {callback(false,"请先确认：仅启动远端 VR 游戏，不提供双眼串流")};return}

@@ -48,6 +48,26 @@ internal object PicoQuickAppsMenu {
         },"pico-local-vr-catalog").start()
     }
 
+    private fun showRuntime(activity: Activity,session: UuDirectSession,status: (String)->Unit) {
+        session.quickApps.runtime {value,error->
+            if(activity.isDestroyed || activity.isFinishing) return@runtime
+            if(value==null) {status(error ?: "远端不支持 VR 后端设置");return@runtime}
+            val choices=arrayOf("OpenXR 优先，SteamVR 备用","仅内置 OpenXR","SteamVR 备用")
+            val keys=arrayOf("open_xr_first","open_xr_only","steam_vr")
+            AlertDialog.Builder(activity).setTitle("此设备的 VR 后端 · 下次连接生效")
+                .setSingleChoiceItems(choices,keys.indexOf(value.optString("preference"))) {dialog,index->
+                    session.quickApps.setRuntime(keys[index],status);dialog.dismiss()
+                }
+                .setNeutralButton("复制 Steam 启动选项") {_,_->
+                    val text=value.optString("steam_options").takeIf {it.isNotBlank() && it!="null"}
+                    if(text==null) status("先在 Linux 安装内置 OpenXR 组件") else {
+                        (activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("OpenUUYC Steam VR",text))
+                        status("已复制该设备的启动选项；需粘贴到 Steam 的游戏启动选项")
+                    }
+                }.setNegativeButton("关闭",null).show()
+        }
+    }
+
     fun show(activity: Activity,session: UuDirectSession,status: (String)->Unit) {
         status("正在读取远端快速应用…")
         session.quickApps.list {apps,error ->
@@ -64,7 +84,7 @@ internal object PicoQuickAppsMenu {
                             status("正在请求启动 ${app.name}…")
                             session.quickApps.launch(app,launchOnlyAck=app.vr) {_,message ->if(!activity.isDestroyed) status(message)}
                         }.show()
-                }.setNeutralButton("刷新") {_,_->show(activity,session,status)}.setNegativeButton("返回",null).show()
+                }.setNeutralButton("VR 后端") {_,_->showRuntime(activity,session,status)}.setNegativeButton("返回",null).show()
         }
     }
 }

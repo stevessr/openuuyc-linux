@@ -46,6 +46,8 @@ struct Request {
     app: String,
     #[serde(default)]
     launch_only_ack: bool,
+    #[serde(default)]
+    backend: String,
 }
 fn desktop_name(text: &str) -> Option<String> {
     let mut main = false;
@@ -286,6 +288,22 @@ pub(crate) fn bind(
             let result:Result<()>=async {
                 ensure!(lease.terminal_allowed() && connected.load(Ordering::Acquire),"远端未授权快速启动：请在 Linux 被控设置允许远程终端；访客会话不支持");
                 match request.op.as_str() {
+                    #[cfg(target_os="linux")]
+                    "vr-runtime"=>{
+                        let info=tokio::task::spawn_blocking(|| -> Result<serde_json::Value> {
+                            use crate::pcvr::runtime;
+                            Ok(serde_json::json!({"preference":runtime::preference()?,"status":runtime::status(),"steam_options":runtime::plan().and_then(|p|p.steam_options(runtime::Api::OpenVr)).ok(),"stream_ready":false}))
+                        }).await??;
+                        send(&ch,serde_json::json!({"id":id,"type":"vr-runtime","runtime":info})).await?;
+                    },
+                    #[cfg(target_os="linux")]
+                    "vr-runtime-set"=>{
+                        use crate::pcvr::runtime::{self,Preference};
+                        let preference=match request.backend.as_str() {"open_xr_first"=>Preference::OpenXrFirst,"open_xr_only"=>Preference::OpenXrOnly,"steam_vr"=>Preference::SteamVr,_=>anyhow::bail!("不支持的 VR 后端策略")};
+                        ensure!(lease.terminal_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
+                        runtime::set_preference(preference)?;
+                        send(&ch,serde_json::json!({"id":id,"type":"vr-runtime-set","message":"后端策略已保存，下次 VR 连接生效；不会切换全局运行时"})).await?;
+                    },
                     "list"=>{
                         apps=tokio::task::spawn_blocking(catalog).await?;
                         let mut entries:Vec<_>=apps.values().map(|(a,_)|a.clone()).collect();

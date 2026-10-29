@@ -4,6 +4,7 @@
 #include <jni.h>
 #include "pcvr_protocol.h"
 #include "pcvr_projection_probe.h"
+#include "pcvr_stereo_layer.h"
 #include "xr_environment.h"
 #include "xr_surface_callback.h"
 #include "xr_panel_geometry.h"
@@ -38,6 +39,8 @@
 #include <initializer_list>
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "OpenUUYC-PICO", __VA_ARGS__)
+static PcvrStereoState stereo_state;
+static std::atomic<bool> stereo_presenting{false};
 static std::mutex environment_mutex;
 static XrEnvironmentSettings environment_settings;
 static std::atomic<bool> stop_requested{false};
@@ -363,6 +366,7 @@ static bool intersect_toolbar(const XrPosef &aim,float &u,float &v) {
 }
 
 static bool intersect_quad(const XrPosef &aim,float &u,float &v,int &pane) {
+    if(stereo_presenting.load()) return false;
     const uint32_t visible=window_visible_mask.load();
     float closest=1e30f;bool found=false;
     for(int i=0;i<6;++i) {
@@ -687,6 +691,30 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeStereoFormat(JNIEnv*,jobject,jint generation,jint width,jint height) {
+    stereo_presenting.store(false);
+    std::lock_guard<std::mutex> lock(stereo_state.mutex);
+    stereo_state.generation=generation>0?uint32_t(generation):0;
+    stereo_state.width=width>0?uint32_t(width):0;stereo_state.height=height>0?uint32_t(height):0;stereo_state.frame=0;
+}
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeStereoFrame(JNIEnv* env,jobject,jint generation,jlong frame,jfloatArray source) {
+    if(!source || env->GetArrayLength(source)!=22 || frame<=0) return;
+    std::array<float,22> values;env->GetFloatArrayRegion(source,0,22,values.data());if(env->ExceptionCheck()) return;
+    for(int eye=0;eye<2;++eye) {
+        const float* v=values.data()+eye*11;float norm=0;
+        for(int i=0;i<11;++i) if(!std::isfinite(v[i])) return;
+        for(int i=0;i<3;++i) if(std::fabs(v[i])>1000) return;
+        for(int i=3;i<7;++i) norm+=v[i]*v[i];
+        if(norm<.98f || norm>1.02f || v[8]-v[7]<.05f || v[9]-v[10]<.05f) return;
+        for(int i=7;i<11;++i) if(std::fabs(v[i])>=1.56f) return;
+    }
+    std::lock_guard<std::mutex> lock(stereo_state.mutex);
+    if(uint32_t(generation)!=stereo_state.generation || uint64_t(frame)<=stereo_state.frame) return;
+    stereo_state.views=values;stereo_state.frame=uint64_t(frame);stereo_state.received=std::chrono::steady_clock::now();
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeSetEnvironment(JNIEnv*,jobject,jint mode,jint color,jint opacity,jint brightness,jboolean flow,jint seed) {
     std::lock_guard<std::mutex> lock(environment_mutex);
     environment_settings.mode=std::clamp(int(mode),0,12);environment_settings.color=static_cast<uint32_t>(color);
@@ -796,6 +824,9 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     XrSpace following_space=XR_NULL_HANDLE;
     XrSwapchain swapchains[8] = {};
     PcvrProjectionProbe pcvr_probe;
+    PcvrStereoLayer stereo_video;
+    bool stereo_open=false;
+    jmethodID stereo_ready=env->GetMethodID(klass,"onXrStereoSurface","(Landroid/view/Surface;II)V");
     XrEnvironmentRenderer environment;
     uint64_t input_frames=0;
     grip_dragging=false;grip_holds[0].reset();grip_holds[1].reset();
@@ -1197,6 +1228,31 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                     static_cast<unsigned long long>(input_frames),input_focused?"true":"false",diagnostic_selected,diagnostic_target[0],diagnostic_target[1],controller_debug_mask,menu_grab?"true":"false",static_cast<unsigned long long>(diagnostic_menu_clicks),profiles[0],profiles[1]);
                 auto text=env->NewStringUTF(report);if(text) {env->CallVoidMethod(activity,input_report,text);env->DeleteLocalRef(text);}
             }
+            uint32_t stereo_gen=0,stereo_w=0,stereo_h=0;
+            {std::lock_guard<std::mutex> lock(stereo_state.mutex);stereo_gen=stereo_state.generation;stereo_w=stereo_state.width;stereo_h=stereo_state.height;}
+            if(stereo_gen && !stereo_video.matches(stereo_gen,stereo_w,stereo_h)) {
+                env->CallVoidMethod(activity,stereo_ready,nullptr,jint(0),jint(0));
+                stereo_open=false;
+                jobject surface=nullptr;
+                if(stereo_video.create(session,create_surface,stereo_gen,stereo_w,stereo_h,&surface)) {
+                    env->CallVoidMethod(activity,stereo_ready,surface,jint(stereo_w),jint(stereo_h));env->DeleteLocalRef(surface);stereo_open=true;
+                } else {std::lock_guard<std::mutex> lock(stereo_state.mutex);stereo_state.generation=0;}
+            }
+            if(!stereo_gen && stereo_open) {
+                env->CallVoidMethod(activity,stereo_ready,nullptr,jint(0),jint(0));stereo_video.destroy();stereo_open=false;
+            }
+            const bool present_stereo=state.shouldRender && stereo_video.prepare(world,stereo_state);
+            stereo_presenting.store(present_stereo);
+            if(present_stereo) {
+                // Keep the controller toolbar as an escape/control surface; hide desktop quads.
+                std::array<const XrCompositionLayerBaseHeader*,5> overlays{};uint32_t overlay_count=0;
+                for(uint32_t i=0;i<layer_count && overlay_count<overlays.size();++i) if(layers[i]->type==XR_TYPE_COMPOSITION_LAYER_QUAD) {
+                    auto* q=reinterpret_cast<const XrCompositionLayerQuad*>(layers[i]);
+                    if(q->subImage.swapchain==swapchains[6] || (q->subImage.swapchain==swapchains[7] && q->subImage.imageRect.offset.y==2400)) overlays[overlay_count++]=layers[i];
+                }
+                layers[0]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&stereo_video.layer);layer_count=1;
+                for(uint32_t i=0;i<overlay_count && layer_count<max_layers;++i) layers[layer_count++]=overlays[i];
+            }
             bool probe_submitted=false;
             if(pcvr_probe_requested.load() && state.shouldRender) {
                 const auto result=pcvr_probe.render(world,state.predictedDisplayTime);
@@ -1235,6 +1291,9 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         previous_down = false;
     }
     if (running) xrEndSession(session);
+    stereo_presenting.store(false);
+    if(stereo_ready) env->CallVoidMethod(activity,stereo_ready,nullptr,jint(0),jint(0));
+    stereo_video.destroy();
     environment.destroy();
     pcvr_probe.destroy();
     actions.destroy();

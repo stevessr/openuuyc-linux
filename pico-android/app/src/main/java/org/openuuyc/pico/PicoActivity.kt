@@ -48,6 +48,11 @@ open class PicoActivity : Activity() {
         private const val CAMERA_REQUEST = 8341
         private const val XR_REQUEST = 1
     }
+    private external fun nativeStereoFormat(generation: Int,width: Int,height: Int)
+    private external fun nativeStereoFrame(generation: Int,frame: Long,views: FloatArray)
+    fun onXrStereoSurface(surface: android.view.Surface?,width: Int,height: Int) {
+        org.openuuyc.pico.uu.UuPcvrSession.stereoTarget()?.stereoSurface(surface,width,height)
+    }
     private external fun nativeRun(activity: PicoActivity)
     private external fun nativeResetLayout()
     private external fun nativeSetFollowView(enabled: Boolean)
@@ -688,7 +693,7 @@ open class PicoActivity : Activity() {
                                 if(running.get() && xrMainAlive && pane>0) xrSurfaces[pane]?.let {session?.addWindowSurface(pane,it)}
                             }
                         }}
-                        xrExtraSessions[pane]=extra;xrQuickAppNames[pane]=device.alias;xrExtraDeviceIds[pane]=device.id
+                        extra.vr.setStereoCallbacks(::nativeStereoFormat,::nativeStereoFrame);xrExtraSessions[pane]=extra;xrQuickAppNames[pane]=device.alias;xrExtraDeviceIds[pane]=device.id
                         worker.execute {
                             try {
                                 if(!running.get()) {extra.close();org.openuuyc.pico.uu.UuRoomRelease.cancel(room);return@execute}
@@ -798,6 +803,8 @@ open class PicoActivity : Activity() {
 
     @Suppress("unused")
     fun onXrSurface(index: Int, surface: Surface) {
+        session?.vr?.setStereoCallbacks(::nativeStereoFormat,::nativeStereoFrame)
+        xrExtraSessions.values.forEach {it.vr.setStereoCallbacks(::nativeStereoFormat,::nativeStereoFrame)}
         ui.post {
             if (index == 7 && running.get()) {
                 xrWindowFrame?.close(); xrWindowFrame=PicoXrWindowFrame(surface).also { it.draw() };applyXrAppearance();session?.publishWindowInfo(); return@post

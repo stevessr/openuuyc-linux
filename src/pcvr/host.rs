@@ -31,12 +31,16 @@ struct State {
     sequence: u64,
     frames: u64,
     last: Option<Instant>,
+    backend: Option<&'static str>,
 }
 pub(crate) struct Session {
     lease: Lease,
     connected: Arc<AtomicBool>,
     state: Mutex<State>,
     tracking_ready: AtomicBool,
+    video: Mutex<Option<std::sync::Weak<RTCDataChannel>>>,
+    keyframe_requested: AtomicBool,
+    video_send: tokio::sync::Mutex<()>,
 }
 impl Session {
     pub(crate) fn new(lease: Lease, connected: Arc<AtomicBool>) -> Arc<Self> {
@@ -45,6 +49,9 @@ impl Session {
             connected,
             state: Mutex::new(State::default()),
             tracking_ready: AtomicBool::new(false),
+            video: Mutex::new(None),
+            keyframe_requested: AtomicBool::new(true),
+            video_send: tokio::sync::Mutex::new(()),
         })
     }
     fn allowed(&self) -> bool {
@@ -56,6 +63,7 @@ impl Session {
             OWNED.store(false, Ordering::Release);
         }
         *state = State::default();
+        self.keyframe_requested.store(true, Ordering::Release);
     }
     fn start(&self) -> Result<()> {
         ensure!(
@@ -70,10 +78,11 @@ impl Session {
         if state.socket.is_some() {
             return Ok(());
         }
-        let path = std::path::PathBuf::from(
+        let root = std::path::PathBuf::from(
             std::env::var_os("XDG_RUNTIME_DIR").context("缺少 XDG_RUNTIME_DIR")?,
-        )
-        .join("openuuyc-pcvr/tracking.sock");
+        );
+        let (path, backend) =
+            super::runtime::tracking_socket(&root, super::runtime::preference()?)?;
         let directory = std::fs::symlink_metadata(path.parent().unwrap())?;
         // The socket is local-only and private to this uid, never a public UDP port.
         let uid = unsafe { libc::getuid() };
@@ -117,6 +126,7 @@ impl Session {
             "另一个会话正在使用内置 VR"
         );
         state.socket = Some(socket);
+        state.backend = Some(backend);
         state.publisher_lock = Some(publisher);
         state.sequence = 0;
         state.frames = 0;
@@ -152,7 +162,62 @@ impl Session {
             }
         }
     }
+    /// Frame producer entry point; not called until a real GPU backend owns the session.
+    /// Never queues old access units behind a slow peer.
+    pub(crate) async fn send_stereo(&self, frame: &super::stereo::Frame) -> Result<()> {
+        ensure!(
+            self.allowed() && lock(&self.state).socket.is_some(),
+            "stereo session is not authorized/started"
+        );
+        let video = lock(&self.video)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .context("stereo media channel is absent")?;
+        ensure!(
+            video.ready_state()
+                == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open,
+            "stereo media channel is not open"
+        );
+        ensure!(
+            !self.keyframe_requested.load(Ordering::Acquire) || frame.keyframe,
+            "stereo recovery requires an IDR"
+        );
+        let _sending = self
+            .video_send
+            .try_lock()
+            .context("stereo frame producer is already sending")?;
+        let packets = frame.fragments()?;
+        if frame.keyframe {
+            self.keyframe_requested.store(false, Ordering::Release);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(16);
+        for packet in packets {
+            let started = lock(&self.state).socket.is_some();
+            if !self.allowed() || !started || video.buffered_amount().await > 256 * 1024 {
+                self.keyframe_requested.store(true, Ordering::Release);
+                anyhow::bail!("stereo deadline/backpressure drop");
+            }
+            match tokio::time::timeout_at(deadline, video.send(&bytes::Bytes::from(packet))).await {
+                Ok(Ok(_)) => {}
+                _ => {
+                    self.keyframe_requested.store(true, Ordering::Release);
+                    anyhow::bail!("stereo media send failed/deadline expired");
+                }
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn bind(self: &Arc<Self>, channel: Arc<RTCDataChannel>, parent: CancellationToken) {
+        if channel.label() == super::stereo::CHANNEL {
+            *lock(&self.video) = Some(Arc::downgrade(&channel));
+            let this = self.clone();
+            channel.on_close(Box::new(move || {
+                this.stop();
+                *lock(&this.video) = None;
+                Box::pin(async {})
+            }));
+            return;
+        }
         if channel.label() == TRACKING {
             self.tracking_ready.store(true, Ordering::Release);
             let this = self.clone();
@@ -217,6 +282,10 @@ impl Session {
                 if op.is_some() {
                     last_error = match op {
                         Some("start") => this.start().err().map(|e| e.to_string()),
+                        Some("video-keyframe") => {
+                            this.keyframe_requested.store(true, Ordering::Release);
+                            None
+                        }
                         Some("stop") => {
                             this.stop();
                             None
@@ -227,7 +296,7 @@ impl Session {
                 }
                 let status = {
                     let state = lock(&this.state);
-                    serde_json::json!({"version":1,"id":id,"tracking":state.socket.is_some(),"stereo":false,"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"message":"内置追踪诊断；双眼画面尚未实现，不启动 VRChat"})
+                    serde_json::json!({"version":1,"id":id,"tracking":state.socket.is_some(),"backend":state.backend,"stereo":false,"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"message":"内置追踪诊断；双眼画面尚未实现，不启动 VRChat"})
                 };
                 let Some(ch) = weak.upgrade() else { break };
                 if ch.ready_state()
@@ -244,5 +313,18 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod stereo_async_tests {
+    use super::*;
+    #[test]
+    fn stereo_sender_can_run_on_the_peer_executor() {
+        fn prove(session: &Session, frame: &super::super::stereo::Frame) {
+            fn assert_send<T: Send>(_: T) {}
+            assert_send(session.send_stereo(frame));
+        }
+        let _ = prove;
     }
 }

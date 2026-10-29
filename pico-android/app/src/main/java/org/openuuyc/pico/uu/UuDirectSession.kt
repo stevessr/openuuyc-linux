@@ -777,9 +777,9 @@ internal class UuDirectSession(
         }
         for (label in listOf(
             "CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL",
-            "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL", UuQuickApps.CHANNEL, UuPcvrSession.CONTROL, UuPcvrSession.TRACKING
-        ).filter { !applicationsOnly || it !in setOf("STREAMER_DATA_CHANNEL",UuPcvrSession.CONTROL,UuPcvrSession.TRACKING) }) {
-            val channel = connection.createDataChannel(label, DataChannel.Init().apply { ordered = label!=UuPcvrSession.TRACKING; if(label==UuPcvrSession.TRACKING) maxRetransmits=0 })
+            "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL", UuQuickApps.CHANNEL, UuPcvrSession.CONTROL, UuPcvrSession.TRACKING, UuStereoFrames.CHANNEL
+        ).filter { !applicationsOnly || it !in setOf("STREAMER_DATA_CHANNEL",UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL) }) {
+            val channel = connection.createDataChannel(label, DataChannel.Init().apply { ordered = label !in setOf(UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL); if(!ordered) maxRetransmits=0 })
             if (channel != null) {
                 channels.add(channel)
                 listenChannel(channel)
@@ -871,7 +871,7 @@ internal class UuDirectSession(
                     } else if (channel.state() == DataChannel.State.CLOSED ||
                                channel.state() == DataChannel.State.CLOSING) {
                         if(channel.label()==UuQuickApps.CHANNEL) quickApps.close()
-                        if(channel.label() in setOf(UuPcvrSession.CONTROL,UuPcvrSession.TRACKING)) vr.close()
+                        if(channel.label() in setOf(UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL)) vr.close()
                         val critical = channel === controlChannel || channel === textChannel
                         if (critical && !closed.get()) {
                             // Revoke the button while CONTROL is still writable.
@@ -898,6 +898,7 @@ internal class UuDirectSession(
                 postRtc {
                 synchronized(this@UuDirectSession) {
                     if (closed.get()) return@postRtc
+                    if(channel.label()==UuStereoFrames.CHANNEL) {vr.video(bytes);return@postRtc}
                     if(channel.label()==UuPcvrSession.CONTROL) {vr.receive(bytes);return@postRtc}
                     if(channel.label()==UuQuickApps.CHANNEL) {quickApps.receive(bytes);return@postRtc}
                     if(channel.label() in setOf("TEXT_DATA_CHANNEL","FILE_DATA_CHANNEL") && transfers.receive(bytes)) return@postRtc

@@ -736,7 +736,7 @@ impl Peer {
         let pcvr=crate::pcvr::host::Session::new(handle.clone(),connected.clone());
         connection.on_data_channel(Box::new(move |channel| {
             #[cfg(target_os="linux")]
-            if matches!(channel.label(),crate::pcvr::host::CONTROL|crate::pcvr::host::TRACKING) {
+            if matches!(channel.label(),crate::pcvr::host::CONTROL|crate::pcvr::host::TRACKING|crate::pcvr::stereo::CHANNEL) {
                 pcvr.bind(channel,channel_cancel.clone());return Box::pin(async {});
             }
             if channel.label()==crate::features::host::quick_apps::CHANNEL {

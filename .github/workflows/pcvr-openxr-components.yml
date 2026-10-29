@@ -1,0 +1,39 @@
+name: Owned OpenXR components
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-components:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install source-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config g++ python3 git \
+            libeigen3-dev libvulkan-dev glslang-tools libopenxr-dev libopenxr-loader1 \
+            libudev-dev libusb-1.0-0-dev libdrm-dev libx11-dev libx11-xcb-dev \
+            libxrandr-dev libxcb-randr0-dev libxkbcommon-dev libwayland-dev \
+            wayland-protocols libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libsystemd-dev libsdl2-dev zlib1g-dev libjpeg-dev
+      - name: Build pinned in-process Monado and xrizer libraries
+        run: |
+          python3 drivers/openxr/build_components.py \
+            --work "$RUNNER_TEMP/pcvr-work" \
+            --output "$RUNNER_TEMP/openuuyc-openxr-components"
+      - name: Verify real loader initialization without a fake HMD
+        run: |
+          export XR_RUNTIME_JSON="$RUNNER_TEMP/openuuyc-openxr-components/openxr/openxr_openuuyc.json"
+          "$RUNNER_TEMP/openuuyc-openxr-components/bin/openuuyc-openxr-probe" > "$RUNNER_TEMP/probe.json"
+          python3 -c 'import json,os; p=json.load(open(os.environ["RUNNER_TEMP"]+"/probe.json")); assert p["instance"] and not p["system"], p'
+      - name: Preserve executable modes in the distributable
+        run: tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/openuuyc-openxr-components-linux-x86_64.tar.gz" openuuyc-openxr-components
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openuuyc-openxr-components-linux-x86_64
+          path: ${{ runner.temp }}/openuuyc-openxr-components-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
