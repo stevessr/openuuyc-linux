@@ -612,10 +612,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             foreground = session.foreground();
-            if foreground
-                .as_ref()
-                .is_some_and(|foreground| foreground.name == "sleep")
-            {
+            if foreground.as_ref().is_some_and(|foreground| {
+                foreground.name == "sleep" && foreground.command.contains("sleep 5")
+            }) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));

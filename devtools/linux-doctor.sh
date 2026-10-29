@@ -13,6 +13,8 @@ for node in /dev/dri/renderD*; do
     [[ -e "$node" ]] || continue
     if [[ -r "$node" && -w "$node" ]]; then printf '[accessible] %s\n' "$node"; else printf '[permission] %s\n' "$node"; fi
 done
+printf '\nApplication launcher\n'
+have applications gio
 printf '\nAudio / clipboard / input / files / terminal\n'
 for c in wpctl pactl pw-cli wl-copy wl-paste xclip fcitx5 xdg-open bash; do have integration "$c"; done
 if [[ -w /dev/uinput ]]; then echo '[accessible] uinput'; else echo '[unavailable] uinput (portal input may still work)'; fi

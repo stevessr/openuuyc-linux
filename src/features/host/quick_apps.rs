@@ -1,4 +1,7 @@
 //! OpenUUYC-only quick launch extension on the authenticated peer, not guessed UU RPCs.
+#[cfg(target_os = "linux")]
+mod desktop;
+
 use super::Lease;
 use anyhow::{Result, ensure};
 use bytes::Bytes;
@@ -6,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -50,36 +53,23 @@ struct Request {
     backend: String,
 }
 fn desktop_name(text: &str) -> Option<String> {
-    let mut main = false;
-    let mut name = None;
-    let mut executable = false;
-    let mut application = false;
-    for line in text.lines().map(str::trim) {
-        if line.starts_with('[') {
-            main = line == "[Desktop Entry]";
-            continue;
-        }
-        if !main {
-            continue;
-        }
-        if line == "Hidden=true" || line == "NoDisplay=true" {
-            return None;
-        }
-        if line == "Type=Application" {
-            application = true
-        }
-        if line.starts_with("Exec=") && line.len() > 5 {
-            executable = true
-        }
-        if let Some(v) = line.strip_prefix("Name=") {
-            if !v.is_empty() && v.len() <= 160 {
-                name = Some(v.to_owned())
-            }
-        }
+    #[cfg(target_os = "linux")]
+    {
+        let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .find(|s| !s.is_empty())
+            .unwrap_or_default();
+        desktop::name(
+            text,
+            &locale,
+            &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+            desktop::executable,
+        )
     }
-    if executable && application {
-        name
-    } else {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = text;
         None
     }
 }
@@ -107,24 +97,9 @@ fn catalog() -> BTreeMap<String, (App, Target)> {
     #[cfg(target_os = "linux")]
     {
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let mut roots = vec![
-            PathBuf::from("/usr/share/applications"),
-            PathBuf::from("/usr/local/share/applications"),
-        ];
-        if let Some(data) = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|h| h.join(".local/share")))
-        {
-            roots.insert(0, data.join("applications"));
-        }
-        if let Some(dirs) = std::env::var_os("XDG_DATA_DIRS") {
-            roots.extend(std::env::split_paths(&dirs).map(|p| p.join("applications")));
-        }
-        if let Some(h) = &home {
-            roots.push(h.join(".local/share/flatpak/exports/share/applications"));
-        }
-        roots.push(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
-        roots.push(PathBuf::from("/var/lib/snapd/desktop/applications"));
+        let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+        let data_dirs = std::env::var("XDG_DATA_DIRS").ok();
+        let roots = desktop::roots(home.as_deref(), data_home.as_deref(), data_dirs.as_deref());
         let mut seen = std::collections::HashSet::new();
         for root in roots {
             let Ok(root) = root.canonicalize() else {
@@ -151,13 +126,13 @@ fn catalog() -> BTreeMap<String, (App, Target)> {
                     .unwrap_or(&entry)
                     .to_string_lossy()
                     .replace('/', "-");
-                if !seen.insert(desktop_id) {
+                if !seen.insert(desktop_id.clone()) {
                     continue;
                 }
                 let Ok(path) = entry.canonicalize() else {
                     continue;
                 };
-                if std::fs::metadata(&path).map_or(true, |m| m.len() > 65536) {
+                if std::fs::metadata(&path).map_or(true, |m| !m.is_file() || m.len() > 65536) {
                     continue;
                 }
                 let Ok(text) = std::fs::read_to_string(&path) else {
@@ -166,25 +141,7 @@ fn catalog() -> BTreeMap<String, (App, Target)> {
                 let Some(name) = desktop_name(&text) else {
                     continue;
                 };
-                if name.eq_ignore_ascii_case("vrchat") {
-                    out.insert(
-                        "vrchat-vr".into(),
-                        (
-                            App {
-                                id: "vrchat-vr".into(),
-                                name: "VRChat · 仅启动（无内置 VR 画面）".into(),
-                                vr: true,
-                                enabled: true,
-                            },
-                            Target::Vrchat,
-                        ),
-                    );
-                    continue;
-                }
-                let id = format!(
-                    "desktop-{:x}",
-                    Sha256::digest(path.as_os_str().as_encoded_bytes())
-                );
+                let id = format!("desktop-{:x}", Sha256::digest(desktop_id.as_bytes()));
                 out.insert(
                     id.clone(),
                     (
@@ -220,17 +177,30 @@ fn catalog() -> BTreeMap<String, (App, Target)> {
     }
     out
 }
-fn spawn(program: &str, args: &[&std::ffi::OsStr]) -> Result<()> {
-    let mut child = Command::new(program)
+async fn spawn(program: &str, args: &[&std::ffi::OsStr]) -> Result<()> {
+    use anyhow::Context;
+    let mut child = tokio::process::Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
-    // Reap launchers without tying the lifetime of the launched app to the viewer.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+        .spawn()
+        .with_context(|| format!("无法运行应用启动器 {program}"))?;
+    // GIO can start successfully but immediately reject a missing executable
+    // or malformed desktop entry. Do not report that as a successful launch.
+    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(status) => ensure!(
+            status?.success(),
+            "应用启动器 {program} 返回失败，请检查应用是否仍已安装"
+        ),
+        Err(_) => {
+            // A launcher may itself remain as the application. Keep it alive,
+            // reap it independently, and only acknowledge dispatch, not a window.
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
     Ok(())
 }
 async fn send(channel: &RTCDataChannel, value: serde_json::Value) -> Result<()> {
@@ -306,6 +276,7 @@ pub(crate) fn bind(
                     },
                     "list"=>{
                         apps=tokio::task::spawn_blocking(catalog).await?;
+                        ensure!(lease.terminal_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
                         let mut entries:Vec<_>=apps.values().map(|(a,_)|a.clone()).collect();
                         entries.sort_by_key(|a|(!a.name.to_ascii_lowercase().starts_with("vrchat"),!a.vr,a.name.to_lowercase()));
                         send(&ch,serde_json::json!({"id":id,"type":"list","apps":entries})).await?;
@@ -319,11 +290,14 @@ pub(crate) fn bind(
                         match target {
                             Target::Desktop(path)=>{
                                 ensure!(lease.terminal_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
-                                spawn("gio",&[std::ffi::OsStr::new("launch"),path.as_os_str()])?;
+                                ensure!(std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= 65536), "应用入口已移除或无效，请刷新列表");
+                                let text = std::fs::read_to_string(&path)?;
+                                ensure!(desktop_name(&text).is_some(), "应用已隐藏或不可用，请刷新列表");
+                                spawn("gio",&[std::ffi::OsStr::new("launch"),path.as_os_str()]).await?;
                             },
                             Target::Vrchat=>{
                                 ensure!(lease.terminal_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
-                                spawn("steam",&[std::ffi::OsStr::new("-applaunch"),std::ffi::OsStr::new("438100")])?;
+                                spawn("steam",&[std::ffi::OsStr::new("-applaunch"),std::ffi::OsStr::new("438100")]).await?;
                             }
                         }
                         send(&ch,serde_json::json!({"id":id,"type":"started","message":if app.vr {"已请求在远端启动 VR 应用；OpenUUYC 尚无双眼游戏画面，未确认 VR 首帧"} else {"启动请求已交给系统；尚未确认应用窗口"}})).await?;
@@ -345,6 +319,7 @@ pub(crate) fn bind(
 mod tests {
     use super::*;
     #[test]
+    #[cfg(target_os = "linux")]
     fn desktop_entries_are_data_not_shell_commands() {
         assert_eq!(
             desktop_name("[Desktop Entry]\nType=Application\nName=Editor\nExec=editor %U"),
@@ -361,6 +336,63 @@ mod tests {
             None
         );
     }
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "reads installed applications from this desktop session"]
+    fn installed_catalog_smoke() {
+        let apps = catalog();
+        assert!(
+            !apps.is_empty(),
+            "no installed applications were discovered"
+        );
+        eprintln!("discovered {} launch entries", apps.len());
+        for (id, (app, target)) in &apps {
+            assert_eq!(id, &app.id);
+            assert!(!app.name.is_empty());
+            if let Target::Desktop(path) = target {
+                assert!(path.is_absolute() && path.is_file());
+            }
+        }
+        for (app, _) in apps.values().take(10) {
+            eprintln!("app: {}", app.name);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "launches a harmless local GIO desktop-entry fixture"]
+    async fn gio_launch_reports_success_and_failure() {
+        let directory =
+            std::env::temp_dir().join(format!("openuuyc-app-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("test app.desktop");
+        let marker = directory.join("launched marker");
+        std::fs::write(&path, format!(
+            "[Desktop Entry]\nType=Application\nName=OpenUUYC test\nExec=/usr/bin/touch \"{}\"\nTerminal=false\n", marker.display()
+        )).unwrap();
+        spawn("gio", &[std::ffi::OsStr::new("launch"), path.as_os_str()])
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if marker.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(marker.is_file(), "GIO did not launch the fixture");
+        std::fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nName=Missing\nExec=/openuuyc-missing-test-binary\n",
+        )
+        .unwrap();
+        assert!(
+            spawn("gio", &[std::ffi::OsStr::new("launch"), path.as_os_str()])
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn vr_launch_requires_explicit_launch_only_consent() {
         assert!(Target::Vrchat.ensure_available(false).is_err());
