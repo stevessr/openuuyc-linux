@@ -25,6 +25,9 @@
 //! spawn on another thread. The child gets the slave as 0–2 through `dup2`,
 //! which clears the flag on the copies, so the shell itself is unaffected.
 
+#[path = "terminal/osc.rs"]
+mod osc;
+
 use anyhow::{Context, Result, bail};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -85,6 +88,7 @@ pub(crate) fn resolve_shell(requested: &str) -> String {
 
 /// A shell running on a pty, with the master side owned by this process.
 pub(crate) struct Session {
+    filter: std::cell::RefCell<osc::Filter>,
     master: OwnedFd,
     child: Child,
     shell: String,
@@ -168,6 +172,7 @@ impl Session {
 
         set_nonblocking(master_raw)?;
         Ok(Self {
+            filter: Default::default(),
             master,
             child,
             shell: shell.to_owned(),
@@ -225,6 +230,34 @@ impl Session {
     /// `Ok(Some(0))` is end-of-file, which Linux reports as `EIO` on the
     /// master once the last slave closes.
     pub(crate) fn read(&self, buffer: &mut [u8]) -> Result<Option<usize>> {
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        let mut filter = self.filter.borrow_mut();
+        let mut eof = false;
+        if filter.ready.is_empty() {
+            let mut raw = [0u8; 8192];
+            match self.read_raw(&mut raw)? {
+                None => return Ok(None),
+                Some(0) => {
+                    filter.finish();
+                    eof = true;
+                }
+                Some(n) => filter.push(&raw[..n]),
+            }
+        }
+        let count = buffer.len().min(filter.ready.len());
+        for slot in &mut buffer[..count] {
+            *slot = filter.ready.pop_front().unwrap();
+        }
+        if count == 0 && !eof {
+            Ok(None)
+        } else {
+            Ok(Some(count))
+        }
+    }
+
+    fn read_raw(&self, buffer: &mut [u8]) -> Result<Option<usize>> {
         // SAFETY: the descriptor is open for the life of `self` and `buffer`
         // is valid for writes of its own length.
         let read = unsafe {
@@ -522,6 +555,26 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_suppresses_context_markers() {
+        let mut session = Session::open("/bin/sh", 80, 24).unwrap();
+        session
+            .write(b"printf '\\033]3008;start=test\\007VISIBLE_OSC_TEST\\n'\n")
+            .unwrap();
+        let output = read_until(
+            &mut session,
+            b"VISIBLE_OSC_TEST\r\n",
+            Duration::from_secs(3),
+        );
+        assert!(
+            output
+                .windows(b"VISIBLE_OSC_TEST\r".len())
+                .any(|w| w == b"VISIBLE_OSC_TEST\r"),
+            "{output:?}"
+        );
+        assert!(!output.windows(7).any(|w| w == b"\x1b]3008;"));
+    }
 
     /// Drains the pty until `needle` appears, the shell exits, or time runs out.
     fn read_until(session: &mut Session, needle: &[u8], timeout: Duration) -> Vec<u8> {

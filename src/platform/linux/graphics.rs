@@ -139,21 +139,33 @@ fn create_graphics(event_loop: &ActiveEventLoop, window: &Window) -> Result<Grap
     let dmabuf_feature = wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
     if crate::platform::linux::dmabuf::enabled() && adapter.features().contains(dmabuf_feature) {
         required_features |= dmabuf_feature;
+    } else if crate::platform::linux::dmabuf::enabled() {
+        crate::platform::linux::dmabuf::mark_unsupported();
     }
-    let (device, queue) = pollster::block_on(
-        adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("openuuyc-ui"),
-            required_features,
-            // The UI stays within the baseline limits; video upload does too.
-            required_limits: wgpu::Limits::downlevel_defaults()
-                .using_resolution(adapter.limits())
-                .using_alignment(adapter.limits()),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::Off,
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        }),
-    )
-    .context("创建 GPU 设备失败")?;
+    let request_device = |required_features| {
+        pollster::block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("openuuyc-ui"),
+                required_features,
+                // The UI stays within the baseline limits; video upload does too.
+                required_limits: wgpu::Limits::downlevel_defaults()
+                    .using_resolution(adapter.limits())
+                    .using_alignment(adapter.limits()),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            }),
+        )
+    };
+    let (device, queue) = match request_device(required_features) {
+        Ok(device) => device,
+        Err(error) if required_features.contains(dmabuf_feature) => {
+            tracing::warn!(%error, "DMA-BUF GPU device creation failed; retrying without external memory");
+            crate::platform::linux::dmabuf::mark_unsupported();
+            request_device(wgpu::Features::empty()).context("创建 GPU 设备失败")?
+        }
+        Err(error) => return Err(error).context("创建 GPU 设备失败"),
+    };
     let label = format!("{} · {:?}", info.name, info.backend);
     Ok(Graphics {
         instance,

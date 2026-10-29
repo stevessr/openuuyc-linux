@@ -267,7 +267,7 @@ sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-
 - **更新**：「关于」页的更新提醒指向上游的 Windows Release；Linux 版请从本 fork 的 Release 或 deb / AUR 包更新。下面的「命令行更新」只适用于 Windows。
 - **Gamescope**：在 SteamOS 游戏模式中，将原生程序添加为非 Steam 游戏即可，无需指定兼容性工具。启动时处理显示连接与缩放，控制中心匹配当前屏幕尺寸；保留手动设置的缩放比例。登录凭据使用系统配置的 Secret Service，锁定时先请求解锁；KWallet 解锁窗口会关联到当前 Steam 应用。
 - **手柄**：Linux 主控通过系统 SDL2 2.0.6 及以上读取标准手柄（Arch 安装 `sdl2-compat`，Debian / Ubuntu 安装 `libsdl2-2.0-0`），支持双摇杆、十字键、按钮和双扳机，震动回传还需要 SDL2 2.0.9 及以上版本和兼容手柄。SteamDeck 的 Steam Input 选择手柄布局（例如「支持视角控制的手柄」）。开启远控输入、将焦点留在播放窗口并松开已有按键后开始转发；失焦、操作本地菜单、拔出或断开连接时释放远端状态并停止震动。
-- **环境变量**：`OPENUUYC_CAPTURE` 指定采集后端顺序（如 `nvfbc`、`wlr`、`x11,portal`）；`OPENUUYC_ZEROCOPY=1` 让 VA-API 解码画面以 dmabuf 直接交给渲染器（只在 Intel 上验证过）；`OPENUUYC_CAPTURE_DMABUF=1` 与 `OPENUUYC_GPU_CONVERT=1` 是门户采集的试验开关；`OPENUUYC_BACKEND=gl|vulkan` 指定界面后端。
+- **环境变量**：`OPENUUYC_CAPTURE` 指定采集后端顺序（如 `nvfbc`、`wlr`、`x11,portal`）；VA-API 解码默认尝试通过 DMA-BUF 直接交给渲染器；不支持导入或导出失败时自动回退 CPU 回读，`OPENUUYC_ZEROCOPY=0` 可强制关闭（驱动接受导入但画面异常时也可使用）；`OPENUUYC_CAPTURE_DMABUF=1` 与 `OPENUUYC_GPU_CONVERT=1` 是门户采集的试验开关；`OPENUUYC_BACKEND=gl|vulkan` 指定界面后端。
 
 `cargo dist` 只用于 Windows 打包，Linux 直接用 `cargo build`。
 

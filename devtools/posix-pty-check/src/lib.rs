@@ -19,3 +19,12 @@
 #[allow(dead_code)]
 #[path = "../../../src/platform/posix/terminal.rs"]
 mod terminal;
+
+#[allow(dead_code)]
+mod platform {
+    #[derive(Debug, PartialEq)]
+    pub(crate) struct Foreground {
+        pub name: String,
+        pub command: String,
+    }
+}
