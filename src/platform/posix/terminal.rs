@@ -52,10 +52,69 @@ pub(crate) fn foreground_supported() -> bool {
 
 /// The shell a terminal emulator would start on this system.
 pub(crate) fn default_shell() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|shell| !shell.is_empty() && std::path::Path::new(shell).exists())
+    select_shell(std::env::var("SHELL").ok(), account_defaults().map(|a| a.0))
+}
+
+fn executable_shell(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::path::Path::new(path);
+    path.is_absolute()
+        && path
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+fn select_shell(environment: Option<String>, account: Option<String>) -> String {
+    environment
+        .into_iter()
+        .chain(account)
+        .find(|s| executable_shell(s))
         .unwrap_or_else(|| DEFAULT_SHELL.to_owned())
+}
+
+/// Resolve service environments without SHELL/HOME using the current user's
+/// NSS account, not an assumed bash home. Reentrant lookup is safe on GUI threads.
+fn account_defaults() -> Option<(String, std::path::PathBuf)> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    let mut size = 4096;
+    while size <= 1024 * 1024 {
+        let mut buffer = vec![0u8; size];
+        let mut account = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        // SAFETY: all output storage lives through copying its strings below;
+        // getpwuid_r writes at most buffer.len() bytes and owns no shared buffer.
+        let code = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                account.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if code == libc::ERANGE {
+            size *= 2;
+            continue;
+        }
+        if code != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: success with non-null result initializes passwd and its strings.
+        let account = unsafe { account.assume_init() };
+        if account.pw_shell.is_null() || account.pw_dir.is_null() {
+            return None;
+        }
+        let shell = unsafe { CStr::from_ptr(account.pw_shell) }
+            .to_str()
+            .ok()?
+            .to_owned();
+        let home = std::path::PathBuf::from(OsStr::from_bytes(
+            unsafe { CStr::from_ptr(account.pw_dir) }.to_bytes(),
+        ));
+        return Some((shell, home));
+    }
+    None
 }
 
 /// `$SHELL` is usually set, but a service environment need not have it.
@@ -81,7 +140,7 @@ pub(crate) fn resolve_shell(requested: &str) -> String {
         _ => None,
     };
     match candidate {
-        Some(path) if std::path::Path::new(path).exists() => path.to_owned(),
+        Some(path) if executable_shell(path) => path.to_owned(),
         _ => default_shell(),
     }
 }
@@ -116,6 +175,7 @@ impl Session {
         // The service environment carries no terminal type, and curses
         // programs (`top`, `less`, `vi`) refuse to start without one. The
         // reference server sets the same pair before forking the pty.
+        command.env("SHELL", shell);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         if std::env::var_os("LANG").is_none() {
@@ -125,8 +185,14 @@ impl Session {
         // directory the service happened to be launched from (usually `/`).
         if let Some(home) = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
-            .filter(|home| home.is_dir())
+            .filter(|home| home.is_absolute() && home.is_dir())
+            .or_else(|| {
+                account_defaults()
+                    .map(|a| a.1)
+                    .filter(|home| home.is_absolute() && home.is_dir())
+            })
         {
+            command.env("HOME", &home);
             command.current_dir(home);
         }
         // The child gets the slave as its three standard streams; the parent
@@ -757,5 +823,37 @@ mod tests {
         // Either the shell closed the pty (EOF) or it printed nothing more;
         // both mean the session ended rather than hanging.
         assert!(session.exited() || !seen.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shell_fallback_tests {
+    use super::*;
+    #[test]
+    fn missing_or_invalid_environment_uses_account_shell() {
+        assert_eq!(select_shell(None, Some("/bin/sh".into())), "/bin/sh");
+        assert_eq!(
+            select_shell(Some("/not/a/shell".into()), Some("/bin/sh".into())),
+            "/bin/sh"
+        );
+        assert_eq!(
+            select_shell(Some("/tmp".into()), Some("/bin/sh".into())),
+            "/bin/sh"
+        );
+        assert_eq!(
+            select_shell(Some("sh".into()), Some("/bin/sh".into())),
+            "/bin/sh"
+        );
+    }
+    #[test]
+    fn environment_override_and_platform_fallback_are_preserved() {
+        assert_eq!(select_shell(Some("/bin/sh".into()), None), "/bin/sh");
+        assert_eq!(select_shell(None, None), DEFAULT_SHELL);
+    }
+    #[test]
+    fn live_account_lookup_is_owned_and_has_an_absolute_home() {
+        let (shell, home) = account_defaults().expect("current user NSS account");
+        assert!(executable_shell(&shell));
+        assert!(home.is_absolute());
     }
 }
