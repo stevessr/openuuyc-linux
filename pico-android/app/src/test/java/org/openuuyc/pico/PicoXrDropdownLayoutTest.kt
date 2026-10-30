@@ -10,6 +10,22 @@ class PicoXrDropdownLayoutTest {
         assertTrue(lastVisibleBottom<=PicoXrDropdownLayout.FOOTER_TOP)
         assertTrue(nextRowBottom>PicoXrDropdownLayout.FOOTER_TOP)
     }
+    @Test fun controllerNavigationScrollsDropdownRowsInBothDirections() {
+        assertEquals(-1,PicoXrDropdownLayout.navigationStep(100))
+        assertEquals(-1,PicoXrDropdownLayout.navigationStep(107))
+        assertEquals(1,PicoXrDropdownLayout.navigationStep(102))
+        assertEquals(1,PicoXrDropdownLayout.navigationStep(105))
+        val nextOffset=PicoXrDropdownLayout.navigationOffset(0,5,1,count)
+        assertEquals(1,nextOffset)
+        assertEquals(6,PicoMenuNavigation.select(5,1) {u,v->PicoXrDropdownLayout.hit(u,v,count,nextOffset)}?.cell)
+        val previousOffset=PicoXrDropdownLayout.navigationOffset(6,6,-1,count)
+        assertEquals(5,previousOffset)
+        assertEquals(5,PicoMenuNavigation.select(6,-1) {u,v->PicoXrDropdownLayout.hit(u,v,count,previousOffset)}?.cell)
+        assertEquals(6,PicoXrDropdownLayout.navigationOffset(6,7,-1,count))
+        assertEquals(6,PicoXrDropdownLayout.navigationOffset(6,9,1,count))
+        assertEquals(0,PicoXrDropdownLayout.navigationOffset(0,0,-1,count))
+        assertEquals(0,PicoXrDropdownLayout.navigationOffset(0,5,1,6))
+    }
     @Test fun rowsHitByTheirOwnBandsAndNothingBetween() {
         val top=PicoXrDropdownLayout.ROW_TOP;val h=PicoXrDropdownLayout.ROW_HEIGHT;val n=PicoXrDropdownLayout.visibleRows
         assertEquals(0,PicoXrDropdownLayout.hit(.5f,.2f,count))

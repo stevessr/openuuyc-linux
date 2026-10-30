@@ -129,17 +129,23 @@ internal class PicoXrToolbar(
         if(!menuVisible || keyboardPage || terminalTarget!=null) return
         if(direction>=100 && keyboardPage) return
         if(confirm && !stickSelectionValid) return
-        val hit: (Float,Float)->Int? = if(!isRoot() && !keyboardPage) {
-            // Dropdown pages: joystick up/down scrolls rows past the visible window.
-            {u,v->PicoXrDropdownLayout.hit(u,v,if(qualityPage()) qualityRows().size else dropdownRows().size,dropdownOffset)?.also {index ->
-                if(index>=0) {
-                    val visible=PicoXrDropdownLayout.visibleRows
-                    if(index<dropdownOffset) dropdownOffset=PicoXrDropdownLayout.pageOf(index)
-                    if(index>=dropdownOffset+visible) dropdownOffset=(index-visible+1).coerceAtLeast(0)
-                }
-            }}
+        val dropdown=!isRoot() && !keyboardPage
+        val rows=when {
+            optionTitle!=null->optionRows()
+            qualityPage()->qualityRows()
+            else->dropdownRows()
+        }
+        val selectionDirection=if(dropdown) PicoXrDropdownLayout.navigationStep(direction) else direction
+        if(dropdown && !confirm && selectionDirection in setOf(-1,1)) {
+            val offset=if(optionTitle!=null) optionOffset else dropdownOffset
+            val next=PicoXrDropdownLayout.navigationOffset(offset,navigationCell,selectionDirection,rows.size)
+            if(optionTitle!=null) optionOffset=next else dropdownOffset=next
+        }
+        val hit: (Float,Float)->Int? = if(dropdown) {
+            val offset=if(optionTitle!=null) optionOffset else dropdownOffset
+            {u,v->PicoXrDropdownLayout.hit(u,v,rows.size,offset)}
         } else ::hoverCell
-        val selected=PicoMenuNavigation.select(navigationCell,direction,hit) ?: run {stickSelectionValid=false;return}
+        val selected=PicoMenuNavigation.select(navigationCell,selectionDirection,hit) ?: run {stickSelectionValid=false;return}
         if(direction>=100) stickSelectionValid=true
         navigationCell=selected.cell
         stickFocused=true;hoverU=selected.u;hoverV=selected.v
