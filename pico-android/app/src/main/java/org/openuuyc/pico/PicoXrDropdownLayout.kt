@@ -12,7 +12,8 @@ internal object PicoXrDropdownLayout {
     const val ROW_TOP = 132f
     const val ROW_LEFT = 24f
     const val ROW_RIGHT = 1176f
-    val visibleRows = ((800f - ROW_TOP - 12f) / ROW_HEIGHT).toInt() // 6
+    const val FOOTER_TOP = 720f
+    val visibleRows = ((FOOTER_TOP - ROW_TOP) / ROW_HEIGHT).toInt()
 
     /** Row index for u,v over the current page; -1 selects the header (back/close). */
     fun hit(u: Float,v: Float,count: Int,offset: Int=0,sliders: Int=0): Int? {

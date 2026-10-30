@@ -3,6 +3,13 @@ import org.junit.Assert.*
 import org.junit.Test
 class PicoXrDropdownLayoutTest {
     private val count=10
+    @Test fun visibleRowsStayAboveFooterNotice() {
+        val lastVisibleBottom=PicoXrDropdownLayout.ROW_TOP+PicoXrDropdownLayout.visibleRows*PicoXrDropdownLayout.ROW_HEIGHT-8f
+        val nextRowBottom=lastVisibleBottom+PicoXrDropdownLayout.ROW_HEIGHT
+        assertEquals(6,PicoXrDropdownLayout.visibleRows)
+        assertTrue(lastVisibleBottom<=PicoXrDropdownLayout.FOOTER_TOP)
+        assertTrue(nextRowBottom>PicoXrDropdownLayout.FOOTER_TOP)
+    }
     @Test fun rowsHitByTheirOwnBandsAndNothingBetween() {
         val top=PicoXrDropdownLayout.ROW_TOP;val h=PicoXrDropdownLayout.ROW_HEIGHT;val n=PicoXrDropdownLayout.visibleRows
         assertEquals(0,PicoXrDropdownLayout.hit(.5f,.2f,count))
