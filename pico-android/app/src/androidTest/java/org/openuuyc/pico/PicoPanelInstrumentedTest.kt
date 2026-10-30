@@ -191,7 +191,30 @@ class PicoPanelInstrumentation : Instrumentation() {
         sendStatus(0,Bundle().apply {putString("stream","RGB/YUV portrait/landscape rounded alpha probe passed; synthetic pixels, not remote media.\n")})
     }
 
+    private fun verifyWindowScaleMenu() {
+        val reader=android.media.ImageReader.newInstance(1200,800,android.graphics.PixelFormat.RGBA_8888,4)
+        val steps=mutableListOf<Int>()
+        val menu=PicoXrToolbar(surface=reader.surface,session={null},followView={},reset={},touchMode={},keyboardModeChanged={},
+            appearance={_,_,_->},closeScreenMenu={},home={},connectImmersive={_,_->},pickBackground={},useImage={},
+            backgroundAction={},menuShape={},connectedIds={emptySet()},disconnect={})
+        menu.setWindowScale { direction -> steps.add(direction); "窗口已微调" }
+        fun click(index: Int) {
+            val r=PicoXrMenuHit.toolbarRect(index)
+            menu.activate((r[0]+r[2])/1200f,(r[1]+r[3])/800f)
+            reader.acquireLatestImage()?.close()
+        }
+        try {
+            menu.openScreenSettings(0)
+            click(7);click(7);click(1) // Advanced settings is the second entry on the last quality-ring page.
+            click(5) // Per-window size action remains on the first advanced ring page.
+            click(4)
+            click(5)
+            assertEquals(listOf(-1,1),steps)
+        } finally {menu.close();reader.close()}
+    }
+
     private fun verifyControllerMenu() {
+        verifyWindowScaleMenu()
         val reader=android.media.ImageReader.newInstance(1200,800,android.graphics.PixelFormat.RGBA_8888,4)
         val following=mutableListOf<Boolean>();val layouts=mutableListOf<Pair<Int,Int>>()
         val menu=PicoXrToolbar(surface=reader.surface,session={null},followView={following.add(it)},reset={},touchMode={},keyboardModeChanged={},

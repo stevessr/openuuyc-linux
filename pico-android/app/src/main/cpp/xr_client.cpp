@@ -53,6 +53,7 @@ static std::atomic<uint32_t> window_visible_mask{1u};
 static std::atomic<bool> passthrough_requested{true};
 static std::atomic<bool> layout_reset{false};
 static std::atomic<float> panel_aspects[6]{{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f}};
+static std::atomic<int> panel_scale_requests[6]{};
 static PanelGeometry panels[6] = {{0.f,0.f,1.65f},{-1.55f,0.f,1.25f},{1.55f,0.f,1.25f},{0.f,1.3f,1.25f},{-1.55f,1.3f,1.25f},{1.55f,1.3f,1.25f}};
 static bool toolbar_available = false;
 static PanelGeometry menu_panel=default_menu_panel();
@@ -943,6 +944,15 @@ Java_org_openuuyc_pico_PicoActivity_nativeSetWindowAspect(JNIEnv *,jobject,jint 
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeScaleWindow(JNIEnv *,jobject,jint pane,jint direction) {
+    if(pane<0 || pane>=6 || (direction!=-1 && direction!=1)) return;
+    auto &pending=panel_scale_requests[pane];
+    int current=pending.load(std::memory_order_relaxed);
+    while(!pending.compare_exchange_weak(current,std::clamp(current+direction,-8,8),
+        std::memory_order_release,std::memory_order_relaxed)) {}
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeSetFollowView(JNIEnv *, jobject, jboolean enabled) {
     std::lock_guard<std::mutex> lock(follow_pose_mutex);
     if(enabled==JNI_TRUE) {follow_requested_offset=follow_click_offset;follow_requested_valid=follow_click_valid;}
@@ -968,6 +978,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeSetPassthroughEnabled(JNIEnv *, jobjec
 extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject activity) {
     stop_requested.store(false, std::memory_order_release);
+    for(auto &request:panel_scale_requests) request.store(0,std::memory_order_relaxed);
     pointer_motion[0].reset();pointer_motion[1].reset();
     window_visible_mask.store(0u, std::memory_order_release);
     controller_menu_available=false;
@@ -1255,7 +1266,13 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 menu_panel.width=menu_portrait.load()?.48f:.80f;
                 menu_panel.aspect=menu_layout==0?2.f/3.f:menu_layout==5?.4f:menu_portrait.load()?1000.f/600.f:1.f/3.f;
             }
-            for(int i=0;i<6;++i) {panels[i].aspect=panel_aspects[i].load();panels[i].width=std::min(panels[i].width,panel_max_width(panels[i].aspect));}
+            for(int i=0;i<6;++i) {
+                panels[i].aspect=panel_aspects[i].load();
+                int steps=panel_scale_requests[i].exchange(0,std::memory_order_acq_rel);
+                for(;steps>0;--steps) panel_scale(panels[i],1.f);
+                for(;steps<0;++steps) panel_scale(panels[i],-1.f);
+                panels[i].width=std::min(panels[i].width,panel_max_width(panels[i].aspect));
+            }
             const int host=menu_host.load();
             if(host>=0 && host<6 && !menu_grab) {
                 if(window_visible_mask.load() & (1u<<host))

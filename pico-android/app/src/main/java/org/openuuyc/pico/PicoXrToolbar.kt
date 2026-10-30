@@ -162,7 +162,7 @@ internal class PicoXrToolbar(
     private var targetScreen: Int?=null
     private var advanced=false
     private var portrait=false
-    private fun qualityPage()=!keyboardPage && terminalTarget==null && targetScreen!=null && !advanced && !confirmingVirtual && optionTitle==null
+    private fun qualityPage()=!keyboardPage && terminalTarget==null && targetScreen!=null && !spacePage && !advanced && !confirmingVirtual && optionTitle==null
 
     private var optionTitle: String?=null
     private var optionLabels=emptyList<String>()
@@ -209,6 +209,8 @@ internal class PicoXrToolbar(
     private var brightness=75
     private var backgroundFlow=true
     private var spacePage=false
+    private var windowScale: (Int) -> String = { "请先选中一个串流窗口" }
+    fun setWindowScale(action: (Int) -> String) { windowScale=action }
     private var mrVisibility=100
     private var customImage=false
     fun setAppearance(visibility: Int,custom: Boolean,color: Int,preset: String="black",brightness: Int=75,flow: Boolean=true) {
@@ -341,7 +343,7 @@ internal class PicoXrToolbar(
         if(isRoot()) PicoXrMenuHit.toolbar(u,v)?.let {index ->
             when(index) {
                 0 -> inputOptions()
-                3 -> {spacePage=true;notice="空间布局 · 跟随与固定使用菜单按钮";draw()}
+                3 -> {spacePage=true;notice="空间布局 · 尺寸每次调整6%，保持比例；最小宽40cm，最大对角线100英寸";draw()}
                 8 -> {setFollowing(true);draw()}
                 9 -> {setFollowing(false);draw()}
                 10 -> {collapsed=true;draw()}
@@ -379,10 +381,15 @@ internal class PicoXrToolbar(
                     2 -> setFollowing(true)
                     3 -> setFollowing(false)
                     7 -> options("主菜单位置",listOf("悬浮菜单（推荐）","左手柄","右手柄"),if(controllerHand==2) 0 else controllerHand+1) {controllerHand=if(it==0) 2 else it-1;previousLayout=-1}
+                    4 -> notice=windowScale(-1)
+                    5 -> notice=windowScale(1)
                     6 -> {focusDots=!focusDots;focusDotsChanged(focusDots);notice=if(focusDots) "焦点圆点已开启" else "焦点圆点已隐藏；射线与点击保持可用"}
-                    11 -> spacePage=false
+                    11 -> {spacePage=false;notice=if(targetScreen!=null) "已返回窗口设置" else "已返回主菜单"}
                 }
                 draw();return
+            }
+            if(targetScreen!=null && cell==5) {
+                spacePage=true;notice="窗口尺寸调节 · 每次调整6%，保持比例；最小宽40cm，最大对角线100英寸";draw();return
             }
             pendingTakeover?.let {device ->
                 pendingTakeover=null
@@ -511,11 +518,10 @@ internal class PicoXrToolbar(
                     2 -> bitrate(current,direct)
                     3 -> {val values=state.selectableProfiles();options("编码偏好",values.map {when(it.codec) {0->"自动";1->"H.264";2->"H.265";else->"编码 ${it.codec}"}},values.indexOfFirst {it.codec==current.codec}) {set(current.copy(codec=values[it].codec))}}
                     4 -> set(current.copy(cursor=!current.cursor))
-                    5 -> {val values=listOf(1280 to 720,1920 to 1080,2560 to 1440,3840 to 2160).filter {v->state.profiles.any {(current.codec==0 || current.codec==it.codec) && v.first<=it.width && v.second<=it.height}};options("串流尺寸",values.map {"${it.first} × ${it.second}"},values.indexOf(current.maxWidth to current.maxHeight)) {val next=values[it];set(current.copy(maxWidth=next.first,maxHeight=next.second))}}
+                    9 -> {val values=listOf(1280 to 720,1920 to 1080,2560 to 1440,3840 to 2160).filter {v->state.profiles.any {(current.codec==0 || current.codec==it.codec) && v.first<=it.width && v.second<=it.height}};options("串流尺寸",values.map {"${it.first} × ${it.second}"},values.indexOf(current.maxWidth to current.maxHeight)) {val next=values[it];set(current.copy(maxWidth=next.first,maxHeight=next.second))}}
                     6 -> options("屏幕分辨率",source.modes.map {it.toString()},source.modes.indexOf(source.current)) {check(direct.applySettings(current,physical=source.modes[it],targetScreen=screen)) {"控制通道未就绪"}}
                     7 -> options("DPI 缩放",source.dpis.map {"$it%"},source.dpis.indexOf(source.dpi)) {check(direct.applySettings(current,dpi=source.dpis[it],targetScreen=screen)) {"控制通道未就绪"}}
                     8 -> {confirmingVirtual=true;notice="确认创建 1920×1080 虚拟屏？"}
-                    9 -> notice="拖动四角调整大小；最大对角线 100 英寸"
                     10 -> notice="${source.name} · ${source.current} · DPI ${source.dpi}%"
                     11 -> {targetScreen=null;closeScreenMenu();notice="串流设置请从各窗口顶部展开"}
                 }
@@ -540,18 +546,31 @@ internal class PicoXrToolbar(
     }
     private fun settingsLabels(): List<String> {
         val state=session()?.settingsSnapshot(targetScreen);val c=state?.current
-        return if(backgroundPage) PicoBackgroundPattern.presets.map {"${if(!customImage && selectedPreset==it.id) "✓ " else ""}${it.label}${if(it.procedural) " · 程序生成" else ""}"}+listOf("","返回环境设置") else if(environmentPage) listOf(if(mr) "MR 透视：开启" else "MR 透视：关闭","透视可见度：${mrVisibility}%","选择图片 / 全景图…",if(customImage) "图片背景：开启" else "图片背景：关闭","背景：全黑","背景：深灰","背景：深蓝","背景库 · 更多…","重新生成图案","背景亮度：${brightness}%",if(backgroundFlow) "背景流动：开" else "背景流动：关","返回主菜单") else if(spacePage) listOf(if(followPending) "跟随：切换中" else if(following) "跟随视角：开" else "跟随视角：关","重置到当前视角","跟随视角","固定窗口","窗口可独立拖动","窗口最大100英寸",if(focusDots) "焦点圆点：开" else "焦点圆点：关（默认）",when(controllerHand) {0->"主菜单：左手柄";1->"主菜单：右手柄";else->"主菜单：悬浮"},"","","","返回主菜单") else if(pendingTakeover!=null) listOf("确认抢占","取消抢占") else if(devicePage) (0..11).map {i -> when(i) {
+        return if(backgroundPage) PicoBackgroundPattern.presets.map {"${if(!customImage && selectedPreset==it.id) "✓ " else ""}${it.label}${if(it.procedural) " · 程序生成" else ""}"}+listOf("","返回环境设置") else if(environmentPage) listOf(if(mr) "MR 透视：开启" else "MR 透视：关闭","透视可见度：${mrVisibility}%","选择图片 / 全景图…",if(customImage) "图片背景：开启" else "图片背景：关闭","背景：全黑","背景：深灰","背景：深蓝","背景库 · 更多…","重新生成图案","背景亮度：${brightness}%",if(backgroundFlow) "背景流动：开" else "背景流动：关","返回主菜单") else if(spacePage) spaceLabels() else if(pendingTakeover!=null) listOf("确认抢占","取消抢占") else if(devicePage) (0..11).map {i -> when(i) {
                 8 -> "上一页";9 -> "下一页";10 -> "刷新设备";11 -> "返回串流"
                 else -> devices.getOrNull(deviceOffset+i)?.let { "${it.alias} · ${if(it.online && it.controllable) "沉浸式连接" else "不可连接"}" } ?: ""
             }} else if(keyboardPage) emptyList() else if(screenPage) (0..11).map { index -> when(index) {
                 10 -> "刷新屏幕";11 -> "返回设置";else -> menuScreens.getOrNull(index)?.let {
                     "${if(it.id==session()?.selectedScreen()) "✓ " else ""}${it.name.ifBlank { "屏幕 ${it.id+1}" }} ${it.current ?: ""}"
                 } ?: ""
-            }} else if(confirmingVirtual) listOf("确认创建","取消","取消","取消") else if(targetScreen!=null) listOf("帧率 ${c?.fps}","画质 ${c?.quality}","码率 ${c?.bitrateMbps}M","编码：自动","远端光标","串流尺寸","屏幕分辨率","DPI 缩放","创建虚拟屏","最大100英寸","屏幕信息","收起设置") else listOf(
+            }} else if(confirmingVirtual) listOf("确认创建","取消","取消","取消") else if(targetScreen!=null) listOf("帧率 ${c?.fps}","画质 ${c?.quality}","码率 ${c?.bitrateMbps}M","编码：自动","远端光标","窗口大小调整","屏幕分辨率","DPI 缩放","创建虚拟屏","串流尺寸","屏幕信息","收起设置") else listOf(
                 if(followPending) "跟随：切换中" else if(following) "跟随视角：开" else "跟随视角：关", "重置布局", "切换屏幕", "创建虚拟屏",
                 if(mr) "MR：开" else "MR：关", "背景：${listOf("全黑","深灰","深蓝")[backgroundIndex]}", "主页面", "操作帮助",
                 "键盘", "最大100英寸", if(usingTouch) "输入：触摸" else "输入：鼠标", "断开全部")
     }
+
+    private fun spaceLabels(): List<String> = listOf(
+        if(followPending) "跟随：切换中" else if(following) "跟随视角：开" else "跟随视角：关",
+        "重置到当前视角",
+        "跟随视角",
+        "固定窗口",
+        "缩小窗口（−6%）",
+        "放大窗口（＋6%）",
+        if(focusDots) "焦点圆点：开" else "焦点圆点：关（默认）",
+        when(controllerHand) {0->"主菜单：左手柄";1->"主菜单：右手柄";else->"主菜单：悬浮"},
+        "", "", "",
+        if(targetScreen!=null) "返回窗口设置" else "返回主菜单"
+    )
     private data class RingEntry(val label: String,val icon: android.graphics.Bitmap?=null,val run: ()->Unit)
     private var ringPage=0
     private var ringKey=""
@@ -584,7 +603,7 @@ internal class PicoXrToolbar(
         ringPage=PicoXrRingPage.clamp(ringPage,entries.size)
         return entries
     }
-    private fun ringTitle()=optionTitle ?: when {devicePage->"设备";screenPage->"显示器";backgroundPage->"背景库";environmentPage->"环境";spacePage->"空间";qualityPage()->"画质";else->"串流设置"}
+    private fun ringTitle()=optionTitle ?: when {devicePage->"设备";screenPage->"显示器";backgroundPage->"背景库";environmentPage->"环境";spacePage->if(targetScreen!=null) "窗口大小" else "空间";qualityPage()->"画质";else->"串流设置"}
     private fun ringBack() {
         when {optionTitle!=null->{optionTitle=null;optionApply=null};backgroundPage->{backgroundPage=false;environmentPage=true};else->click(11)}
         draw()

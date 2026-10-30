@@ -89,6 +89,13 @@ open class PicoActivity : Activity() {
     }
     private fun currentXrSession()=xrSettingsSession ?: xrExtraSessions[xrActivePane] ?: session
 
+    private fun adjustActiveXrWindow(direction: Int): String {
+        val pane=xrActivePane
+        if(pane !in 0..5 || xrPaneVisible.get(pane)==0) return "先指向一个可见串流窗口，再调整尺寸"
+        nativeScaleWindow(pane,direction)
+        return "当前窗口${if(direction>0) "放大" else "缩小"}6% · 保持比例"
+    }
+
     private var panelMicButton: Button?=null
     private var panelClipboardButton: Button?=null
     private fun toggleMicrophone(target: UuDirectSession?) {
@@ -136,6 +143,7 @@ open class PicoActivity : Activity() {
     private external fun nativeSetControllerMenu(layout: Int,hand: Int)
     private external fun nativeSetMenuPortrait(portrait: Boolean)
     private external fun nativeSetWindowAspect(pane: Int,width: Int,height: Int)
+    private external fun nativeScaleWindow(pane: Int,direction: Int)
     private external fun nativeSetWindowVisible(index: Int, visible: Boolean)
     private external fun nativeSetPassthroughEnabled(enabled: Boolean)
     private var passthroughEnabled = true
@@ -886,6 +894,7 @@ open class PicoActivity : Activity() {
                     val apps=runCatching {PicoLocalVrApps.list(this)}.getOrDefault(emptyList())
                     ui.post {if(!isDestroyed) callback(apps)}
                 }},{app->runCatching {PicoLocalVrApps.launch(this,app)}.onFailure {error->message(error.message ?: "VR 应用启动失败")}});it.setTerminalInput({terminal->terminalKeyboard?.hide();terminalKeyboard=PicoRemoteKeyboard(this,{terminal.input(it+"\r")},{_,_->false}).also {keyboard->keyboard.show()}},{terminalKeyboard?.hide();terminalKeyboard=null});it.setCodexVoice {shortcut,status->val target=currentXrSession();target?.codexVoice(this,{if(currentXrSession()===target) shortcut() else false},status) ?: status("请选择有效串流窗口")};it.setVoiceControl({remoteKeyboard?.startVoice()},{remoteKeyboard?.stopVoice()},{remoteKeyboard?.cancelVoice()});it.setPointerStyle(xrPointerStyle,::applyPointerStyle);it.setQuickAppConnections(::quickAppConnections);it.setControllerMenu(xrAppearance.menuHand) {layout,hand->xrAppearance.setMenuHand(hand);nativeSetControllerMenu(layout,hand)};it.setFocusDots(xrAppearance.focusDots) {enabled->xrAppearance.setFocusDots(enabled);nativeSetFocusDots(enabled)};it.setMr(passthroughEnabled);it.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness,xrAppearance.flow) }
+                .also { it.setWindowScale(::adjustActiveXrWindow) }
                 return@post
             }
             if (!running.get() || index !in 0..5) { surface.release(); return@post }
