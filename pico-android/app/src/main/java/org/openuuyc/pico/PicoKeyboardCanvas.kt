@@ -4,13 +4,23 @@ import android.graphics.Paint
 import android.graphics.RectF
 
 internal object PicoKeyboardCanvas {
-    fun draw(c: Canvas,mode: PicoKeyboardMode,keys: PicoKeyboardKeys,u: Float,v: Float) {
+    fun draw(c: Canvas,mode: PicoKeyboardMode,keys: PicoKeyboardKeys,u: Float,v: Float,voiceActive: Boolean=false) {
         val p=Paint(Paint.ANTI_ALIAS_FLAG).apply {textSize=25f}
-        listOf("系统键盘","自定义键盘","全键盘","语音输入","返回").forEachIndexed {i,label ->
-            PicoXrMaterial.control(c,RectF(i*240+7f,48f,i*240+233f,90f),i==mode.ordinal,u*1200 in i*240+7f..i*240+233f && v*400 in 48f..90f)
-            p.color=PicoTheme.TEXT;c.drawText(label,i*240+20f,78f,p)
+        listOf("输入方式 ›","返回").forEachIndexed {i,label ->
+            val left=if(i==0) 7f else 967f;val right=if(i==0) 953f else 1193f
+            PicoXrMaterial.control(c,RectF(left,48f,right,90f),false,u*1200 in left..right && v*400 in 48f..90f)
+            p.color=PicoTheme.TEXT;c.drawText(label,left+20f,78f,p)
         }
-        if(mode==PicoKeyboardMode.SYSTEM || mode==PicoKeyboardMode.VOICE) {p.color=PicoTheme.TEXT;c.drawText("系统键盘可切换语言；语音请点键盘麦克风，完成后点发送",20f,160f,p);return}
+        if(mode==PicoKeyboardMode.VOICE) {
+            p.color=if(voiceActive) PicoTheme.RED else PicoTheme.ACCENT;c.drawCircle(600f,220f,64f,p)
+            p.style=Paint.Style.STROKE;p.strokeWidth=5f;p.color=android.graphics.Color.WHITE
+            c.drawRoundRect(RectF(587f,185f,613f,226f),13f,13f,p)
+            c.drawArc(RectF(578f,202f,622f,242f),0f,180f,false,p);c.drawLine(600f,242f,600f,254f,p);c.drawLine(589f,254f,611f,254f,p)
+            p.style=Paint.Style.FILL;p.color=PicoTheme.TEXT;p.textSize=25f
+            c.drawText(if(voiceActive) "正在聆听 · 松开 / 再次点击结束" else "点击开始再点结束，或按住说话松开结束",300f,330f,p)
+            return
+        }
+        if(mode==PicoKeyboardMode.SYSTEM) {p.color=PicoTheme.TEXT;c.drawText("使用原生系统键盘输入多语言文字",20f,160f,p);return}
         val rows=PicoKeyboardLayout.rows(mode)
         val height=264f/rows.size
         val hover=PicoKeyboardLayout.keyAt(mode,u,v)

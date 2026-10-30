@@ -72,6 +72,9 @@ jobs:
           c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
             pico-android/app/src/test/cpp/xr_panel_orbit_test.cpp -o /tmp/xr-panel-orbit-test
           /tmp/xr-panel-orbit-test
+          c++ -std=c++17 -I pico-android/app/src/main/cpp \
+            pico-android/app/src/test/cpp/xr_panel_facing_test.cpp -o /tmp/xr-panel-facing-test
+          /tmp/xr-panel-facing-test
           c++ -std=c++17 -Wall -Wextra -Werror -Ipico-android/app/src/main/cpp \
             pico-android/app/src/test/cpp/xr_ray_geometry_test.cpp -o /tmp/xr-ray-geometry-test
           /tmp/xr-ray-geometry-test

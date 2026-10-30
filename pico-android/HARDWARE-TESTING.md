@@ -327,3 +327,21 @@ and reachability still require headset validation.
 - Deflect the invoking hand's stick beyond 60%, then return below 25% to execute the highlighted item once. A stick press/trigger confirmation is not required.
 - Below-threshold motion must not execute anything. Closing the menu or losing stick tracking cancels the pending selection. Verify both hands and submenu navigation on hardware.
 - Application directories use data-only SDP (zero media tracks). Existing connections wait for capability readiness; unsupported official UU quick-app peers must report unsupported instead of requesting audio/video.
+
+- Crisp-release guard: once the stick starts returning (8% below its held peak), it must reach centre within 160 ms. Pausing for more than 65 ms, outward reversal over 8%, or a tracking sample gap over 80 ms cancels. A cancelled gesture must return to centre before re-arming; validate thresholds against actual controller spring behaviour.
+
+### View-parallel drag and radial lists
+- While dragging a desktop or floating menu, its local right/up/normal track the current VIEW orientation, including roll. The grabbed UV stays on the controller ray's user-centred sphere. Verify while turning, nodding, tilting and translating the head.
+- The immersive hub uses eight annular sectors. All device/screen/app/setting lists share that hit geometry, with six data sectors and reserved previous/next sectors. Centre title reports the page. Empty sectors, wedge gaps and disabled page controls must not execute on spring release.
+- Keyboard key grids retain their typing layout; they are not list menus. Windowed Android menus remain unchanged.
+
+### Voice microphone and input styles
+- Voice page is an explicit microphone, not an IME instruction. Short click starts, a second click ends; a hold of at least 300 ms ends on release. Partial/final results remain local until the user ends the gesture; changing mode, losing focus or closing the session cancels. Speech requests never enable remote microphone forwarding.
+- Android SpeechRecognizer requires an installed RecognitionService and user microphone permission. On 2026-10-30, the connected PICO reported no RecognitionService and a null voice_recognition_service setting; actual recognition remains blocked on a provider, not accepted as tested.
+- Input type and pointer appearance are separate submenus. Win7/Win11 touch hints are client-side visuals, not assertions about the remote OS. Remote/local cursor modes use UU capture-cursor configuration; adaptive uses the remote text-caret indication and local arrow otherwise. Verify cursor-setting acknowledgements and both simultaneous controllers.
+
+### PICO system IME invocation repair (2026-10-30)
+- Checked the official PICO Unity SDK source (`XR/Editor/PXR_BuildProcessor.cs`, `XR/Runtime/Android/PxrPlatform.aar`) and the connected OS 5.15.8 default IME (`com.bytedance.pico.inputmethod/.PicoIME`). Do not copy Unity application-wide VR metadata into this mixed panel/OpenXR app or invent a Kotlin PXR keyboard API.
+- Native Android route: a real EditText/editor window, focus/token gate, one input-connection restart per request, bounded show retries and IME result acknowledgement. A voice-only dialog is replaced before requesting a text keyboard. IME acknowledgement is not proof that its immersive overlay is visible.
+- Installed repair and ran `native-ime` instrumentation on the connected PICO: input connection bound; local Unicode composition/confirm/cancel and voice-dialog-to-editor transition passed. No speech recording or remote text transport was used. Actual immersive visual placement/controller typing still needs a worn-headset test.
+- Platform references: https://github.com/Pico-Developer/PICO-Unity-SDK/blob/main/XR/Editor/PXR_BuildProcessor.cs and https://developer.android.com/develop/ui/views/touch-and-input/keyboard-input/visibility .

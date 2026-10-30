@@ -36,7 +36,8 @@ internal class PicoLoginView(
     private val loadDeviceApps: ((UuDevice, Boolean, (List<org.openuuyc.pico.uu.UuQuickApps.App>?,String?)->Unit)->Unit)? = null,
     private val launchDeviceApp: ((UuDevice,org.openuuyc.pico.uu.UuQuickApps.App)->Unit)? = null,
     private val closeDeviceApps: (() -> Unit)? = null,
-    private val onDeviceFiles: ((UuDevice)->Unit)? = null
+    private val onDeviceFiles: ((UuDevice)->Unit)? = null,
+    private val onDeviceTerminal: ((UuDevice)->Unit)? = null
 ) : FrameLayout(context) {
     private val state = PicoPanelState()
     private var restoreRetry = false
@@ -370,6 +371,7 @@ internal class PicoLoginView(
         page.addView(hero);page.gap(14)
         val actions=row()
         onImmersiveConnect?.let {connect ->actions.addView(button("沉浸式连接") {connect(device)}.apply {isEnabled=device.online && device.controllable},LinearLayout.LayoutParams(0,dp(46),1f))}
+        onDeviceTerminal?.let {open->actions.addView(button("终端") {open(device)}.apply {isEnabled=device.online && device.controllable},LinearLayout.LayoutParams(0,dp(46),1f).apply {marginStart=dp(10)})}
         onDeviceFiles?.let {open ->actions.addView(button("文件管理") {open(device)}.apply {isEnabled=device.online && device.controllable},LinearLayout.LayoutParams(0,dp(46),1f).apply {marginStart=dp(10)})}
         actions.addView(button("刷新设备") {onRefresh()},LinearLayout.LayoutParams(0,dp(46),1f).apply {marginStart=dp(10)})
         page.addView(actions);page.gap(22)
@@ -397,7 +399,13 @@ internal class PicoLoginView(
             list.removeAllViews()
             val pinned=prefs.getStringSet(key,emptySet()).orEmpty()
             available.sortedWith(compareByDescending<org.openuuyc.pico.uu.UuQuickApps.App> {it.name.startsWith("VRChat",true)}.thenByDescending {it.vr}.thenByDescending {it.id in pinned}.thenBy {it.name.lowercase()}).forEach {app ->
-                list.addView(button((if(app.id in pinned) "★ " else "")+app.name) {launchDeviceApp?.invoke(device,app)}.apply {isEnabled=app.enabled})
+                list.addView(button((if(app.id in pinned) "★ " else "")+app.name) {launchDeviceApp?.invoke(device,app)}.apply {
+                    isEnabled=app.enabled
+                    PicoAppIcon.decode(app.icon)?.let {bitmap->
+                        val icon=android.graphics.drawable.BitmapDrawable(resources,bitmap)
+                        icon.setBounds(0,0,dp(32),dp(32));setCompoundDrawables(icon,null,null,null);compoundDrawablePadding=dp(12)
+                    }
+                })
             }
         }
         page.gap(10)

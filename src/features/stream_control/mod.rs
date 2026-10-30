@@ -351,6 +351,7 @@ pub struct StreamControlHandle {
     drag_drop: crate::features::drag_drop::controller::Controller,
     files: Arc<crate::features::file_transfer::Transport>,
     diagnostics: crate::diagnostics::remote::Controller,
+    terminal: crate::features::remote_terminal::Terminal,
     mouse: crate::features::remote_input::RemoteInput,
     cursor: crate::features::remote_cursor::RemoteCursorState,
     audio: crate::media::audio::AudioPlayback,
@@ -622,6 +623,7 @@ impl StreamControlHandle {
                 drag_drop: Default::default(),
                 files: Arc::new(crate::features::file_transfer::Transport::default()),
                 diagnostics: Default::default(),
+                terminal: Default::default(),
                 mouse,
                 cursor,
                 audio,
@@ -673,6 +675,8 @@ impl StreamControlHandle {
     pub(crate) fn file_transfer(&self) -> &Arc<crate::features::file_transfer::Transport> {
         &self.files
     }
+
+    pub(crate) fn terminal(&self)->&crate::features::remote_terminal::Terminal {&self.terminal}
 
     pub(crate) fn diagnostics(&self) -> &crate::diagnostics::remote::Controller {
         &self.diagnostics

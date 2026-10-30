@@ -491,6 +491,7 @@ pub(super) fn show_stream_control_window(
     local_size: Option<(u32, u32)>,
     anchor_offset: egui::Vec2,
 ) {
+    handle.terminal().ui(ctx);
     topology_menu::show(ctx, handle, local_size);
     topology_menu::show_error(ctx, handle);
     let mic = handle.microphone().snapshot();
@@ -1023,6 +1024,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                     crate::ui::controls::progress_notice(ui.ctx(),"clipboard-wait","剪贴板同步",(!clip.active && snapshot.mouse_mode != MouseMode::View).then_some("等待剪贴板通道就绪"));
 crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同步失败", crate::ui::controls::DialogIcon::Error, clip.error.as_deref());
                                 }
+                                if menu_row(ui,"远端终端","",None,true,false).clicked() {handle.terminal().show();}
                                 let can_send = snapshot.ready
                                     && !snapshot.mouse_pending
                                     && snapshot.mouse_mode != MouseMode::View

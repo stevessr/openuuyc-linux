@@ -202,7 +202,7 @@ impl NativePeer {
         }
 
         let mut local_channels = Vec::with_capacity(DATA_CHANNEL_LABELS.len());
-        for label in DATA_CHANNEL_LABELS {
+        for label in DATA_CHANNEL_LABELS.into_iter().chain([crate::features::remote_terminal::CHANNEL]) {
             let channel = connection
                 .create_data_channel(label, Some(official_data_channel_init(label)))
                 .await
@@ -923,6 +923,7 @@ impl NativePeer {
     pub async fn close(&self) -> Result<()> {
         self.data_channels.stream_control.microphone().close().await;
         self.data_channels.stream_control.file_transfer().close();
+        self.data_channels.stream_control.terminal().disconnected();
         self.data_channels.stream_control.diagnostics().close();
         self.data_channels.stream_control.clipboard().suspend();
         self.data_channels.port_mapping.close();
@@ -936,6 +937,7 @@ impl NativePeer {
 impl Drop for NativePeer {
     fn drop(&mut self) {
         self.data_channels.stream_control.microphone().stop();
+        self.data_channels.stream_control.terminal().disconnected();
         self.data_channels.stream_control.diagnostics().close();
         self.data_channels.stream_control.clipboard().suspend();
         self.data_channels.stream_control.mouse().set_ready(false);

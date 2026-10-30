@@ -20,11 +20,17 @@ internal class PicoRemoteKeyboard(
     private var editor: android.widget.EditText?=null
     internal val nativeEditor: android.widget.EditText? get()=editor
     private var editorGeneration=0
+    var imeStateChanged: (String)->Unit={}
+    private var imeTask: Runnable?=null
+    private fun cancelImeRequest() {imeTask?.let {editor?.removeCallbacks(it)};imeTask=null}
     /** Use a real native EditText/window token; the old 1px custom View wasn't a reliable IME host. */
     fun show() {
         val activity=context as? android.app.Activity ?: return
         if(activity.isFinishing || activity.isDestroyed) return
-        if(dialog?.isShowing==true) {requestIme();return}
+        if(dialog?.isShowing==true && editor!=null) {requestIme();return}
+        // A voice dialog has no text editor/token. It must not swallow a
+        // subsequent system-keyboard request.
+        hide()
         releaseKeys()
         val input=object: android.widget.EditText(context) {
             override fun onCreateInputConnection(info: EditorInfo): InputConnection? {
@@ -65,33 +71,84 @@ internal class PicoRemoteKeyboard(
             input.requestFocus();requestIme()
         }
         native.setOnDismissListener {
-            submission.cancel();editorGeneration++
+            submission.cancel();cancelImeRequest();editorGeneration++
             (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(input.windowToken,0)
             if(dialog===native) {dialog=null;editor=null}
             input.text.clear();releaseKeys()
         }
+        // Configure BEFORE showing; PICO IME needs a focusable editor window,
+        // not a keyboard request against the OpenXR rendering surface.
+        native.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or android.view.WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+        native.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         native.show()
     }
     private fun requestIme() {
         val input=editor ?: return
+        cancelImeRequest()
         val generation=editorGeneration
-        fun attempt(left: Int) {
-            if(generation!=editorGeneration || dialog?.isShowing!=true) return
-            input.requestFocus()
-            if(input.isAttachedToWindow && input.hasWindowFocus()) {
-                val ime=context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                ime.restartInput(input)
-                ime.showSoftInput(input,InputMethodManager.SHOW_IMPLICIT)
-                if(android.os.Build.VERSION.SDK_INT>=30) input.windowInsetsController?.show(android.view.WindowInsets.Type.ime())
-            } else if(left>0) input.postDelayed({attempt(left-1)},150)
+        val gate=PicoImeLaunchGate()
+        // Use the editor's display context. PICO's panel and immersive windows
+        // can live on different displays; the Activity's service can be stale.
+        val ime=input.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        val result=object: android.os.ResultReceiver(android.os.Handler(android.os.Looper.getMainLooper())) {
+            override fun onReceiveResult(code: Int,data: android.os.Bundle?) {
+                if(generation!=editorGeneration || editor!==input) return
+                val shown=code==InputMethodManager.RESULT_SHOWN || code==InputMethodManager.RESULT_UNCHANGED_SHOWN
+                gate.acknowledge(shown)
+                imeStateChanged(if(shown) "PICO 系统输入法已响应" else "系统输入法尚未显示，正在重试")
+            }
         }
-        input.post {attempt(6)}
+        val task=object: Runnable {
+            override fun run() {
+                if(generation!=editorGeneration || editor!==input || dialog?.isShowing!=true) return
+                input.requestFocus()
+                val visible=android.os.Build.VERSION.SDK_INT>=30 && input.rootWindowInsets?.isVisible(android.view.WindowInsets.Type.ime())==true
+                when(gate.step(input.isAttachedToWindow && input.windowToken!=null,input.hasWindowFocus(),visible)) {
+                    PicoImeLaunchGate.Step.DONE->{imeTask=null;return}
+                    PicoImeLaunchGate.Step.TIMEOUT->{imeTask=null;imeStateChanged("系统键盘未响应，请点击输入框重试或切换自定义键盘");return}
+                    PicoImeLaunchGate.Step.CONNECT->ime.restartInput(input)
+                    PicoImeLaunchGate.Step.SHOW->{
+                        ime.showSoftInput(input,0,result)
+                        if(android.os.Build.VERSION.SDK_INT>=30) input.windowInsetsController?.show(android.view.WindowInsets.Type.ime())
+                    }
+                    PicoImeLaunchGate.Step.WAIT->Unit
+                }
+                input.postDelayed(this,150)
+            }
+        }
+        imeTask=task;input.post(task)
     }
+    var voiceStarting: ()->Unit={}
+    var voiceChanged: (Boolean,String)->Unit={_,_->}
+    private var voiceButton: android.widget.Button?=null
+    private val voiceGesture=PicoVoiceGesture()
+    private val voice by lazy {PicoVoiceInput(context as android.app.Activity,text) {active,message->
+        voiceButton?.text=if(active) "🎙 正在聆听" else "🎙 点击 / 按住说话"
+        voiceChanged(active,message)
+        if(voiceButton!=null) android.widget.Toast.makeText(context,message,android.widget.Toast.LENGTH_SHORT).show()
+    }}
+    val voiceListening get()=voice.listening
+    fun startVoice() {voiceStarting();voice.start()}
+    fun stopVoice() {voice.stop()}
+    fun cancelVoice() {voiceGesture.reset();voice.cancel()}
     fun showVoiceInput() {
-        show()
-        android.widget.Toast.makeText(context,"请点击 PICO 系统键盘的麦克风进行语音输入，完成后点发送",android.widget.Toast.LENGTH_LONG).show()
+        val activity=context as? android.app.Activity ?: return
+        hide()
+        val button=android.widget.Button(context).apply {
+            text="🎙 点击 / 按住说话";textSize=26f;minHeight=180
+            setOnTouchListener {view,event ->
+                when(event.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN->when(voiceGesture.down(android.os.SystemClock.elapsedRealtime(),voice.listening)) {PicoVoiceGesture.Action.START->startVoice();else->Unit}
+                    android.view.MotionEvent.ACTION_UP->{if(voiceGesture.up(android.os.SystemClock.elapsedRealtime())==PicoVoiceGesture.Action.STOP) voice.stop();view.performClick()}
+                    android.view.MotionEvent.ACTION_CANCEL->cancelVoice()
+                };true
+            }
+        }
+        voiceButton=button
+        val native=android.app.AlertDialog.Builder(activity).setTitle("语音输入").setView(button).setNegativeButton("关闭",null).create()
+        dialog=native;native.setOnDismissListener {cancelVoice();voiceButton=null;if(dialog===native) dialog=null};native.show()
     }
-    fun hide() {editorGeneration++;dialog?.dismiss();dialog=null;editor=null;clearFocus();releaseKeys()}
+    fun hide() {cancelVoice();cancelImeRequest();editorGeneration++;dialog?.dismiss();dialog=null;editor=null;clearFocus();releaseKeys()}
     fun releaseKeys() { held.toList().forEach { key(it, false) }; held.clear() }
     private fun dispatchRemoteKey(event: KeyEvent): Boolean {
         val vk = vk(event.keyCode) ?: return false

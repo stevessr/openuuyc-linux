@@ -11,6 +11,12 @@ class PicoXrMenuHitTest {
         assertNull(PicoXrMenuHit.settings(.5f,.1f))
         assertNull(PicoXrMenuHit.settings(.1f,.8f,4))
     }
+    @Test fun ringGapsAndOutsideDoNotActivate() {
+        assertNull(PicoXrMenuHit.toolbar(600f/1200,100f/800))
+        assertNull(PicoXrMenuHit.toolbar(600f/1200,275f/800))
+        val angle=Math.toRadians(22.5)
+        assertNull(PicoXrMenuHit.toolbar((600+220*kotlin.math.sin(angle)).toFloat()/1200,(410-220*kotlin.math.cos(angle)).toFloat()/800))
+    }
     @Test fun centersMatchTwelveMenuCells() {
         for(i in 0..11) assertEquals(i,PicoXrMenuHit.cell((i%4*300+150)/1200f,(48+i/4*104+52)/400f))
     }

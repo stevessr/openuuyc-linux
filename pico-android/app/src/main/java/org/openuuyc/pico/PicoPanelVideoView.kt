@@ -27,6 +27,25 @@ internal class PicoPanelVideoView(
     private var videoHeight = 1080
     var touchMode = false
         set(value) { if (field != value) releasePointer(); field = value }
+    var pointerStyle=4
+        set(value) {field=value.coerceIn(0,4);invalidate()}
+    var remoteTextCursor=false
+        set(value) {field=value;invalidate()}
+    private var pointerVisible=false
+    override fun dispatchDraw(canvas: android.graphics.Canvas) {
+        super.dispatchDraw(canvas)
+        if(!pointerVisible || !PicoPointerStyle.localCursor(pointerStyle,remoteTextCursor) || (pointerStyle in 0..1 && !pressed)) return
+        val x=video.left+u*video.width;val y=video.top+v*video.height
+        val p=android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        if(pointerStyle in 0..1) {
+            p.color=if(pointerStyle==0) Color.WHITE else Color.argb(110,180,220,255)
+            p.style=if(pointerStyle==0) android.graphics.Paint.Style.STROKE else android.graphics.Paint.Style.FILL;p.strokeWidth=3f
+            canvas.drawCircle(x,y,if(pointerStyle==0) 16f else 20f,p)
+        } else {
+            val path=android.graphics.Path().apply {moveTo(x,y);lineTo(x,y+24);lineTo(x+7,y+17);lineTo(x+17,y+17);close()}
+            p.color=Color.WHITE;canvas.drawPath(path,p);p.style=android.graphics.Paint.Style.STROKE;p.strokeWidth=2f;p.color=Color.BLACK;canvas.drawPath(path,p)
+        }
+    }
     private var downU = 0f
     private var downV = 0f
     private var moved = false
@@ -65,9 +84,11 @@ internal class PicoPanelVideoView(
                 MotionEvent.ACTION_UP -> { pointer(u, v, false); pressed = false; if (!moved) onTap(); video.performClick() }
                 MotionEvent.ACTION_CANCEL -> releasePointer()
             }
+            pointerVisible=true;invalidate()
             true
         }
         video.setOnHoverListener { _, event ->
+            pointerVisible=event.actionMasked!=MotionEvent.ACTION_HOVER_EXIT;invalidate()
             if (event.actionMasked == MotionEvent.ACTION_HOVER_MOVE) {
                 u = PanelViewport.coordinate(event.x, video.width)
                 v = PanelViewport.coordinate(event.y, video.height)
@@ -89,7 +110,7 @@ internal class PicoPanelVideoView(
         if (width <= 0 || height <= 0 || (width == videoWidth && height == videoHeight)) return
         videoWidth = width; videoHeight = height; requestLayout()
     }
-    fun releasePointer() { if (pressed) { if (touchMode) touch(4, emptyList()) else pointer(u, v, false) }; pressed = false }
+    fun releasePointer() { if (pressed) { if (touchMode) touch(4, emptyList()) else pointer(u, v, false) }; pressed = false;invalidate() }
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
         val box = PanelViewport.fit(right - left, bottom - top, videoWidth, videoHeight)
         video.layout(box.left, box.top, box.left + box.width, box.top + box.height)

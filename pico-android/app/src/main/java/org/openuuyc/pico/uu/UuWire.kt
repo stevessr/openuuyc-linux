@@ -46,7 +46,7 @@ internal object UuWire {
         integer(out, 9, 1) // qos_stat
     }
 
-    fun connectOptions(controllerId: String, profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080))): ByteArray {
+    fun connectOptions(controllerId: String, profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080)), terminal: Boolean=false): ByteArray {
         require(controllerId.matches(Regex("[a-z0-9]{16}")))
         val capture = message { out ->
             integer(out, 1, 2) // 60fps tier
@@ -62,7 +62,7 @@ internal object UuWire {
             integer(out, 11, 60)
         }
         return message { out ->
-            integer(out, 1, 1) // viewing
+            integer(out, 1, if(terminal) 8 else 1) // CT_TERMINAL or viewing
             integer(out, 2, -1) // auto screen
             bytes(out, 3, capture)
             profiles.forEach { profile -> bytes(out, 4, message { decoder ->
@@ -81,7 +81,7 @@ internal object UuWire {
     }
 
     fun controlEvent(controllerId: String, appControlId: String = UUID.randomUUID().toString(),
-                     profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080))):
+                     profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080)),terminal: Boolean=false):
         Pair<String, ByteArray> {
         val capability = JSONObject()
             .put("ice_id", "")
@@ -104,7 +104,7 @@ internal object UuWire {
             .put("app_control_id", appControlId)
             .put("app_data", JSONObject().put("_placeholder", true).put("num", 0))
             .put("streamer_data", streamer.toString())
-        return "451-2" + JSONArray().put("control").put(payload).toString() to connectOptions(controllerId, profiles)
+        return "451-2" + JSONArray().put("control").put(payload).toString() to connectOptions(controllerId, profiles,terminal)
     }
 
     /** Socket.IO binary attachment MUST start with an Engine.IO message byte. */

@@ -192,7 +192,7 @@ impl Frame {
     }
 
     /// Builds a frame the controller will accept.
-    fn encode(kind: FrameType, session: u32, payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn encode(kind: FrameType, session: u32, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER + payload.len());
         out.extend_from_slice(MAGIC);
         out.push(VERSION);
@@ -1385,6 +1385,19 @@ pub(crate) fn bind(
     channel: &Arc<RTCDataChannel>,
     screens: Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
     cancel: CancellationToken,
+) { bind_impl(channel,screens,cancel,true); }
+
+/// A refused/revoked optional terminal must never tear down desktop streaming.
+pub(crate) fn bind_extension(
+    channel: &Arc<RTCDataChannel>,
+    screens: Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
+    cancel: CancellationToken,
+) { bind_impl(channel,screens,cancel.child_token(),false); }
+fn bind_impl(
+    channel: &Arc<RTCDataChannel>,
+    screens: Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
+    cancel: CancellationToken,
+    dedicated: bool,
 ) {
     let connection = next_connection();
     let stop = cancel.child_token();
@@ -1414,6 +1427,7 @@ pub(crate) fn bind(
                 handle_frame(&channel, &screens, &data, connection, &stop).await;
                 return;
             }
+            if !dedicated {return;}
             let responses = {
                 let mut state = screens.lock().await;
                 crate::features::stream_control::publisher::receive_session(
@@ -1456,6 +1470,7 @@ pub(crate) fn bind(
         // The session list this controller saw last; the first tick only
         // records it, so connecting does not itself send a notification.
         let mut listed: Option<u64> = None;
+        let mut had_grant=false;
         loop {
             ticker.tick().await;
             let Some(channel) = pump_channel.upgrade().filter(|_| !pump_stop.is_cancelled()) else {
@@ -1470,12 +1485,14 @@ pub(crate) fn bind(
             // for the reattach.
             let lease = pump_screens.lock().await.authorization();
             if !lease.terminal_allowed() {
+                if !dedicated && !had_grant {continue;}
                 tracing::info!("host terminal grant ended; closing the terminal connection");
                 pump_stop.cancel();
                 cancel.cancel();
                 let _ = channel.close().await;
                 break;
             }
+            had_grant=true;
             // The same goes for the shells opened on this machine: once the
             // controller may no longer reach them, it lets go of them within
             // a tick, and each is reported as ended to the controller (an

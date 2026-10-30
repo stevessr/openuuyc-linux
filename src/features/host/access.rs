@@ -1308,6 +1308,17 @@ impl Lease {
             state.port_revision,
         )
     }
+    pub(crate) fn app_launch_allowed(&self) -> bool {
+        let state = lock(&self.handle.ownership);
+        self.current(&state) && self.assistance.is_none() && !self.handle.guest
+            && (state.terminal || super::quick_apps::launch_allowed())
+    }
+    /// Read-only installed-app inventory for the currently authorized owner.
+    /// Launching still requires the separate terminal grant.
+    pub(crate) fn app_catalog_allowed(&self) -> bool {
+        let state = lock(&self.handle.ownership);
+        self.current(&state) && self.assistance.is_none() && !self.handle.guest
+    }
     /// Whether this lease may open a shell on the controlled machine.
     ///
     /// A terminal is a shell, so it is refused for guest assistance and for

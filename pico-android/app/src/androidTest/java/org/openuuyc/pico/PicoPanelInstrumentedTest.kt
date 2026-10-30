@@ -120,6 +120,11 @@ class PicoPanelInstrumentation : Instrumentation() {
                 val cancelled=checkNotNull(keyboard.nativeEditor).onCreateInputConnection(android.view.inputmethod.EditorInfo())!!
                 cancelled.setComposingText("未确认",1);keyboard.hide()
                 check(output.size==1) {"Cancelled text must not be sent"}
+                // Opening a voice control does NOT record. Switching back must
+                // replace its non-editor dialog instead of swallowing show().
+                keyboard.showVoiceInput();keyboard.show()
+                checkNotNull(keyboard.nativeEditor) {"Voice dialog swallowed the system keyboard request"}
+                keyboard.hide()
             }
             sendStatus(0,Bundle().apply {putString("stream","Native IME bound; multilingual Unicode/composition/confirm/cancel passed; no audio recording or remote transport used.\n")})
         } finally {runOnMainSync {runCatching {keyboard.hide()};activity.finishAndRemoveTask()}}

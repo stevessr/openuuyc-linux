@@ -56,6 +56,8 @@ internal class UuDirectSession(
     private val onUnexpectedDisconnect: () -> Unit = {}
 ) : AutoCloseable {
     var applicationsOnly=false
+    var terminalOnly=false
+    val terminal=UuTerminal()
     var immersiveRendering=false
     companion object {
         private val appFocused=AtomicBoolean(false)
@@ -257,6 +259,7 @@ internal class UuDirectSession(
     private val appControlId = UUID.randomUUID().toString()
 
     @Synchronized fun start(xrSurface: Surface?) {
+        if(terminalOnly) applicationsOnly=true
         check(!started && !closed.get())
         started = true;live.add(this)
         if(xrSurface!=null) windowSurfaces[0] = xrSurface
@@ -390,7 +393,7 @@ internal class UuDirectSession(
             }
             is UuSocketIoWire.Packet.RoomAck -> {
                 if (!signalGate.roomAcknowledged()) return
-                val (header, bytes) = UuWire.controlEvent(identity.deviceId, appControlId, localProfiles)
+                val (header, bytes) = UuWire.controlEvent(identity.deviceId, appControlId, localProfiles,terminalOnly)
                 socket?.send(header)
                 socket?.send(ByteString.of(*UuWire.attachment(bytes)))
                 emit("UU 房间已登录，发送原生控制握手")
@@ -779,8 +782,8 @@ internal class UuDirectSession(
         }
         for (label in listOf(
             "CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL",
-            "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL", UuQuickApps.CHANNEL, UuPcvrSession.CONTROL, UuPcvrSession.TRACKING, UuStereoFrames.CHANNEL
-        ).filter { !applicationsOnly || it !in setOf("STREAMER_DATA_CHANNEL",UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL) }) {
+            "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL", UuTerminal.CHANNEL, UuQuickApps.CHANNEL, UuPcvrSession.CONTROL, UuPcvrSession.TRACKING, UuStereoFrames.CHANNEL
+        ).filter { (!terminalOnly || it!=UuTerminal.CHANNEL) && (!applicationsOnly || it !in setOf("STREAMER_DATA_CHANNEL",UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL)) }) {
             val channel = connection.createDataChannel(label, DataChannel.Init().apply { ordered = label !in setOf(UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL); if(!ordered) maxRetransmits=0 })
             if (channel != null) {
                 channels.add(channel)
@@ -859,6 +862,8 @@ internal class UuDirectSession(
                     emit("数据通道 $label：${channel.state()}")
                     if (channel.state() == DataChannel.State.OPEN) {
                         when (channel.label()) {
+                            UuTerminal.CHANNEL -> if(!terminalOnly) terminal.bind(channel)
+                            "BINARY_DATA_CHANNEL" -> if(terminalOnly) terminal.bind(channel)
                             UuQuickApps.CHANNEL -> quickApps.bind(channel)
                             UuPcvrSession.CONTROL,UuPcvrSession.TRACKING -> vr.bind(channel)
                             "CONTROL_DATA_CHANNEL" -> {
@@ -872,6 +877,7 @@ internal class UuDirectSession(
                         }
                     } else if (channel.state() == DataChannel.State.CLOSED ||
                                channel.state() == DataChannel.State.CLOSING) {
+                        if(channel.label()==UuTerminal.CHANNEL || (channel.label()=="BINARY_DATA_CHANNEL" && terminalOnly)) terminal.close()
                         if(channel.label()==UuQuickApps.CHANNEL) quickApps.close()
                         if(channel.label() in setOf(UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL)) vr.close()
                         val critical = channel === controlChannel || channel === textChannel
@@ -894,12 +900,13 @@ internal class UuDirectSession(
                 }
             } }
             override fun onMessage(buffer: DataChannel.Buffer) {
-                if(closed.get() || buffer.data.remaining()>65536) return
+                if(closed.get() || buffer.data.remaining()>(if(channel.label()==UuQuickApps.CHANNEL) 4*1024*1024 else 65536)) return
                 val data=buffer.data.slice()
                 val bytes=ByteArray(data.remaining());data.get(bytes)
                 postRtc {
                 synchronized(this@UuDirectSession) {
                     if (closed.get()) return@postRtc
+                    if(channel.label()==UuTerminal.CHANNEL || (terminalOnly && channel.label()=="BINARY_DATA_CHANNEL")) {terminal.receive(bytes);return@postRtc}
                     if(channel.label()==UuStereoFrames.CHANNEL) {vr.video(bytes);return@postRtc}
                     if(channel.label()==UuPcvrSession.CONTROL) {
                         vr.receive(bytes)
@@ -1226,6 +1233,13 @@ internal class UuDirectSession(
         return true
     }
 
+    @Synchronized fun setRemoteCursorVisible(visible: Boolean): Boolean {
+        if(!inputReady()) return false
+        remoteSettings.pending?.let {return it.second.cursor==visible}
+        if(remoteSettings.current.cursor==visible) return true
+        return runCatching {applySettings(remoteSettings.current.copy(cursor=visible),automatic=true)}.getOrDefault(false)
+    }
+
     @Synchronized fun scroll(delta: Int) {
         if (closed.get() || !captureGate.inputReady(
             controlChannel?.state() == DataChannel.State.OPEN,
@@ -1239,7 +1253,7 @@ internal class UuDirectSession(
         // PeerConnection.dispose must not run on Observer/DataChannel callbacks.
         // Mark closed synchronously, then release on the Android main queue.
         audioModule?.setMicrophoneMute(true);micState.stop()
-        clipboardBinding.enable(false);transfers.close();files.close();quickApps.close();vr.close();live.remove(this)
+        clipboardBinding.enable(false);transfers.close();files.close();terminal.close();quickApps.close();vr.close();live.remove(this)
         deferredClose.request { rtcCallbacks.close();disposeAfterCallbacks() }
     }
 

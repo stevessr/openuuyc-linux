@@ -286,6 +286,13 @@ impl DeviceCenterApp {
                 };
             }
         }
+        {
+            let mut allowed = crate::features::host::quick_apps::launch_allowed();
+            if ui.checkbox(&mut allowed,"允许应用快捷启动（仅本次运行，不开放远程终端）").changed() {
+                crate::features::host::quick_apps::set_launch_allowed(allowed);
+            }
+            ui.small("仅当前已授权的非访客连接可启动主机列出的应用；关闭后立即撤销。");
+        }
         section(ui, "被控设置");
         let host = self.host.clone();
         let mut allowed = host.as_ref().is_some_and(|h| h.allowed());

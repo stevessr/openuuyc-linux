@@ -101,6 +101,13 @@ internal class PicoXrWindowFrame(private val surface: Surface) {
             // Transparent circular pointer tiles, sampled by native billboard quads.
             p.color=Color.WHITE;c.drawCircle(48f,2416f,12f,p)
             p.color=PicoTheme.ACCENT;c.drawCircle(80f,2416f,12f,p)
+            // Win7 outline ring, Win11 translucent touch target, local arrow.
+            p.style=Paint.Style.STROKE;p.strokeWidth=2.5f;p.color=Color.WHITE;c.drawCircle(112f,2416f,11f,p)
+            p.style=Paint.Style.FILL;p.color=Color.argb(100,180,220,255);c.drawCircle(144f,2416f,13f,p)
+            p.style=Paint.Style.STROKE;p.strokeWidth=1.5f;p.color=Color.WHITE;c.drawCircle(144f,2416f,12f,p)
+            val arrow=android.graphics.Path().apply {moveTo(174f,2416f);lineTo(174f,2430f);lineTo(180f,2424f);lineTo(187f,2424f);close()}
+            p.style=Paint.Style.FILL;p.color=Color.WHITE;c.drawPath(arrow,p)
+            p.style=Paint.Style.STROKE;p.strokeWidth=1.5f;p.color=Color.BLACK;c.drawPath(arrow,p);p.style=Paint.Style.FILL
             c.save();c.clipRect(0,2432,1200,3232)
             p.color=background;p.alpha=backgroundAlpha
             p.colorFilter=android.graphics.ColorMatrixColorFilter(floatArrayOf(brightness,0f,0f,0f,0f,0f,brightness,0f,0f,0f,0f,0f,brightness,0f,0f,0f,0f,0f,1f,0f))

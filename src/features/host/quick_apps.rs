@@ -1,6 +1,10 @@
 //! OpenUUYC-only quick launch extension on the authenticated peer, not guessed UU RPCs.
 #[cfg(target_os = "linux")]
 mod desktop;
+#[cfg(target_os = "linux")]
+mod steam;
+#[cfg(target_os = "linux")]
+mod icons;
 
 use super::Lease;
 use anyhow::{Result, ensure};
@@ -18,6 +22,10 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use webrtc::data_channel::RTCDataChannel;
+static LAUNCH_ALLOWED: AtomicBool = AtomicBool::new(false);
+pub(crate) fn launch_allowed() -> bool { LAUNCH_ALLOWED.load(Ordering::Acquire) }
+pub(crate) fn set_launch_allowed(allowed: bool) { LAUNCH_ALLOWED.store(allowed,Ordering::Release); }
+
 pub(crate) const CHANNEL: &str = "OPENUUYC_QUICK_APPS_V1";
 #[derive(Clone, Serialize)]
 struct App {
@@ -25,16 +33,18 @@ struct App {
     name: String,
     vr: bool,
     enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
 }
 #[derive(Clone)]
 enum Target {
     Desktop(PathBuf),
-    Vrchat,
+    Steam(u32),
 }
 impl Target {
     fn ensure_available(&self, explicit_launch_only: bool) -> Result<()> {
         ensure!(
-            explicit_launch_only || !matches!(self, Self::Vrchat),
+            explicit_launch_only || !matches!(self, Self::Steam(438100)),
             "内置 VR 的双眼传输和追踪链路尚未就绪；未启动 VRChat，不会调用外部串流程序"
         );
         Ok(())
@@ -150,29 +160,20 @@ fn catalog() -> BTreeMap<String, (App, Target)> {
                             vr: desktop_vr(&text) || name.to_ascii_lowercase().contains("vrchat"),
                             name,
                             enabled: true,
+                            icon: icons::key(&text).and_then(icons::png),
                         },
                         Target::Desktop(path),
                     ),
                 );
             }
         }
-        if home.is_some_and(|h| {
-            [h.join(".local/share/Steam"), h.join(".steam/steam")]
-                .iter()
-                .any(|p| p.join("steamapps/appmanifest_438100.acf").is_file())
-        }) {
-            out.insert(
-                "vrchat-vr".into(),
-                (
-                    App {
-                        id: "vrchat-vr".into(),
-                        name: "VRChat · 仅启动（无内置 VR 画面）".into(),
-                        vr: true,
-                        enabled: true,
-                    },
-                    Target::Vrchat,
-                ),
-            );
+        if let Some(home) = home.as_deref() {
+            for (appid,name) in steam::installed(home) {
+                let id = if appid == 438100 { "vrchat-vr".to_owned() } else { format!("steam-{appid}") };
+                let lower = name.to_ascii_lowercase();
+                let vr = matches!(appid,438100|250820) || lower.contains("vrchat") || lower.contains("steamvr");
+                out.insert(id.clone(), (App {id,name,vr,enabled:true,icon:icons::png(&format!("steam_icon_{appid}"))},Target::Steam(appid)));
+            }
         }
     }
     out
@@ -215,6 +216,7 @@ pub(crate) fn bind(
     connected: Arc<AtomicBool>,
     stop: CancellationToken,
 ) {
+    tracing::info!("quick-app channel bound");
     let cancel = stop.child_token();
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let invalid = cancel.clone();
@@ -245,18 +247,23 @@ pub(crate) fn bind(
         let mut last_permission = None;
         let mut last_launch = None;
         loop {
-            let allowed = lease.terminal_allowed() && connected.load(Ordering::Acquire);
+            let allowed = lease.app_launch_allowed() && connected.load(Ordering::Acquire);
+            let catalog_allowed = lease.app_catalog_allowed() && connected.load(Ordering::Acquire);
             let Some(ch) = weak.upgrade() else { break };
             let request = tokio::select! {_=cancel.cancelled()=>break,_=tick.tick()=>{
-                if ch.ready_state()==webrtc::data_channel::data_channel_state::RTCDataChannelState::Open && last_permission!=Some(allowed) {
-                    if send(&ch,serde_json::json!({"id":0,"type":"hello","allowed":allowed,"message":"快速启动沿用本机远程终端授权；仅接受已列出的应用 ID"})).await.is_err(){break}
-                    last_permission=Some(allowed);
+                if ch.ready_state()==webrtc::data_channel::data_channel_state::RTCDataChannelState::Open && last_permission!=Some((allowed,catalog_allowed)) {
+                    if send(&ch,serde_json::json!({"id":0,"type":"hello","allowed":allowed,"catalog_allowed":catalog_allowed,"message":"快速启动沿用本机远程终端授权；仅接受已列出的应用 ID"})).await.is_err(){break}
+                    last_permission=Some((allowed,catalog_allowed));
+                    tracing::info!(allowed,catalog_allowed,"quick-app capabilities sent");
                 }
                 continue
             },r=rx.recv()=>match r {Some(r)=>r,None=>break}};
             let id = request.id;
             let result:Result<()>=async {
-                ensure!(lease.terminal_allowed() && connected.load(Ordering::Acquire),"远端未授权快速启动：请在 Linux 被控设置允许远程终端；访客会话不支持");
+                ensure!(lease.app_catalog_allowed() && connected.load(Ordering::Acquire),"应用目录需要当前已授权的非访客设备连接");
+                if !matches!(request.op.as_str(),"list"|"vr-runtime") {
+                    ensure!(lease.app_launch_allowed(),"远端未授权应用启动：请在 Linux 被控设置允许应用快捷启动");
+                }
                 match request.op.as_str() {
                     #[cfg(target_os="linux")]
                     "vr-runtime"=>{
@@ -270,16 +277,17 @@ pub(crate) fn bind(
                     "vr-runtime-set"=>{
                         use crate::pcvr::runtime::{self,Preference};
                         let preference=match request.backend.as_str() {"open_xr_first"=>Preference::OpenXrFirst,"open_xr_only"=>Preference::OpenXrOnly,"steam_vr"=>Preference::SteamVr,_=>anyhow::bail!("不支持的 VR 后端策略")};
-                        ensure!(lease.terminal_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
+                        ensure!(lease.app_launch_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
                         runtime::set_preference(preference)?;
                         send(&ch,serde_json::json!({"id":id,"type":"vr-runtime-set","message":"后端策略已保存，下次 VR 连接生效；不会切换全局运行时"})).await?;
                     },
                     "list"=>{
                         apps=tokio::task::spawn_blocking(catalog).await?;
-                        ensure!(lease.terminal_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
+                        ensure!(lease.app_catalog_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
                         let mut entries:Vec<_>=apps.values().map(|(a,_)|a.clone()).collect();
+                        tracing::info!(count=entries.len(),"quick-app catalog response");
                         entries.sort_by_key(|a|(!a.name.to_ascii_lowercase().starts_with("vrchat"),!a.vr,a.name.to_lowercase()));
-                        send(&ch,serde_json::json!({"id":id,"type":"list","apps":entries})).await?;
+                        send(&ch,serde_json::json!({"id":id,"type":"list","apps":entries,"launch_allowed":lease.app_launch_allowed()})).await?;
                     },
                     "launch"=>{
                         ensure!(last_launch.is_none_or(|t:Instant|t.elapsed()>Duration::from_secs(2)),"启动请求过于频繁");
@@ -289,15 +297,15 @@ pub(crate) fn bind(
                         last_launch=Some(Instant::now());
                         match target {
                             Target::Desktop(path)=>{
-                                ensure!(lease.terminal_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
+                                ensure!(lease.app_launch_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
                                 ensure!(std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= 65536), "应用入口已移除或无效，请刷新列表");
                                 let text = std::fs::read_to_string(&path)?;
                                 ensure!(desktop_name(&text).is_some(), "应用已隐藏或不可用，请刷新列表");
                                 spawn("gio",&[std::ffi::OsStr::new("launch"),path.as_os_str()]).await?;
                             },
-                            Target::Vrchat=>{
-                                ensure!(lease.terminal_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
-                                spawn("steam",&[std::ffi::OsStr::new("-applaunch"),std::ffi::OsStr::new("438100")]).await?;
+                            Target::Steam(appid)=>{
+                                ensure!(lease.app_launch_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
+                                spawn("gio",&[std::ffi::OsStr::new("open"),std::ffi::OsStr::new(&format!("steam://rungameid/{appid}"))]).await?;
                             }
                         }
                         send(&ch,serde_json::json!({"id":id,"type":"started","message":if app.vr {"已请求在远端启动 VR 应用；OpenUUYC 尚无双眼游戏画面，未确认 VR 首帧"} else {"启动请求已交给系统；尚未确认应用窗口"}})).await?;
@@ -395,8 +403,8 @@ mod tests {
 
     #[test]
     fn vr_launch_requires_explicit_launch_only_consent() {
-        assert!(Target::Vrchat.ensure_available(false).is_err());
-        assert!(Target::Vrchat.ensure_available(true).is_ok());
+        assert!(Target::Steam(438100).ensure_available(false).is_err());
+        assert!(Target::Steam(438100).ensure_available(true).is_ok());
         assert!(desktop_vr("[Desktop Entry]\nX-OpenUUYC-VR=true"));
         assert!(!desktop_vr("[Other]\nX-OpenUUYC-VR=true"));
         assert!(

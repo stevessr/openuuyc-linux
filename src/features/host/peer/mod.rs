@@ -729,6 +729,7 @@ impl Peer {
         let channel_annotation = annotation.clone();
         let channel_clipboard = clipboard_receiver.clone();
         let channel_control = control_receiver.clone();
+        let terminal_binding: Arc<Mutex<Option<CancellationToken>>> = Default::default();
         let diagnostics_binding: Arc<Mutex<Option<CancellationToken>>> = Default::default();
         let diagnostics_lease = handle.clone();
         let diagnostics_connected = connected.clone();
@@ -754,6 +755,12 @@ impl Peer {
                 if let Some(previous) = lock(&diagnostics_binding).replace(token) {
                     previous.cancel();
                 }
+                return Box::pin(async {});
+            }
+            if channel.label()==crate::features::remote_terminal::CHANNEL {
+                let token=channel_cancel.child_token();
+                if let Some(previous)=lock(&terminal_binding).replace(token.clone()) {previous.cancel();}
+                crate::features::host::terminal::bind_extension(&channel,channel_screens.clone(),token);
                 return Box::pin(async {});
             }
             // The terminal rides the same low-priority BINARY channel the

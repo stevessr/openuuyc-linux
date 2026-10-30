@@ -1,4 +1,5 @@
 #include "xr_panel_orbit.h"
+#include "xr_pose_math.h"
 #include <cassert>
 #include <initializer_list>
 int main() {
@@ -43,5 +44,20 @@ int main() {
         assert(panel_dot(n,towards)/std::sqrt(panel_dot(towards,towards))>.999f);
         assert(orbit_drag(p,{1,.8f,.6f},{0,0,-1},viewer,.45f,.98f,.98f,p.aspect));
         assert(std::isfinite(p.yaw) && std::isfinite(p.pitch));
+    }
+    // Dragged panels stay parallel to the current VIEW, including head roll,
+    // while keeping an off-centre grab point exactly on the pointer sphere.
+    for(float yaw:{-.8f,.7f}) for(float pitch:{-.6f,.5f}) for(float roll:{-.4f,.3f}) {
+        const auto q=pose_product(pose_product({0,std::sin(yaw/2),0,std::cos(yaw/2)},
+            {std::sin(pitch/2),0,0,std::cos(pitch/2)}),{0,0,std::sin(roll/2),std::cos(roll/2)});
+        PanelGeometry p{0,0,1.5f};panel_face_view(p,q.x,q.y,q.z,q.w);
+        const auto normal=pose_rotate(q,{0,0,1}),right=pose_rotate(q,{1,0,0}),up=pose_rotate(q,{0,1,0});
+        assert(panel_dot(panel_normal(p),{normal.x,normal.y,normal.z})>.9999f);
+        assert(panel_dot(panel_right(p),{right.x,right.y,right.z})>.9999f);
+        assert(panel_dot(panel_up(p),{up.x,up.y,up.z})>.9999f);
+        assert(orbit_drag(p,{0,0,0},{0,0,-1},{0,0,0},2,.85f,.1f,p.aspect,true));
+        assert(panel_dot(panel_up(p),{up.x,up.y,up.z})>.9999f);
+        const auto anchor=panel_point(p,.35f*p.width,.4f*p.width*p.aspect);
+        assert(std::fabs(anchor.x)<.0001f && std::fabs(anchor.y)<.0001f && std::fabs(anchor.z+2)<.0001f);
     }
 }

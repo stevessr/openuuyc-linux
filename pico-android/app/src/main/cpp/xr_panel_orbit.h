@@ -7,7 +7,7 @@ inline float orbit_radius(const PanelGeometry &p,OrbitVector head,float u,float 
     const float x=anchor.x-head.x,y=anchor.y-head.y,z=anchor.z-head.z;
     return std::sqrt(x*x+y*y+z*z);
 }
-inline bool orbit_drag(PanelGeometry &p,OrbitVector ray,OrbitVector dir,OrbitVector head,float radius,float u,float v,float aspect) {
+inline bool orbit_drag(PanelGeometry &p,OrbitVector ray,OrbitVector dir,OrbitVector head,float radius,float u,float v,float aspect,bool view_parallel=false) {
     const float anchor_x=(u-.5f)*p.width,anchor_y=(.5f-v)*p.width*aspect;
     radius=std::max(radius,std::sqrt(anchor_x*anchor_x+anchor_y*anchor_y)+.25f);
     const float ox=ray.x-head.x,oy=ray.y-head.y,oz=ray.z-head.z;
@@ -24,10 +24,10 @@ inline bool orbit_drag(PanelGeometry &p,OrbitVector ray,OrbitVector dir,OrbitVec
     const float dx=(u-.5f)*p.width,dy=(.5f-v)*p.width*aspect;
     // Full spherical facing, with exact local grab anchor (yaw AND pitch).
     // Iterate the center because the grabbed point may be near a corner.
-    for(int i=0;i<24;++i) {
+    for(int i=0;i<(view_parallel?1:24);++i) {
         const float hx=head.x-p.x,hy=head.y-p.y,hz=head.z-p.z;
-        p.yaw=std::atan2(hx,hz);
-        p.pitch=-std::atan2(hy,std::sqrt(hx*hx+hz*hz));
+        if(!view_parallel) {p.yaw=std::atan2(hx,hz);
+        p.pitch=-std::atan2(hy,std::sqrt(hx*hx+hz*hz));p.roll=0;}
         const auto r=panel_right(p),up=panel_up(p);
         p.x=x-r.x*dx-up.x*dy;
         p.y=y-r.y*dx-up.y*dy;

@@ -6,33 +6,53 @@ import android.graphics.RectF
 
 /** MR controller dashboard: one radial hub, no independent floating tool cards. */
 internal object PicoXrControllerCanvas {
-    fun draw(c: Canvas,labels: List<String>,following: Boolean,pending: Boolean,hand: Int,u: Float,v: Float,notice: String) {
-        PicoXrMaterial.panel(c,1200f,800f)
-        PicoXrMaterial.label(c,"OpenUUYC · 快速控制",32f,58f,1000f,30f,medium=true)
-        PicoXrMaterial.label(c,notice,32f,96f,1100f,20f,muted=true)
+    fun draw(c: Canvas,labels: List<String>,following: Boolean,pending: Boolean,hand: Int,u: Float,v: Float,notice: String,icons: Boolean=true,title: String="快速控制",previous: Boolean=false,next: Boolean=false,appIcons: List<android.graphics.Bitmap?> = emptyList()) {
+        c.drawColor(Color.TRANSPARENT,android.graphics.PorterDuff.Mode.CLEAR)
         val p=Paint(Paint.ANTI_ALIAS_FLAG)
-        p.style=Paint.Style.STROKE;p.strokeWidth=2f;p.color=Color.argb(75,105,170,220)
-        c.drawOval(RectF(196f,170f,1004f,658f),p)
-        c.drawCircle(600f,420f,122f,p)
-        for(i in 0..10) {
-            val r=PicoXrMenuHit.toolbarRect(i)
-            val hovered=u*1200 in r[0]..r[2] && v*800 in r[1]..r[3]
-            val selected=i==8 && following || i==9 && !following
-            PicoXrMaterial.control(c,RectF(r[0],r[1],r[2],r[3]),selected,hovered,enabled=!(pending && i in 8..9))
-            p.style=Paint.Style.FILL;p.textAlign=Paint.Align.CENTER
-            p.color=if(i==7) PicoTheme.RED else if(hovered || selected) Color.rgb(161,221,255) else PicoTheme.TEXT
-            if(i<8) {
-                PicoXrMaterial.rootIcon(c,i,(r[0]+r[2])/2-18,r[1]+18,p.color)
-                p.textSize=29f;c.drawText(labels[i],(r[0]+r[2])/2,r[3]-18,p)
-            } else {
-                p.textSize=if(i==10) 25f else 28f
-                c.drawText(when(i) {8->if(pending) "切换中…" else "跟随视角";9->"固定窗口";else->"收起"},(r[0]+r[2])/2,(r[1]+r[3])/2+10,p)
+        val hovered=PicoXrMenuHit.toolbar(u,v)
+        val outer=RectF(295f,105f,905f,715f)
+        val inner=RectF(458f,268f,742f,552f)
+        for(i in labels.indices.take(8)) {
+            if(labels[i].isBlank()) continue
+            val start=-110.5f+i*45
+            val end=start+41
+            val a=Math.toRadians(end.toDouble())
+            val wedge=android.graphics.Path().apply {
+                arcTo(outer,start,41f)
+                lineTo(600f+142f*kotlin.math.cos(a).toFloat(),410f+142f*kotlin.math.sin(a).toFloat())
+                arcTo(inner,end,-41f);close()
             }
+            p.style=Paint.Style.FILL
+            p.color=if(hovered==i) Color.argb(245,46,139,192) else Color.argb(235,24,35,48)
+            c.drawPath(wedge,p)
+            p.style=Paint.Style.STROKE;p.strokeWidth=if(hovered==i) 3f else 1.5f
+            p.color=if(hovered==i) Color.rgb(135,229,255) else Color.argb(120,88,129,155)
+            c.drawPath(wedge,p)
+            val r=PicoXrMenuHit.toolbarRect(i)
+            val x=(r[0]+r[2])/2;val y=(r[1]+r[3])/2
+            val color=if(i==7) PicoTheme.RED else if(hovered==i) Color.WHITE else PicoTheme.TEXT
+            val appIcon=appIcons.getOrNull(i)
+            if(appIcon!=null) c.drawBitmap(appIcon,null,RectF(x-28,y-48,x+28,y+8),p)
+            if(icons) PicoXrMaterial.rootIcon(c,i,x-18,y-29,color)
+            p.style=Paint.Style.FILL;p.color=color;p.textSize=25f;p.textAlign=Paint.Align.CENTER
+            PicoXrMaterial.label(c,labels[i],x-84,y+if(icons || appIcon!=null) 38 else 8,168f,if(icons) 25f else 22f)
         }
-        p.textSize=22f;p.color=PicoTheme.MUTED
-        c.drawText("画面位置",600f,307f,p)
-        c.drawText(when(hand) {0->"左手柄固定 · 右手射线";1->"右手柄固定 · 左手射线";else->"X / A 唤起 · 摇杆选择 · 松开执行"},600f,770f,p)
+        p.style=Paint.Style.FILL;p.color=Color.argb(235,16,26,37);c.drawCircle(600f,410f,132f,p)
+        p.textAlign=Paint.Align.CENTER;p.textSize=21f;p.color=PicoTheme.MUTED
+        PicoXrMaterial.label(c,title,490f,322f,220f,20f)
+        for(i in if(icons) 8..10 else 10..10) {
+            val r=PicoXrMenuHit.toolbarRect(i)
+            val selected=i==8 && following || i==9 && !following
+            PicoXrMaterial.control(c,RectF(r[0],r[1],r[2],r[3]),selected,hovered==i,enabled=if(icons) !(pending && i in 8..9) else i==10 || (i==8 && previous) || (i==9 && next))
+            p.style=Paint.Style.FILL;p.textSize=24f;p.color=PicoTheme.TEXT;p.textAlign=Paint.Align.CENTER
+            c.drawText(when { !icons->when(i) {8->if(previous) "‹ 上一页" else "首页";9->if(next) "下一页 ›" else "末页";else->"返回"};else->when(i) {8->if(pending) "切换中…" else "跟随视角";9->"固定窗口";else->"收起"}},(r[0]+r[2])/2,(r[1]+r[3])/2+8,p)
+        }
+        p.textSize=20f;p.color=PicoTheme.MUTED;p.textAlign=Paint.Align.CENTER
+        c.drawText("X / A 唤起 · 摇杆选择 · 快速松开执行",600f,752f,p)
+        // Keep contextual status outside the ring rather than covering wedges.
+        PicoXrMaterial.label(c,notice,200f,790f,800f,17f,muted=true)
     }
+
     fun collapsed(c: Canvas,hand: Int) {
         c.drawColor(Color.TRANSPARENT,android.graphics.PorterDuff.Mode.CLEAR)
         PicoXrMaterial.sheet(c,RectF(32f,32f,1168f,368f),90f)

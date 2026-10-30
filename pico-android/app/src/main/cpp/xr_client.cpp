@@ -97,6 +97,9 @@ static bool panel_ray(const XrPosef &aim, const PanelGeometry &p, float &x, floa
 
 
 static std::atomic<bool> focus_dots_enabled{false};
+static std::atomic<int> pointer_style{4};
+static std::atomic<bool> pointer_text_caret[6]{};
+static int desktop_pointer_style(int pane) {const int style=pointer_style.load();return style==4?(pointer_text_caret[pane].load()?2:3):style;}
 static int controller_debug_mask=0;
 static int diagnostic_selected=-1,diagnostic_target[2]{-1,-1};
 static uint64_t diagnostic_menu_clicks=0;
@@ -134,8 +137,9 @@ static XrPosef identity_pose(float z = 0.f) {
 }
 
 static XrQuaternionf panel_orientation(const PanelGeometry &p) {
-    const float sy=std::sin(p.yaw/2),cy=std::cos(p.yaw/2),sx=std::sin(p.pitch/2),cx=std::cos(p.pitch/2);
-    return {cy*sx,sy*cx,-sy*sx,cy*cx};
+    const auto q=pose_product(pose_product({0,std::sin(p.yaw/2),0,std::cos(p.yaw/2)},
+        {std::sin(p.pitch/2),0,0,std::cos(p.pitch/2)}),{0,0,std::sin(p.roll/2),std::cos(p.roll/2)});
+    return {q.x,q.y,q.z,q.w};
 }
 
 static XrPosef compose_xr_pose(const XrPosef &a,const XrPosef &b) {
@@ -431,8 +435,9 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
         if(hand==quick_navigation_hand && menu_host.load()<0 && controller_menu_layout.load()!=4 && !menu_grab && grabbed_pane<0 && navigation_method) {
             query.action=actions.scroll;XrActionStateFloat y{XR_TYPE_ACTION_STATE_FLOAT};xrGetActionStateFloat(session,&query,&y);
             query.action=actions.nav_x;XrActionStateFloat x{XR_TYPE_ACTION_STATE_FLOAT};xrGetActionStateFloat(session,&query,&x);
-            const bool released=menu_stick[hand].update(x.currentState,y.currentState,x.isActive && y.isActive);
+            const bool released=menu_stick[hand].update(x.currentState,y.currentState,x.isActive && y.isActive,timestamp);
             if(released) {
+                last_menu_nav=0;
                 menu_nav_hand=hand;menu_nav_until=timestamp+5000000000LL;
                 env->CallVoidMethod(activity,navigation_method,jint(0),JNI_TRUE);
             }
@@ -607,9 +612,15 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
                     last_scroll_time=timestamp;
                 }
                 const auto d=rotate_vector(menu_location.pose.orientation,{0,0,-1});
-                if(eye_valid) menu_grab_origin={eye.pose.position.x,eye.pose.position.y,eye.pose.position.z};
+                XrSpaceLocation menu_eye=eye;
+                const bool menu_eye_valid=menu_space==world?eye_valid:
+                    (XR_SUCCEEDED(xrLocateSpace(view_space,menu_space,timestamp,&menu_eye)) && (menu_eye.locationFlags&eye_flags)==eye_flags);
+                if(menu_eye_valid) {
+                    menu_grab_origin={menu_eye.pose.position.x,menu_eye.pose.position.y,menu_eye.pose.position.z};
+                    const auto q=menu_eye.pose.orientation;panel_face_view(menu_panel,q.x,q.y,q.z,q.w);
+                }
                 orbit_drag(menu_panel,{menu_location.pose.position.x,menu_location.pose.position.y,menu_location.pose.position.z},
-                    {d.x,d.y,d.z},menu_grab_origin,menu_grab_radius,grab_u,grab_v,menu_panel.aspect);
+                    {d.x,d.y,d.z},menu_grab_origin,menu_grab_radius,grab_u,grab_v,menu_panel.aspect,menu_eye_valid);
             }
             if(!down) {menu_grab=false;menu_grip=false;interaction_hand=-1;}
             last_down=down;last_pane=6;return;
@@ -702,8 +713,9 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
                     else {
                         const auto d=rotate_vector(location.pose.orientation,{0,0,-1});
                         if(eye_valid) grab_depth_origin=eye.pose.position;
+                        if(eye_valid) panel_face_user(p,{eye.pose.position.x,eye.pose.position.y,eye.pose.position.z});
                         orbit_drag(p,{location.pose.position.x,location.pose.position.y,location.pose.position.z},
-                            {d.x,d.y,d.z},{grab_depth_origin.x,grab_depth_origin.y,grab_depth_origin.z},window_grab_radius,grab_u,grab_v,p.aspect);
+                            {d.x,d.y,d.z},{grab_depth_origin.x,grab_depth_origin.y,grab_depth_origin.z},window_grab_radius,grab_u,grab_v,p.aspect,false);
                     }
                 }
             }
@@ -791,6 +803,11 @@ Java_org_openuuyc_pico_PicoActivity_nativeSetEnvironmentImage(JNIEnv* env,jobjec
     }
     std::lock_guard<std::mutex> lock(environment_mutex);environment_settings.image=image;
 }
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetPointerStyle(JNIEnv*,jobject,jint style) {pointer_style.store(std::clamp(int(style),0,4));}
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetPointerTextCaret(JNIEnv*,jobject,jint pane,jboolean visible) {if(pane>=0 && pane<6) pointer_text_caret[pane].store(visible==JNI_TRUE);}
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeSetFocusDots(JNIEnv*,jobject,jboolean enabled) {focus_dots_enabled.store(enabled==JNI_TRUE);}
@@ -1122,7 +1139,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 menu_panel.aspect=menu_layout==0?2.f/3.f:menu_layout==2?1000.f/600.f:1.f/3.f;
             } else {
                 menu_panel.width=menu_portrait.load()?.48f:.80f;
-                menu_panel.aspect=menu_portrait.load()?1000.f/600.f:1.f/3.f;
+                menu_panel.aspect=menu_layout==0?2.f/3.f:menu_portrait.load()?1000.f/600.f:1.f/3.f;
             }
             for(int i=0;i<6;++i) {panels[i].aspect=panel_aspects[i].load();panels[i].width=std::min(panels[i].width,panel_max_width(panels[i].aspect));}
             const int host=menu_host.load();
@@ -1196,6 +1213,13 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                     const float dx=head.pose.position.x-menu_panel.x,dy=head.pose.position.y-menu_panel.y,dz=head.pose.position.z-menu_panel.z;
                     menu_panel.yaw=std::atan2(dx,dz);menu_panel.pitch=-std::atan2(dy,std::sqrt(dx*dx+dz*dz));
                 }
+            }
+            // Locate the eye in the exact space used by both input and layers.
+            // Update before ray intersections, including stationary windows.
+            XrSpaceLocation facing_eye{XR_TYPE_SPACE_LOCATION};
+            if(XR_SUCCEEDED(xrLocateSpace(view,active_space,state.predictedDisplayTime,&facing_eye)) &&
+               (facing_eye.locationFlags&XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+                for(auto &panel:panels) panel_face_user(panel,{facing_eye.pose.position.x,facing_eye.pose.position.y,facing_eye.pose.position.z});
             }
             if (action_ready && input_focused && state.shouldRender) {
                 process_input(env, activity, pointer, scroll_method, hover_method, menu_method, window_close, window_menu, quick_method,navigation_method, session, active_space, active_space, view, actions,
@@ -1294,12 +1318,16 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 // Dots take priority over rays under the runtime's layer budget.
                 // BOTH hand dots update independently even when only one hand
                 // owns the remote click/drag. No Canvas cursor is involved.
-                for(int hand:{preferred_hand,1-preferred_hand}) if(focus_dots_enabled.load() && ray_visible[hand] && layer_count<max_layers) {
+                for(int hand:{preferred_hand,1-preferred_hand}) if(ray_visible[hand] && layer_count<max_layers &&
+                    ((diagnostic_target[hand]>=0 && diagnostic_target[hand]<6)?desktop_pointer_style(diagnostic_target[hand])!=2:focus_dots_enabled.load())) {
                     auto &cursor=quads[layer_count];cursor.type=XR_TYPE_COMPOSITION_LAYER_QUAD;
                     cursor.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                     cursor.space=active_space;cursor.eyeVisibility=XR_EYE_VISIBILITY_BOTH;cursor.pose=focus_poses[hand];
                     const float size=std::clamp(ray_lengths[hand]*.012f,.008f,.06f);cursor.size={size,size};
-                    cursor.subImage.swapchain=swapchains[7];cursor.subImage.imageRect={{focus_pressed[hand]?64:32,2400},{32,32}};
+                    const bool desktop=diagnostic_target[hand]>=0 && diagnostic_target[hand]<6;
+                    const int style=desktop?desktop_pointer_style(diagnostic_target[hand]):0;
+                    const int tile=desktop?(style==0?96:style==1?128:160):(focus_pressed[hand]?64:32);
+                    cursor.subImage.swapchain=swapchains[7];cursor.subImage.imageRect={{tile,2400},{32,32}};
                     layers[layer_count++]=reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cursor);
                 }
                 for(int hand:{preferred_hand,1-preferred_hand}) if(ray_visible[hand] && ray_line_visible[hand] && layer_count<max_layers) {

@@ -100,7 +100,20 @@ open class PicoActivity : Activity() {
     }
 
     private var xrFollowing = false
+    private var terminalKeyboard: PicoRemoteKeyboard?=null
     private var xrTouchMode=false
+    private var xrPointerStyle=4
+    private external fun nativeSetPointerStyle(style: Int)
+    private external fun nativeSetPointerTextCaret(pane: Int,visible: Boolean)
+    private fun applyPointerStyle(style: Int) {
+        xrPointerStyle=style.coerceIn(0,4)
+        getSharedPreferences("xr_appearance",MODE_PRIVATE).edit().putInt("pointer_style",xrPointerStyle).apply()
+        nativeSetPointerStyle(xrPointerStyle)
+        (listOfNotNull(session)+xrExtraSessions.values).distinct().forEach {direct->
+            val desired=PicoPointerStyle.remoteCursor(xrPointerStyle,direct.textCursorVisible)
+            runCatching {val current=direct.settingsSnapshot().current;if(current.cursor!=desired) direct.applySettings(current.copy(cursor=desired))}
+        }
+    }
     private external fun nativeSetPcvrProbe(enabled: Boolean)
     private var pcvrProbe=false
     private var pcvrPointerProbe=false
@@ -148,6 +161,7 @@ open class PicoActivity : Activity() {
         passthroughEnabled=xrAppearance.mr
         System.loadLibrary("openuuyc_pico")
         nativeSetFocusDots(xrAppearance.focusDots)
+        xrPointerStyle=getSharedPreferences("xr_appearance",MODE_PRIVATE).getInt("pointer_style",4).coerceIn(0,4);nativeSetPointerStyle(xrPointerStyle)
         nativeSetControllerMenu(0,xrAppearance.menuHand)
         worker.execute {xrAppearance.prepareBackground();ui.post {if(!isDestroyed && running.get()) applyXrAppearance()}}
         status = TextView(this)
@@ -183,7 +197,7 @@ open class PicoActivity : Activity() {
     private fun deviceAppSession(device: UuDevice): UuDirectSession? =
         (if(device.id==xrDeviceId) session else xrExtraDeviceIds.entries.firstOrNull {it.value==device.id}?.key?.let {xrExtraSessions[it]}) ?: appDirectorySessions[device.id]
 
-    private fun loadDeviceQuickApps(device: UuDevice,connect: Boolean,callback: (List<org.openuuyc.pico.uu.UuQuickApps.App>?,String?)->Unit,forFiles: Boolean=false) {
+    private fun loadDeviceQuickApps(device: UuDevice,connect: Boolean,callback: (List<org.openuuyc.pico.uu.UuQuickApps.App>?,String?)->Unit,forFiles: Boolean=false,forTerminal: Boolean=false) {
         val direct=deviceAppSession(device)
         if(direct!=null) {
             val epoch=appDirectoryEpoch
@@ -192,8 +206,9 @@ open class PicoActivity : Activity() {
                 if(isDestroyed || epoch!=appDirectoryEpoch || deviceAppSession(device)!==direct) {
                     callback(null,"设备连接已结束，请重新连接应用目录");return
                 }
+                if(forTerminal && direct.terminal.ready) {callback(emptyList(),null);return}
                 if(forFiles && direct.filesReady) {callback(emptyList(),null);return}
-                if(!forFiles && direct.quickApps.initialized) {direct.quickApps.list(callback);return}
+                if(!forFiles && !forTerminal && direct.quickApps.initialized) {direct.quickApps.list(callback);return}
                 if(android.os.SystemClock.elapsedRealtime()>=deadline) {
                     callback(null,if(forFiles) "文件管理通道未就绪，请确认远端支持 UU 文件管理" else "该设备未完成快速应用能力握手；需要支持此扩展的 OpenUUYC 被控端，官方 UU 暂不支持此应用目录");return
                 }
@@ -204,7 +219,7 @@ open class PicoActivity : Activity() {
         if(!connect) {callback(null,"点击添加应用或连接应用目录，无需打开桌面串流");return}
         if(!device.online || !device.controllable) {callback(null,"该设备离线或未允许控制");return}
         if(device.occupants>0) {callback(null,"该设备已被占用；请先使用连接设备并明确确认抢占");return}
-        android.app.AlertDialog.Builder(this).setTitle("连接 ${device.alias} 的${if(forFiles) "文件管理" else "应用目录"}？")
+        android.app.AlertDialog.Builder(this).setTitle("连接 ${device.alias} 的${if(forTerminal) "终端" else if(forFiles) "文件管理" else "应用目录"}？")
             .setMessage("将建立该设备的纯数据控制连接，不协商音视频轨道、不打开桌面画面。文件管理遵循远端文件权限，应用启动另需 Linux OpenUUYC 的远程终端授权；离开页面或打开串流后释放连接。")
             .setNegativeButton("取消") {_,_->callback(null,"已取消应用连接")}
             .setOnCancelListener {callback(null,"已取消应用连接")}
@@ -218,15 +233,16 @@ open class PicoActivity : Activity() {
                             if(isDestroyed || epoch!=appDirectoryEpoch) {org.openuuyc.pico.uu.UuRoomRelease.cancel(room);return@post}
                             try {
                                 val connection=UuDirectSession(applicationContext,room,api.identity.copy(),::message)
-                                connection.applicationsOnly=true
+                                connection.applicationsOnly=true;connection.terminalOnly=forTerminal
                                 appDirectorySessions[device.id]=connection
                                 connection.onDisposed={ui.post {if(appDirectorySessions[device.id]===connection) appDirectorySessions.remove(device.id)}}
                                 connection.start(null)
                                 val deadline=android.os.SystemClock.elapsedRealtime()+30000
                                 fun poll() {
                                     if(isDestroyed || epoch!=appDirectoryEpoch || appDirectorySessions[device.id]!==connection) {appDirectoryLoading.remove(device.id);callback(null,"应用连接已关闭");return}
+                                    if(forTerminal && connection.terminal.ready) {appDirectoryLoading.remove(device.id);callback(emptyList(),null);return}
                                     if(forFiles && connection.filesReady) {appDirectoryLoading.remove(device.id);callback(emptyList(),null);return}
-                                    if(!forFiles && connection.quickApps.initialized) {appDirectoryLoading.remove(device.id);connection.quickApps.list(callback);return}
+                                    if(!forFiles && !forTerminal && connection.quickApps.initialized) {appDirectoryLoading.remove(device.id);connection.quickApps.list(callback);return}
                                     if(android.os.SystemClock.elapsedRealtime()>=deadline) {
                                         appDirectoryLoading.remove(device.id);appDirectorySessions.remove(device.id);connection.close()
                                         callback(null,"应用连接超时：远端可能不支持快速启动扩展或尚未授权");return
@@ -255,6 +271,12 @@ open class PicoActivity : Activity() {
         try {startActivityForResult(intent,8345)} catch(error: Exception) {pendingTransferDocument=null;message(error.message ?: "系统文件选择器不可用")}
     }
 
+    private fun showDeviceTerminal(device: UuDevice) {
+        loadDeviceQuickApps(device,true,{_,error->
+            if(error!=null) message(error) else deviceAppSession(device)?.let {PicoTerminalMenu.show(this,it,"${device.alias} · 终端")}
+        },forTerminal=true)
+    }
+
     private fun showDeviceFiles(device: UuDevice) {
         loadDeviceQuickApps(device,true,{_,error->
             val direct=deviceAppSession(device)
@@ -278,7 +300,7 @@ open class PicoActivity : Activity() {
             { enabled -> passthroughEnabled = enabled; nativeSetPassthroughEnabled(enabled) },
             ::toggleCamera, cameraPreview.preview, passthroughEnabled,
             { device -> connect(device) }, ::restoreLogin,
-            { device -> connect(device, PicoViewerMode.IMMERSIVE) }, ::smsLogin, {PicoQuickAppsMenu.showConnections(this,quickAppConnections(),::message)}, {device,connect,callback->loadDeviceQuickApps(device,connect,callback)}, ::launchDeviceQuickApp, ::closeAppDirectories, ::showDeviceFiles)
+            { device -> connect(device, PicoViewerMode.IMMERSIVE) }, ::smsLogin, {PicoQuickAppsMenu.showConnections(this,quickAppConnections(),::message)}, {device,connect,callback->loadDeviceQuickApps(device,connect,callback)}, ::launchDeviceQuickApp, ::closeAppDirectories, ::showDeviceFiles, ::showDeviceTerminal)
         status = loginView!!.status
         qrImage = loginView!!.qrImage
         setContentView(loginView)
@@ -548,9 +570,12 @@ open class PicoActivity : Activity() {
             session = direct
             running.set(true)
             val keyboard = PicoRemoteKeyboard(this, direct::text, direct::key)
+            keyboard.voiceStarting={direct.setMicrophoneEnabled(false);refreshSharingButtons()}
+            keyboard.imeStateChanged={state->message(state)}
             remoteKeyboard = keyboard
             smartIme = getPreferences(MODE_PRIVATE).getBoolean("smart_ime", true)
             direct.textCursorListener = { text -> ui.post {
+                panelVideo?.let {view->view.remoteTextCursor=text;direct.setRemoteCursorVisible(PicoPointerStyle.remoteCursor(view.pointerStyle,text))}
                 if (text && smartIme && android.os.SystemClock.elapsedRealtime() - lastRemoteTap < 1500 && !isDestroyed) keyboard.show()
             } }
             fun action(label: String, run: () -> Unit): Button {
@@ -570,6 +595,7 @@ open class PicoActivity : Activity() {
                 android.app.AlertDialog.Builder(this).setTitle("创建虚拟显示器？").setMessage("将在远端请求创建1920×1080显示器。")
                     .setNegativeButton("取消",null).setPositiveButton("确认") {_,_-> try {check(direct.createVirtualDisplay());message("请求已发送，等待远端屏幕列表")} catch(error: Exception) {message(error.message ?: "虚拟屏未创建")} }.show()
             }
+            action("终端") {PicoTerminalMenu.show(this,direct,"远端终端")}
             action("文件管理") {PicoFilesMenu.show(this,direct,::message,::pickTransferDocument)}
             action("游戏 / 应用") {PicoQuickAppsMenu.showConnections(this,quickAppConnections(),::message)}
             action("设置") { PicoRemoteSettingsDialog.show(this, direct, smartIme, { enabled ->
@@ -579,10 +605,17 @@ open class PicoActivity : Activity() {
             panelMicButton=action("麦克风：关") {toggleMicrophone(direct)}
             panelClipboardButton=action("剪贴板：关") {direct.setClipboardEnabled(!direct.clipboardEnabled)}
             val inputMode = Button(this).apply {
-                text = "鼠标模式"; setTextColor(PicoTheme.TEXT)
+                text = "输入模式 ›"; setTextColor(PicoTheme.TEXT)
                 setOnClickListener {
-                    panelVideo?.releasePointer(); keyboard.releaseKeys(); direct.releaseInputs()
-                    panelVideo?.let { it.touchMode = !it.touchMode; text = if (it.touchMode) "触摸模式" else "鼠标模式" }
+                    android.widget.PopupMenu(this@PicoActivity,this).apply {
+                        menu.addSubMenu("输入类型").apply {listOf("鼠标","触摸").forEachIndexed {i,label->add(label).setOnMenuItemClickListener {
+                            keyboard.releaseKeys();direct.releaseInputs();panelVideo?.touchMode=i==1;true
+                        }}}
+                        menu.addSubMenu("指针与触摸提示").apply {PicoPointerStyle.labels.forEachIndexed {i,label->add(label).setOnMenuItemClickListener {
+                            panelVideo?.pointerStyle=i;direct.setRemoteCursorVisible(PicoPointerStyle.remoteCursor(i,direct.textCursorVisible));true
+                        }}}
+                        show()
+                    }
                 }
             }
             controls.addView(inputMode, LinearLayout.LayoutParams(dp(100), dp(44)))
@@ -590,7 +623,10 @@ open class PicoActivity : Activity() {
             val display = PicoPanelVideoView(this,
                 { surface -> if (running.get()) direct.attachMainSurface(surface) },
                 { direct.detachMainSurface() },
-                { u, v, down -> direct.pointer(0, u, v, down) },
+                { u, v, down ->
+                    direct.setRemoteCursorVisible(PicoPointerStyle.remoteCursor(panelVideo?.pointerStyle ?: 4,direct.textCursorVisible))
+                    direct.pointer(0, u, v, down)
+                },
                 { delta -> direct.scroll(delta) },
                 onTap = {
                     lastRemoteTap = android.os.SystemClock.elapsedRealtime()
@@ -639,6 +675,9 @@ open class PicoActivity : Activity() {
                 if(pane !in xrReservedSlots) {nativeSetWindowAspect(pane,width,height);xrWindowFrame?.title(pane,"$xrDeviceAlias - $name")}
             } }
             remoteKeyboard=PicoRemoteKeyboard(this,{xrKeyboardTarget?.text(it)==true},{code,down->currentXrSession()?.key(code,down)==true})
+            remoteKeyboard?.imeStateChanged={state->xrToolbar?.status(state)}
+            remoteKeyboard?.voiceStarting={currentXrSession()?.setMicrophoneEnabled(false);refreshSharingButtons()}
+            remoteKeyboard?.voiceChanged={active,message->xrToolbar?.voiceState(active,message)}
             setContentView(remoteKeyboard)
             running.set(true)
             xrThread = Thread({
@@ -830,12 +869,12 @@ open class PicoActivity : Activity() {
             }
             if (index == 6 && running.get()) {
                 xrToolbar?.close()
-                xrToolbar = PicoXrToolbar(surface, { currentXrSession() }, ::nativeSetFollowView, { session?.showAllWindows();nativeResetLayout() }, { enabled -> xrTouchMode=enabled }, { mode -> when(mode) {PicoKeyboardMode.SYSTEM->{xrKeyboardTarget=currentXrSession();remoteKeyboard?.show()};PicoKeyboardMode.VOICE->{xrKeyboardTarget=currentXrSession();remoteKeyboard?.showVoiceInput()};else->{xrKeyboardTarget=null;remoteKeyboard?.hide()}} }, { mr,color,opacity -> xrAppearance.update(mr,color,opacity);applyXrAppearance() }, { xrSettingsSession=null;nativeDockMenu(-1) }, ::openXrHome, ::connectXrDevice, ::pickXrBackground, ::setXrCustomBackground, ::changeXrBackground, ::nativeSetMenuPortrait, {xrExtraDeviceIds.values.toSet()+if(xrMainAlive) setOf(xrDeviceId) else emptySet()}) {
+                xrToolbar = PicoXrToolbar(surface, { currentXrSession() }, ::nativeSetFollowView, { session?.showAllWindows();nativeResetLayout() }, { enabled -> xrTouchMode=enabled }, { mode -> when(mode) {PicoKeyboardMode.SYSTEM->{xrKeyboardTarget=currentXrSession();remoteKeyboard?.show()};PicoKeyboardMode.VOICE->{remoteKeyboard?.hide();xrKeyboardTarget=currentXrSession()};else->{xrKeyboardTarget=null;remoteKeyboard?.hide()}} }, { mr,color,opacity -> xrAppearance.update(mr,color,opacity);applyXrAppearance() }, { xrSettingsSession=null;nativeDockMenu(-1) }, ::openXrHome, ::connectXrDevice, ::pickXrBackground, ::setXrCustomBackground, ::changeXrBackground, ::nativeSetMenuPortrait, {xrExtraDeviceIds.values.toSet()+if(xrMainAlive) setOf(xrDeviceId) else emptySet()}) {
                     stopSession(); finishViewer()
                 } .also { it.setLocalVrApps({callback->worker.execute {
                     val apps=runCatching {PicoLocalVrApps.list(this)}.getOrDefault(emptyList())
                     ui.post {if(!isDestroyed) callback(apps)}
-                }},{app->runCatching {PicoLocalVrApps.launch(this,app)}.onFailure {error->message(error.message ?: "VR 应用启动失败")}});it.setQuickAppConnections(::quickAppConnections);it.setControllerMenu(xrAppearance.menuHand) {layout,hand->xrAppearance.setMenuHand(hand);nativeSetControllerMenu(layout,hand)};it.setFocusDots(xrAppearance.focusDots) {enabled->xrAppearance.setFocusDots(enabled);nativeSetFocusDots(enabled)};it.setMr(passthroughEnabled);it.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness,xrAppearance.flow) }
+                }},{app->runCatching {PicoLocalVrApps.launch(this,app)}.onFailure {error->message(error.message ?: "VR 应用启动失败")}});it.setTerminalInput({terminal->terminalKeyboard?.hide();terminalKeyboard=PicoRemoteKeyboard(this,{terminal.input(it+"\r")},{_,_->false}).also {keyboard->keyboard.show()}},{terminalKeyboard?.hide();terminalKeyboard=null});it.setVoiceControl({remoteKeyboard?.startVoice()},{remoteKeyboard?.stopVoice()},{remoteKeyboard?.cancelVoice()});it.setPointerStyle(xrPointerStyle,::applyPointerStyle);it.setQuickAppConnections(::quickAppConnections);it.setControllerMenu(xrAppearance.menuHand) {layout,hand->xrAppearance.setMenuHand(hand);nativeSetControllerMenu(layout,hand)};it.setFocusDots(xrAppearance.focusDots) {enabled->xrAppearance.setFocusDots(enabled);nativeSetFocusDots(enabled)};it.setMr(passthroughEnabled);it.setAppearance(xrAppearance.visibility,xrAppearance.custom,xrAppearance.color,xrAppearance.presetId,xrAppearance.brightness,xrAppearance.flow) }
                 return@post
             }
             if (!running.get() || index !in 0..5) { surface.release(); return@post }
@@ -855,6 +894,8 @@ open class PicoActivity : Activity() {
         if(index in 0..5) {
             xrActivePane=index
             val extra=xrExtraSessions[index];val target=extra ?: session;val local=if(extra!=null) 0 else index
+            target?.setRemoteCursorVisible(PicoPointerStyle.remoteCursor(xrPointerStyle,target.textCursorVisible))
+            nativeSetPointerTextCaret(index,target?.textCursorVisible==true)
             if(xrTouchMode) target?.pointerAsTouch(local,u,v,down) else target?.pointer(local,u,v,down)
         }
     }
@@ -978,7 +1019,7 @@ open class PicoActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (!hasFocus) { panelVideo?.releasePointer(); remoteKeyboard?.releaseKeys(); xrToolbar?.releaseKeyboardKeys(); session?.releaseInputs() }
+        if (!hasFocus) { panelVideo?.releasePointer(); remoteKeyboard?.cancelVoice();remoteKeyboard?.releaseKeys(); xrToolbar?.releaseKeyboardKeys(); session?.releaseInputs() }
     }
 
     override fun onResume() {super.onResume();UuDirectSession.setApplicationFocused(true)}
@@ -986,7 +1027,7 @@ open class PicoActivity : Activity() {
     override fun onPause() {
         if(pendingTransferDocument==null) closeAppDirectories()
         UuDirectSession.setApplicationFocused(false)
-        panelVideo?.releasePointer(); remoteKeyboard?.releaseKeys(); xrToolbar?.releaseKeyboardKeys(); session?.releaseInputs()
+        panelVideo?.releasePointer(); terminalKeyboard?.releaseKeys();remoteKeyboard?.cancelVoice();remoteKeyboard?.releaseKeys(); xrToolbar?.releaseKeyboardKeys(); session?.releaseInputs()
         if (::cameraPreview.isInitialized) cameraPreview.stop()
         super.onPause()
     }

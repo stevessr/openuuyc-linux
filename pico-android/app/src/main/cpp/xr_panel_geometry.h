@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <cmath>
 
-struct PanelGeometry { float x, y, width; float yaw = 0.f; float z = -2.f; float aspect = 9.f/16.f; float pitch = 0.f; };
+struct PanelGeometry { float x, y, width; float yaw = 0.f; float z = -2.f; float aspect = 9.f/16.f; float pitch = 0.f; float roll = 0.f; };
 inline bool panel_uv(const PanelGeometry &panel, float x, float y, float &u, float &v) {
     u=(x-panel.x)/panel.width+.5f;
     v=.5f-(y-panel.y)/(panel.width*panel.aspect);
@@ -26,8 +26,24 @@ inline float panel_anchor_yaw(float forward_x,float forward_z) {
 }
 
 struct PanelVector {float x,y,z;};
-inline PanelVector panel_right(const PanelGeometry &p) {return {std::cos(p.yaw),0,-std::sin(p.yaw)};}
-inline PanelVector panel_up(const PanelGeometry &p) {return {std::sin(p.yaw)*std::sin(p.pitch),std::cos(p.pitch),std::cos(p.yaw)*std::sin(p.pitch)};}
+inline PanelVector panel_right(const PanelGeometry &p) {const float c=std::cos(p.roll),s=std::sin(p.roll);return {std::cos(p.yaw)*c+std::sin(p.yaw)*std::sin(p.pitch)*s,std::cos(p.pitch)*s,-std::sin(p.yaw)*c+std::cos(p.yaw)*std::sin(p.pitch)*s};}
+inline PanelVector panel_up(const PanelGeometry &p) {const float c=std::cos(p.roll),s=std::sin(p.roll);return {-std::cos(p.yaw)*s+std::sin(p.yaw)*std::sin(p.pitch)*c,std::cos(p.pitch)*c,std::sin(p.yaw)*s+std::cos(p.yaw)*std::sin(p.pitch)*c};}
+inline void panel_face_view(PanelGeometry &p,float x,float y,float z,float w) {
+ p.pitch=std::asin(std::clamp(2*(w*x-y*z),-1.f,1.f));
+ p.yaw=std::atan2(2*(x*z+w*y),1-2*(x*x+y*y));
+ p.roll=std::atan2(2*(x*y+w*z),1-2*(x*x+z*z));
+}
+// Billboard towards the viewer position, not the viewer's gaze direction.
+// Keep world-up stable so head roll does not roll remote desktops.
+inline bool panel_face_user(PanelGeometry &p,PanelVector eye) {
+    const float x=eye.x-p.x,y=eye.y-p.y,z=eye.z-p.z;
+    const float horizontal=std::hypot(x,z),distance=std::hypot(horizontal,y);
+    if(!std::isfinite(distance) || distance<.001f) return false;
+    if(horizontal>.00001f) p.yaw=std::atan2(x,z);
+    p.pitch=-std::atan2(y,horizontal);
+    p.roll=0;
+    return true;
+}
 inline PanelVector panel_normal(const PanelGeometry &p) {return {std::sin(p.yaw)*std::cos(p.pitch),-std::sin(p.pitch),std::cos(p.yaw)*std::cos(p.pitch)};}
 inline float panel_dot(PanelVector a,PanelVector b) {return a.x*b.x+a.y*b.y+a.z*b.z;}
 inline PanelVector panel_point(const PanelGeometry &p,float x,float y) {
