@@ -45,8 +45,10 @@ internal object PicoXrDropdownLayout {
     }
 
     fun pageOf(selected: Int): Int = (selected.coerceAtLeast(0)/visibleRows)*visibleRows
-    /** Convert radial controller sectors to previous/next for a linear dropdown. */
+    const val NAVIGATE_BACK = -2
+    /** Convert radial controller sectors to previous/next/back for a linear dropdown. */
     fun navigationStep(direction: Int): Int = when {
+        direction == 104 -> NAVIGATE_BACK
         direction in 100..107 -> if(direction-100 in setOf(0,1,6,7)) -1 else 1
         else -> direction
     }

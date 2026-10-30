@@ -213,6 +213,7 @@ class PicoPanelInstrumentation : Instrumentation() {
 
     private fun verifyControllerMenu() {
         verifyWindowScaleMenu()
+        verifyStickBackNavigation()
         val reader=android.media.ImageReader.newInstance(1200,800,android.graphics.PixelFormat.RGBA_8888,4)
         val following=mutableListOf<Boolean>();val layouts=mutableListOf<Pair<Int,Int>>()
         val menu=PicoXrToolbar(surface=reader.surface,session={null},followView={following.add(it)},reset={},touchMode={},keyboardModeChanged={},
@@ -236,6 +237,29 @@ class PicoPanelInstrumentation : Instrumentation() {
             val hand=PicoXrMenuHit.settingsRect(7)
             menu.activate((hand[0]+hand[2])/2400,(hand[1]+hand[3])/800)
             reader.acquireLatestImage()?.close();assertEquals(1 to 1,layouts.last())
+        } finally {menu.close();reader.close()}
+    }
+    private fun verifyStickBackNavigation() {
+        val reader=android.media.ImageReader.newInstance(1200,800,android.graphics.PixelFormat.RGBA_8888,4)
+        var home=0
+        val menu=PicoXrToolbar(surface=reader.surface,session={null},followView={},reset={},touchMode={},keyboardModeChanged={},
+            appearance={_,_,_->},closeScreenMenu={},home={home++},connectImmersive={_,_->},pickBackground={},useImage={},
+            backgroundAction={},menuShape={},connectedIds={emptySet()},disconnect={})
+        fun clickRoot(index: Int) {
+            val r=PicoXrMenuHit.toolbarRect(index)
+            menu.activate((r[0]+r[2])/2400,(r[1]+r[3])/1600)
+            reader.acquireLatestImage()?.close()
+        }
+        try {
+            menu.quickMenu(0);reader.acquireLatestImage()?.close()
+            clickRoot(4)
+            menu.navigate(104,false) // straight down backs out of the dropdown
+            reader.acquireLatestImage()?.close()
+            menu.navigate(104,false) // held-stick repeat must not select root sector four
+            menu.navigate(0,true) // spring release consumes the back gesture, not a stale selection
+            reader.acquireLatestImage()?.close()
+            clickRoot(5)
+            assertEquals(1,home)
         } finally {menu.close();reader.close()}
     }
 

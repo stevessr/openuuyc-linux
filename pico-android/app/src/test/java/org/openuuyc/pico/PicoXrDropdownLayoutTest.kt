@@ -14,6 +14,7 @@ class PicoXrDropdownLayoutTest {
         assertEquals(-1,PicoXrDropdownLayout.navigationStep(100))
         assertEquals(-1,PicoXrDropdownLayout.navigationStep(107))
         assertEquals(1,PicoXrDropdownLayout.navigationStep(102))
+        assertEquals(PicoXrDropdownLayout.NAVIGATE_BACK,PicoXrDropdownLayout.navigationStep(104))
         assertEquals(1,PicoXrDropdownLayout.navigationStep(105))
         val nextOffset=PicoXrDropdownLayout.navigationOffset(0,5,1,count)
         assertEquals(1,nextOffset)

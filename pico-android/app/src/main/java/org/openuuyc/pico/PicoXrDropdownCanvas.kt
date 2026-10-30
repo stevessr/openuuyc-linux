@@ -79,11 +79,10 @@ internal object PicoXrDropdownCanvas {
                 }
             }
         }
-        if(rows.size>PicoXrDropdownLayout.visibleRows) {
-            p.textSize=19f;p.color=PicoTheme.MUTED
-            val hint="${minOf(offset+1,rows.size)}–${minOf(offset+PicoXrDropdownLayout.visibleRows,rows.size)} / ${rows.size} · 摇杆上下滚动"
-            c.drawText(hint,32f,780f,p)
-        }
+        p.textSize=19f;p.color=PicoTheme.MUTED
+        val range=if(rows.size>PicoXrDropdownLayout.visibleRows) "${minOf(offset+1,rows.size)}–${minOf(offset+PicoXrDropdownLayout.visibleRows,rows.size)} / ${rows.size} · " else ""
+        val actionHint=if(rows.size>PicoXrDropdownLayout.visibleRows) "摇杆翻行 · 下拨返回" else "摇杆选择 · 下拨返回"
+        c.drawText(range+actionHint,32f,780f,p)
         PicoXrMaterial.label(c,notice,32f,748f,1100f,18f,muted=true)
     }
 }

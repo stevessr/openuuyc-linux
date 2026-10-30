@@ -115,17 +115,22 @@ internal class PicoXrToolbar(
     private var navigationCell=0
     private var stickFocused=false
     private var stickSelectionValid=false
+    private var stickBackPendingRelease=false
     fun quickMenu(hand: Int) {
         closeTerminal();voiceCancel();voicePressed=false;voiceGesture.reset()
         closeScreenMenu()
         menuVisible=!(menuVisible && quickHand==hand);quickHand=if(menuVisible) hand else -1
-        controllerHand=2;previousLayout=-1;navigationCell=0;stickFocused=false
+        controllerHand=2;previousLayout=-1;navigationCell=0;stickFocused=false;stickBackPendingRelease=false
         optionTitle=null;optionApply=null;devicePage=false;screenPage=false;spacePage=false;environmentPage=false;backgroundPage=false;keyboardPage=false;targetScreen=null;targetPaneHint=null;collapsed=false;dropdownOffset=0;sliderDrag=-1
         notice="左 X / 右 A 唤起 · 摇杆选择、松开执行 · 内侧扳机拖动"
         draw();if(menuVisible) navigate(0,false)
     }
     fun navigate(direction: Int,confirm: Boolean) {
-        if(direction==9) {stickFocused=false;stickSelectionValid=false;draw();return}
+        if(direction==9) {stickBackPendingRelease=false;stickFocused=false;stickSelectionValid=false;draw();return}
+        if(stickBackPendingRelease) {
+            if(confirm) stickBackPendingRelease=false
+            return
+        }
         if(!menuVisible || keyboardPage || terminalTarget!=null) return
         if(direction>=100 && keyboardPage) return
         if(confirm && !stickSelectionValid) return
@@ -136,6 +141,11 @@ internal class PicoXrToolbar(
             else->dropdownRows()
         }
         val selectionDirection=if(dropdown) PicoXrDropdownLayout.navigationStep(direction) else direction
+        if(dropdown && !confirm && selectionDirection==PicoXrDropdownLayout.NAVIGATE_BACK) {
+            closeDropdownPage()
+            navigationCell=0;stickFocused=false;stickSelectionValid=false;stickBackPendingRelease=true;hoverU=0f;hoverV=0f
+            draw();return
+        }
         if(dropdown && !confirm && selectionDirection in setOf(-1,1)) {
             val offset=if(optionTitle!=null) optionOffset else dropdownOffset
             val next=PicoXrDropdownLayout.navigationOffset(offset,navigationCell,selectionDirection,rows.size)
