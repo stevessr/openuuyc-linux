@@ -4,6 +4,7 @@
 
 ## 本轮补齐
 
+- **手机输入法文字提交（UUWay 的 Fcitx5 通路，原生实现）**：Linux 被控端的文字输入现在先走输入法门户——`org.freedesktop.portal.Fcitx`（即 fcitx5 的 `org.fcitx.Fcitx.InputMethod1`）的 `CreateInputContext` 建一个短命输入上下文，`CommitString` 把整段文字交给当前聚焦的输入框，随后 `DestroyIC` 释放。无剪贴板、无合成按键、无日志；失败或权限撤销时按原样回退 `zwp_virtual_keyboard`（Wayland 原生窗口）和 XTest（XWayland）。协议对本机 fcitx5 5.1.23 验证过 `CreateInputContext`/`FocusIn`/`DestroyIC` 生命周期，未验证真实窗口的插入效果。
 - **终端控制序列**：现有 OSC 3008 过滤继续保留。对于未判定的 ESC/引导前缀，PTY 空闲 50 ms 后释放，避免单独 ESC 永久滞留；已识别的 OSC 正文不会因空闲而泄漏给客户端。结束与分包处理保持不变。
 - **服务环境下的 shell/home**：优先保留有效的 `$SHELL`，缺失、目录或不可执行路径回退当前用户的 NSS 登录 shell，最后才用平台默认值；HOME 无效时使用当前用户 home。通过 `getpwuid_r` 查询，避免多线程共享 passwd 缓冲。子进程的 SHELL 与实际启动程序一致，不修改父进程环境。
 - **只读环境自检**：`bash devtools/linux-doctor.sh` 或追加 `--json`。检测真实 X11 连接和同用户 socket 候选，拒绝 SSH 显示隐式切换、报告多会话歧义；检测 Wayland/PipeWire/音频连接、render/uinput 权限和用户服务。工具存在与连接成功分开报告，外部命令每项超时 3 秒。不安装软件、不启动服务、不自动授权、不采集屏幕。
@@ -17,6 +18,7 @@
 ```sh
 python3 -m unittest discover -s devtools -p test_linux_doctor.py -v
 SHELL=/bin/sh cargo +1.95.0 test --offline platform::posix::terminal --lib -- --test-threads=1
+cargo +1.95.0 test --offline platform::linux::fcitx --lib
 bash devtools/linux-doctor.sh --json
 ```
 

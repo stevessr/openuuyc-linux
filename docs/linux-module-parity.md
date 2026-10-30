@@ -13,7 +13,7 @@ UUWay 是 Wine 桥接被控端；本项目保留原生 Rust 架构，不直接�
 | 音频 | media/audio、linux/loopback | 同采样率减拷贝；录放设备切换、断线恢复 |
 | 虚拟麦克风 | linux/virtual_audio | 当前明确不支持，需实现 PipeWire source 与生命周期 |
 | 键鼠/触摸 | linux/input、features/remote_input | 权限拒绝、焦点、断开释放按键、多点触摸 |
-| 中文输入 | linux/input | Fcitx5/桌面输入法的实际提交验证 |
+| 中文输入 | linux/input | 已接输入法门户（Fcitx5 D-Bus `CreateInputContext` → `CommitString`），缺真实桌面提交验收 |
 | 光标 | linux/cursor_shape、features/remote_cursor | 形状、热点、缩放、多屏边界 |
 | 剪贴板 | features/clipboard | 双向文本、循环抑制、Wayland 权限 |
 | 文件传输 | features/file_transfer、linux/transfer | 双向目录、取消、冲突、路径安全 |
@@ -46,11 +46,27 @@ Linux 被控端通过已认证的 `OPENUUYC_QUICK_APPS_V1` 扩展列出与启动
 
 ```bash
 cargo +1.95.0 test --lib features::host::quick_apps --offline -- --include-ignored --nocapture
+cargo +1.95.0 test --lib platform::linux::fcitx --offline
 ```
 
 2026-10-30 本机验证：应用专项 10 项通过（包含两个显式启用的本机测试），
 发现 133 个应用入口；GIO 临时 touch 入口创建文件成功，缺失程序入口正确返回失败。
 PTY 专项 10 项通过，连续 5 轮复测通过。尚未验证跨设备应用列表展示和真实窗口激活。
+
+### 输入法门户文字提交
+
+Linux 被控端的手机输入法文字（`Event::Text`）现在先经
+`org.freedesktop.portal.Fcitx`（fcitx5 / 深度输入法等实现）的
+`CreateInputContext` → `FocusIn` → `CommitString` → `DestroyIC` 提交，
+落点由输入法自己决定：当前聚焦的输入框。这条通路不触碰剪贴板、不发合成按键、
+也不写日志；输入法不在或调用被拒时按序回退 `zwp_virtual_keyboard`（Wayland
+原生窗口）与 XTest（XWayland / Xorg），行为与之前一致。
+
+2026-10-30 本机验证：fcitx5 5.1.23 上 `CreateInputContext`、`FocusIn`、
+`SetCapability`、`FocusOut`、`DestroyIC` 全部按预期应答，探针上下文在连接
+关闭后由输入法自行回收；Rust 单元测试 2 项通过（无守护进程时 `open` 明确失败、
+空文本在任何守护进程调用前被拒绝）。尚未在真实远程会话中验证文字落入目标输入框、
+与合成类输入法（如 rime）的候选状态交互，及 KDE/GNOME 其他实现。
 
 ## MR 双向控制入口
 

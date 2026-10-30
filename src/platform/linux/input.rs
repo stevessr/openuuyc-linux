@@ -1862,6 +1862,23 @@ impl Injector {
             virtual_keyboard = self.virtual_keyboard.is_some(),
             "文字输入"
         );
+        // 输入法门户（Fcitx5 等）把整段文字交给当前聚焦的输入框：没有剪贴板、
+        // 不发按键，也不能被组合键打断。桌面有输入法在跑时它是最可靠的通路。
+        if permitted() {
+            match crate::platform::linux::fcitx::Context::open().and_then(|context| {
+                let result = context.commit(text);
+                let _ = context.destroy();
+                result
+            }) {
+                Ok(()) => {
+                    tracing::info!("文字输入：输入法门户提交完成");
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::debug!(error = %format!("{error:#}"), "输入法门户不可用，尝试下一条路径");
+                }
+            }
+        }
         if let Some(keyboard) = &mut self.virtual_keyboard
             && !xwayland
         {

@@ -13,6 +13,7 @@ pub(crate) mod display_hdr;
 pub(crate) mod dmabuf;
 pub(crate) mod drag_drop;
 pub(crate) mod encoder;
+pub(crate) mod fcitx;
 pub(crate) mod file_locations;
 pub(crate) mod gamepad;
 pub(crate) mod gamescope;
