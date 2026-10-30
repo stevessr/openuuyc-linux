@@ -17,6 +17,7 @@ mod hevc;
 pub(crate) mod input;
 mod keyframe;
 pub(crate) mod microphone;
+pub(crate) mod native_audio;
 pub(crate) mod network;
 pub(crate) mod parameters;
 pub(crate) mod peer;

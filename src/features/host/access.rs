@@ -1177,6 +1177,15 @@ impl Lease {
             update_media_summary(&mut state.status);
         }
     }
+    pub(crate) fn audio_refresh_rate(&self) -> u32 {
+        lock(&self.handle.ownership)
+            .status
+            .streams
+            .values()
+            .filter_map(|stream| stream.video.map(|video| video.fps))
+            .max()
+            .unwrap_or(60)
+    }
     pub(crate) fn video(&self, encoding: Option<ActiveEncoding>) {
         self.modify(|state| {
             state.status.streams.entry(self.track).or_default().video = encoding;

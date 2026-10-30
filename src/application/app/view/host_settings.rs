@@ -360,6 +360,36 @@ impl DeviceCenterApp {
                 self.wol_setup_entry(ui);
             }
             section(ui, "画面与声音");
+            #[cfg(target_os = "linux")]
+            {
+                let mut requested = crate::platform::audio_thread::rt_requested();
+                form_row(
+                    ui,
+                    "低延迟",
+                    "默认开启；专用音频线程实时调度，队列按串流 FPS 限制；重连生效",
+                    |ui| {
+                        if crate::ui::controls::switch(ui, &mut requested).changed() {
+                            crate::platform::audio_thread::set_rt_requested(requested);
+                        }
+                    },
+                );
+                let audio = host.status().audio;
+                if audio.rt_requested {
+                    ui.label(format!(
+                        "低延迟：{} · 队列预算 {:.2}ms",
+                        if audio.rt_active {
+                            "实时调度已生效"
+                        } else {
+                            "普通调度（实时调度未生效）"
+                        },
+                        audio.queue_budget_us as f64 / 1000.0
+                    ));
+                    if let Some(error) = audio.rt_error {
+                        ui.label(egui::RichText::new(error).color(theme::AMBER));
+                    }
+                }
+            }
+
             let inventory = host.audio_devices();
             let mut quality = host.audio_quality();
             let mut quality_changed = false;

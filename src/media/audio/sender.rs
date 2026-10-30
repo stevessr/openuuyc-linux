@@ -13,10 +13,12 @@ use webrtc::{
     track::track_local::track_local_static_rtp::TrackLocalStaticRTP,
 };
 pub(crate) const RATE: u32 = 48_000;
-pub(crate) const BLOCK: usize = 480;
+pub(crate) const BLOCK: usize = 120; // 2.5ms at 48kHz; independent of decoder playout quantum
+pub(crate) const BLOCK_DURATION: Duration = Duration::from_micros(2500);
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
+#[derive(Clone, Copy)]
 pub(crate) struct Frame {
     pub samples: [f32; BLOCK * 2],
     pub timestamp: u32,
@@ -25,6 +27,9 @@ pub(crate) struct Frame {
 }
 pub(crate) trait Source: Send + Sync {
     fn current(&self, generation: u64) -> bool;
+    fn backlog_budget(&self) -> Duration {
+        Duration::from_millis(40)
+    }
     fn stopped(&self) -> &AtomicBool;
     fn encoding(&self) -> Option<Encoding>;
     fn frames(&self) -> &ArrayQueue<Frame>;
@@ -197,7 +202,7 @@ impl Transmitter {
                 continue;
             };
             if !source.current(frame.generation)
-                || frame.created.elapsed() > Duration::from_millis(40)
+                || frame.created.elapsed() > BLOCK_DURATION + source.backlog_budget()
             {
                 // A stale capture must not leave an older partial Opus packet behind.
                 pcm.clear();
@@ -256,11 +261,11 @@ impl Transmitter {
                 pcm.extend(frame.samples.chunks_exact(2).map(|p| (p[0] + p[1]) * 0.5));
             }
             let channels = if config.stereo { 2 } else { 1 };
-            if pcm.len() < RATE as usize * config.packet_ms as usize / 1000 * channels {
+            if pcm.len() < config.packet_samples * channels {
                 continue;
             }
             // Allow the negotiated packetization interval, but no extra stale backlog.
-            if first_capture.elapsed() > Duration::from_millis(u64::from(config.packet_ms) + 40) {
+            if first_capture.elapsed() > config.packet_duration() + source.backlog_budget() {
                 pcm.clear();
                 marker = true;
                 continue;
@@ -312,12 +317,12 @@ impl Transmitter {
                     wall_clock.1 + wall_clock.0.elapsed(),
                 )),
             ];
-            if first_capture.elapsed() > Duration::from_millis(u64::from(config.packet_ms) + 40) {
+            if first_capture.elapsed() > config.packet_duration() + source.backlog_budget() {
                 marker = true;
                 continue;
             }
             let write = tokio::time::timeout(
-                Duration::from_millis(25),
+                source.backlog_budget().min(Duration::from_millis(25)),
                 track.write_rtp_with_extensions(&packet, &extensions),
             )
             .await;

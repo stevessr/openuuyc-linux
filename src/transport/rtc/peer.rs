@@ -178,7 +178,7 @@ impl NativePeer {
                 mime_type: MIME_TYPE_OPUS.to_owned(),
                 clock_rate: 48_000,
                 channels: 2,
-                sdp_fmtp_line: "minptime=10;stereo=1;useinbandfec=1".to_owned(),
+                sdp_fmtp_line: "minptime=3;stereo=1;useinbandfec=1".to_owned(),
                 ..Default::default()
             },
             "audio_0".to_owned(),

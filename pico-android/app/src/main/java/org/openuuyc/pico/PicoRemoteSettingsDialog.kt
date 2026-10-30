@@ -46,7 +46,7 @@ internal object PicoRemoteSettingsDialog {
         render={
             body.removeAllViews()
             val state=session.settingsSnapshot();val current=state.current;val screen=state.screens.firstOrNull {it.id==state.selected}
-            lastSignature="${state.current}|${state.pending?.first}|${state.screens}|${session.microphoneEnabled}|${session.microphoneActive}|${session.clipboardEnabled}"
+            lastSignature="${state.current}|${state.pending?.first}|${state.screens}|${session.microphoneEnabled}|${session.microphoneActive}|${session.clipboardEnabled}|${session.nativeAudioStatus()}"
             val ready=state.pending==null && screen!=null && state.profiles.isNotEmpty()
             val header=LinearLayout(activity).apply {gravity=Gravity.CENTER_VERTICAL}
             header.addView(TextView(activity).apply {text=if(page=="画质") "画质" else "‹  $page";textSize=18f;setTextColor(PicoTheme.TEXT);setOnClickListener {page=when(page) {"分辨率","DPI 缩放" -> "显示设置";else -> "画质"};render()}},LinearLayout.LayoutParams(0,dp(42),1f))
@@ -95,6 +95,11 @@ internal object PicoRemoteSettingsDialog {
                 }
                 "DPI 缩放" -> screen?.dpis.orEmpty().forEach {dpi -> row("$dpi%",if(screen?.dpi==dpi) "当前" else "",screen?.dpi==dpi,ready && state.captureLevel>=5) {apply(current,dpi=dpi)}}
                 "高级设置" -> {
+                    row("当前音频通路",session.nativeAudioStatus(),enabled=false) {}
+                    row("音游音频",if(session.nextRhythmAudio) "低延迟 · 重连生效" else "音画同步 · 重连生效") {
+                        session.setRhythmAudioForNextConnection(!session.nextRhythmAudio);render()
+                    }
+
                     row("本地显示比例","保持画面比例",enabled=false) {}
                     row("仅音频模式","暂未实现",enabled=false) {};line()
                     row("高速中转连接 Beta","暂未实现",enabled=false) {}
@@ -121,7 +126,7 @@ internal object PicoRemoteSettingsDialog {
         val poll=object: Runnable {override fun run() {
             if(!popup.isShowing) return
             val state=session.settingsSnapshot()
-            val signature="${state.current}|${state.pending?.first}|${state.screens}|${session.microphoneEnabled}|${session.microphoneActive}|${session.clipboardEnabled}"
+            val signature="${state.current}|${state.pending?.first}|${state.screens}|${session.microphoneEnabled}|${session.microphoneActive}|${session.clipboardEnabled}|${session.nativeAudioStatus()}"
             if(!dragging && signature!=lastSignature) render()
             handler.postDelayed(this,700)
         }}

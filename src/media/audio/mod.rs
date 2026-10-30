@@ -100,6 +100,7 @@ pub(crate) struct OutputDevices {
 }
 
 struct Packet {
+    received: Instant,
     data: Bytes,
     timestamp: u32,
     sequence: u16,
@@ -384,15 +385,18 @@ impl AudioPlayback {
         let Ok(samples) = opusic_c::utils::get_nb_samples(&data, SampleRate::Hz48000) else {
             return;
         };
-        // Our negotiated Opus receive fmtp is minptime=10. Keep the jitter
+        // Accept short Opus RTP frames; keep the decoder jitter
         // processing quantum at 10 ms even when RTP packets contain 20/60 ms.
-        if data.len() > MAX_PACKET || !(BLOCK..=MAX_SAMPLES).contains(&samples) {
+        if data.len() > MAX_PACKET
+            || !(super::audio::sender::BLOCK..=MAX_SAMPLES).contains(&samples)
+        {
             return;
         }
         let first_packet = !shared.receiving.swap(true, Ordering::AcqRel);
         // No pre-player backlog, and no unbounded queue while an output device is absent.
         if shared.started.load(Ordering::Acquire) {
             shared.packets.force_push(Packet {
+                received: Instant::now(),
                 data,
                 timestamp,
                 sequence,
@@ -509,6 +513,9 @@ impl Engine {
             let Some(packet) = self.shared.packets.pop() else {
                 break;
             };
+            if packet.received.elapsed() > Duration::from_millis(80) {
+                continue;
+            }
             if packet.generation != generation
                 || self.seen.contains(&(packet.sequence, packet.timestamp))
             {

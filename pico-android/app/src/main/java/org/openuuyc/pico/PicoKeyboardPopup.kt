@@ -12,6 +12,13 @@ internal object PicoKeyboardPopup {
         val keys=PicoKeyboardKeys(session::key)
         var mode=PicoKeyboardMode.CUSTOM
         var hoverU=-1f;var hoverV=-1f
+        val footerHeight=(64*activity.resources.displayMetrics.density).toInt()
+        val statusLabel=android.widget.TextView(activity).apply {
+            text="Codex 语音：先聚焦远端 Codex，再点击语音键"
+            setTextColor(android.graphics.Color.WHITE);textSize=14f
+            setPadding(12,4,12,4);maxLines=3
+            setBackgroundColor(PicoTheme.SIDEBAR)
+        }
         lateinit var popup: PopupWindow
         val panel=object: View(activity) {
             override fun onDraw(canvas: Canvas) {
@@ -19,6 +26,7 @@ internal object PicoKeyboardPopup {
                 canvas.save();canvas.scale(width/1200f,height/PicoKeyboardLayout.height(mode))
                 PicoKeyboardCanvas.draw(canvas,mode,keys,hoverU,hoverV)
                 canvas.restore()
+
             }
             private fun chooseMode() {
                 android.widget.PopupMenu(activity,this).apply {
@@ -28,7 +36,7 @@ internal object PicoKeyboardPopup {
                             when(mode) {
                                 PicoKeyboardMode.SYSTEM->{popup.dismiss();system()}
                                 PicoKeyboardMode.VOICE->{popup.dismiss();voice()}
-                                else->popup.update(popup.width,(popup.width*PicoKeyboardLayout.height(mode)/1200).toInt())
+                                else->popup.update(popup.width,(popup.width*PicoKeyboardLayout.height(mode)/1200).toInt()+footerHeight)
                             }
                             invalidate();true
                         }
@@ -46,8 +54,10 @@ internal object PicoKeyboardPopup {
                         PicoKeyboardLayout.Header.MODE->chooseMode()
                         PicoKeyboardLayout.Header.BACK->popup.dismiss()
                         PicoKeyboardLayout.Header.CODEX_VOICE->{
-                            val sent=keys.codexVoice()
-                            android.widget.Toast.makeText(activity,if(sent) "已发送 Codex CLI F8：请先聚焦远端 Codex，麦克风回传需单独开启" else "Codex 语音快捷键未发送，请检查连接",android.widget.Toast.LENGTH_LONG).show()
+                            session.codexVoice(activity,keys::codexVoice) {message->
+                                android.widget.Toast.makeText(activity,message,android.widget.Toast.LENGTH_LONG).show()
+                                statusLabel.text=message;invalidate()
+                            }
                         }
                         null->PicoKeyboardLayout.keyAt(mode,hoverU,hoverV)?.let(keys::pressed)
                     }
@@ -59,7 +69,12 @@ internal object PicoKeyboardPopup {
             override fun performClick(): Boolean {super.performClick();return true}
         }
         val width=(activity.resources.displayMetrics.widthPixels*.9f).toInt()
-        popup=PopupWindow(panel,width,width/3,true).apply {
+        val content=android.widget.LinearLayout(activity).apply {
+            orientation=android.widget.LinearLayout.VERTICAL
+            addView(panel,android.widget.LinearLayout.LayoutParams(-1,0,1f))
+            addView(statusLabel,android.widget.LinearLayout.LayoutParams(-1,footerHeight))
+        }
+        popup=PopupWindow(content,width,width/3+footerHeight,true).apply {
             setBackgroundDrawable(android.graphics.drawable.ColorDrawable(PicoTheme.SIDEBAR))
             isOutsideTouchable=true;setOnDismissListener { keys.release() }
         }

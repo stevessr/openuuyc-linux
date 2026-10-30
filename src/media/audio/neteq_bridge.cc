@@ -37,7 +37,8 @@ struct Receiver {
   Receiver() {
     webrtc::NetEq::Config config;
     config.sample_rate_hz = 48000;
-    config.max_packets_in_buffer = 200;
+    config.max_packets_in_buffer = 16;
+    config.max_delay_ms = 60;
     config.min_delay_ms = 0;
     config.enable_post_decode_vad = false;
     webrtc::DefaultNetEqFactory factory;

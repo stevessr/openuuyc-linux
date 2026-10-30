@@ -41,7 +41,7 @@ pub(crate) struct Config {
     pub cbr: bool,
     pub bitrate: u32,
     pub bitrate_limit: u32,
-    pub packet_ms: u32,
+    pub packet_samples: usize,
     pub max_playback_rate: u32,
 }
 
@@ -55,15 +55,25 @@ impl Config {
         let number = |key| params.get(key).and_then(|s| s.parse::<u32>().ok());
         let flag = |key| params.get(key).is_some_and(|s| *s == "1");
         let requested = ptime.or_else(|| number("ptime")).unwrap_or(20);
-        // T121408 rounds up to the next supported packet duration, capped at 120.
-        let packet_ms = [10, 20, 40, 60, 120]
-            .into_iter()
-            .find(|v| *v >= requested)
-            .unwrap_or(120);
+        // RFC 7587 signals 2.5ms packets as integer ptime=3. Keep exact
+        // sample counts internally; rounding that back to 3ms would be invalid Opus.
+        let packet_samples = [
+            (3, 120),
+            (5, 240),
+            (10, 480),
+            (20, 960),
+            (40, 1920),
+            (60, 2880),
+            (120, 5760),
+        ]
+        .into_iter()
+        .find(|(ms, _)| *ms >= requested)
+        .map(|(_, samples)| samples)
+        .unwrap_or(5760);
         let bitrate_limit = number("maxaveragebitrate")
             .unwrap_or(510_000)
             .clamp(6_000, 510_000)
-            .min(MAX_PACKET as u32 * 8000 / packet_ms);
+            .min(MAX_PACKET as u32 * 8 * RATE / packet_samples as u32);
         Ok(Self {
             stereo: flag("stereo"),
             fec: flag("useinbandfec"),
@@ -71,11 +81,14 @@ impl Config {
             cbr: flag("cbr"),
             bitrate: (Quality::default().kbps * 1000).min(bitrate_limit),
             bitrate_limit,
-            packet_ms,
+            packet_samples,
             max_playback_rate: number("maxplaybackrate")
                 .filter(|rate| (8_000..=RATE).contains(rate))
                 .unwrap_or(RATE),
         })
+    }
+    pub fn packet_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.packet_samples as u64 * 1_000_000 / u64::from(RATE))
     }
     pub fn quality(mut self, quality: Quality) -> Self {
         self.bitrate = (quality.kbps * 1000).min(self.bitrate_limit);
@@ -98,7 +111,9 @@ pub(crate) fn create_encoder(config: Config) -> std::result::Result<Encoder, opu
             Channels::Mono
         },
         SampleRate::Hz48000,
-        if config.stereo {
+        if config.packet_samples < 480 {
+            Application::LowDelay
+        } else if config.stereo {
             Application::Audio
         } else {
             Application::Voip
@@ -175,4 +190,72 @@ pub(crate) fn remote_config(
         return Ok(None);
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod short_packet_tests {
+    use super::*;
+    #[test]
+    fn short_packet_neteq_decodes_generated_tone() {
+        for ptime in [3, 5] {
+            let config = Config::negotiated("stereo=1", Some(ptime)).unwrap();
+            let mut encoder = create_encoder(config).unwrap();
+            let mut receiver = crate::media::audio::neteq::Receiver::new().unwrap();
+            let mut encoded = [0u8; MAX_PACKET];
+            let mut peak = 0.0f32;
+            let mut pending = 0;
+            for sequence in 0..(4800 / config.packet_samples) {
+                let pcm: Vec<f32> = (0..config.packet_samples * 2)
+                    .map(|i| {
+                        ((sequence * config.packet_samples + i / 2) as f32
+                            * 440.0
+                            * std::f32::consts::TAU
+                            / 48000.0)
+                            .sin()
+                            * 0.25
+                    })
+                    .collect();
+                let count = encoder.encode_float_to_slice(&pcm, &mut encoded).unwrap();
+                assert!(receiver.insert(
+                    &encoded[..count],
+                    (sequence * config.packet_samples) as u32,
+                    sequence as u16
+                ));
+                pending += config.packet_samples;
+                if pending >= 480 {
+                    let mut block = [0.0; 960];
+                    let mut stats = Default::default();
+                    receiver.block(&mut block, &mut stats).unwrap();
+                    assert!(block.iter().all(|s| s.is_finite()));
+                    peak = block.iter().fold(peak, |p, s| p.max(s.abs()));
+                    pending -= 480;
+                }
+            }
+            assert!(
+                peak > 0.01,
+                "short Opus packets never reached native playout"
+            );
+        }
+    }
+    #[test]
+    fn opus_short_packets_keep_exact_samples_and_decode_duration() {
+        for (ptime, samples) in [(3, 120), (5, 240), (10, 480), (20, 960)] {
+            let config = Config::negotiated("stereo=1;useinbandfec=1", Some(ptime)).unwrap();
+            assert_eq!(config.packet_samples, samples);
+            let mut encoder = create_encoder(config).unwrap();
+            let mut output = [0u8; MAX_PACKET];
+            let encoded = encoder
+                .encode_float_to_slice(&vec![0.0; samples * 2], &mut output)
+                .unwrap();
+            assert_eq!(
+                opusic_c::utils::get_nb_samples(&output[..encoded], SampleRate::Hz48000).unwrap()
+                    as usize,
+                samples
+            );
+            assert_eq!(
+                config.packet_duration().as_micros(),
+                samples as u128 * 1_000_000 / 48000
+            );
+        }
+    }
 }

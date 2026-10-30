@@ -35,6 +35,8 @@ internal class PicoXrToolbar(
         direct.terminal.changed={notice=it;draw()};direct.terminal.output={terminalScreen.append(it);draw()}
         notice="远端终端 · 点击打开 Shell；命令在所选设备执行";draw()
     }
+    private var codexVoice: ((()->Boolean,(String)->Unit)->Unit)?=null
+    fun setCodexVoice(action: (()->Boolean,(String)->Unit)->Unit) {codexVoice=action}
     private var voiceStart: ()->Unit={}
     private var voiceStop: ()->Unit={}
     private var voiceCancel: ()->Unit={}
@@ -330,7 +332,7 @@ internal class PicoXrToolbar(
                 PicoKeyboardLayout.Header.BACK->{keyboardKeys.release();voiceCancel();keyboardPage=false;keyboardModeChanged(PicoKeyboardMode.CUSTOM)}
                 PicoKeyboardLayout.Header.CODEX_VOICE->{
                     voiceCancel()
-                    notice=if(keyboardKeys.codexVoice()) "已发送 Codex CLI F8 · 请先聚焦远端 Codex，麦克风回传需单独开启" else "Codex 语音键未发送，请检查控制通道"
+                    codexVoice?.invoke(keyboardKeys::codexVoice) {message->notice=message;draw()} ?: run {notice="Codex 语音控制未就绪"}
                 }
                 null->if(keyboardMode!=PicoKeyboardMode.VOICE) PicoKeyboardLayout.keyAt(keyboardMode,u,v)?.let {if(!keyboardKeys.pressed(it)) notice="键盘发送未完成，检查控制通道"}
             }
@@ -564,7 +566,11 @@ internal class PicoXrToolbar(
                     else menuScreens.mapIndexed {i,d->RingEntry("${if(d.id==session()?.selectedScreen()) "✓ " else ""}${d.name}") {screenOffset=i;click(0)}}
                 rows+RingEntry("刷新") {click(10)}
             }
-            qualityPage() -> PicoXrQualityLayout.items.filter {it.action!=11}.map {item->
+            qualityPage() -> listOf(RingEntry("音频 · ${session()?.nativeAudioStatus() ?: "未连接"}") {
+                options("音频播放模式 · 重连生效",listOf("音游 · 声音不等待画面","音画同步 · 兼顾观看"),if(session()?.nextRhythmAudio!=false) 0 else 1) {index->
+                    session()?.setRhythmAudioForNextConnection(index==0);notice="音频模式已保存，重连串流生效";draw()
+                };draw()
+            })+PicoXrQualityLayout.items.filter {it.action!=11}.map {item->
                 val label=when(item.action) {3->"编码偏好";105->"自动（原画）";104->"原画";103->"超清";102->"高清";2->"自定义码率";98->"分辨率与 DPI";99->"高级设置";else->"${item.action-200} FPS"}
                 legacy(label,(item.x+item.w/2)/600,(item.y+item.h/2)/1000)
             }

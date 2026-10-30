@@ -81,6 +81,10 @@ internal class UuDirectSession(
         if(!value) clipboardBinding.enable(false)
         postRtc {clipboardWire.reset();clipboardBinding.enable(value);emit(if(value) "文本剪贴板同步已开启（仅前台会话）" else "剪贴板同步已关闭")}
     }
+    private val audioPreferences=context.getSharedPreferences("stream_audio",Context.MODE_PRIVATE)
+    val rhythmAudio=audioPreferences.getBoolean("rhythm",true)
+    val nextRhythmAudio: Boolean get()=audioPreferences.getBoolean("rhythm",true)
+    fun setRhythmAudioForNextConnection(value: Boolean) {audioPreferences.edit().putBoolean("rhythm",value).apply()}
     private val micState=UuMicrophoneState()
     @Volatile private var audioModule: org.webrtc.audio.JavaAudioDeviceModule?=null
     private var microphoneTransceiver: RtpTransceiver?=null
@@ -88,6 +92,54 @@ internal class UuDirectSession(
     private var microphoneSource: org.webrtc.AudioSource?=null
     @Volatile var microphoneActive=false;private set
     @Volatile var microphoneNegotiated=false;private set
+    private var codexVoiceGeneration=0L
+    private var codexVoicePending=false
+    private var codexVoiceRunning=false
+    private var codexOwnsMicrophone=false
+    @Volatile private var codexMicrophoneError: String?=null
+    /** F8 is meaningful only after the authorized microphone is really sending. */
+    fun codexVoice(activity: android.app.Activity,shortcut: ()->Boolean,status: (String)->Unit) {
+        if(codexVoicePending) {
+            codexVoiceGeneration++;codexVoicePending=false
+            if(codexOwnsMicrophone) setMicrophoneEnabled(false)
+            codexOwnsMicrophone=false;status("Codex 语音启动已取消");return
+        }
+        if(codexVoiceRunning) {
+            if(!shortcut()) {status("停止快捷键未发送，请检查连接");return}
+            codexVoiceRunning=false
+            if(codexOwnsMicrophone) setMicrophoneEnabled(false)
+            codexOwnsMicrophone=false;status("Codex 语音停止快捷键已发送");return
+        }
+        if(closed.get() || !inputReady()) {status("控制通道未就绪，未开启 Codex 语音");return}
+        if(!microphoneNegotiated) {status("未协商麦克风回传，请重连支持麦克风的串流；仅终端连接不传音频");return}
+        val generation=++codexVoiceGeneration
+        codexVoicePending=true;codexMicrophoneError=null
+        status("Codex 语音：等待麦克风授权与远端确认…")
+        fun finishFailure(message: String) {
+            codexVoicePending=false
+            if(codexOwnsMicrophone) setMicrophoneEnabled(false)
+            codexOwnsMicrophone=false;status(message)
+        }
+        if(!UuMicrophonePermissionActivity.request(activity) {granted->
+            if(generation!=codexVoiceGeneration || closed.get()) return@request
+            if(!granted) {finishFailure("未授权麦克风，Codex 语音未启动");return@request}
+            codexOwnsMicrophone=!microphoneEnabled
+            if(codexOwnsMicrophone) setMicrophoneEnabled(true)
+            val deadline=android.os.SystemClock.uptimeMillis()+10000L
+            fun poll() {
+                if(generation!=codexVoiceGeneration) return
+                if(closed.get() || activity.isDestroyed) {finishFailure("连接或界面已关闭，未启动 Codex 语音");return}
+                if(microphoneActive) {
+                    codexVoicePending=false
+                    if(shortcut()) {codexVoiceRunning=true;status("麦克风已回传 · Codex F8 已发送（请保持远端 Codex 聚焦）")}
+                    else finishFailure("麦克风已准备，但 Codex 快捷键发送失败")
+                } else if(codexMicrophoneError!=null) finishFailure(codexMicrophoneError!!)
+                else if(android.os.SystemClock.uptimeMillis()>=deadline) finishFailure("远端麦克风未就绪，Codex 语音未启动；检查 Linux 音频服务与麦克风权限")
+                else cleanupHandler.postDelayed({poll()},100)
+            }
+            poll()
+        }) finishFailure("麦克风授权窗口忙，请稍后重试")
+    }
     val microphoneEnabled: Boolean get()=micState.requested
     fun setMicrophoneEnabled(value: Boolean) {
         if(!value) {audioModule?.setMicrophoneMute(true);micState.stop()}
@@ -231,14 +283,27 @@ internal class UuDirectSession(
     private var negotiatedVideoTracks: List<Int> = emptyList()
     private var videoMidIndices: Map<String, Int> = emptyMap()
     private var remoteAudio: AudioTrack? = null
-    private var audioFocusHeld = false
+    @Volatile private var audioFocusHeld = false
+    @Volatile private var nativeAudioClaimed=false
+    @Volatile private var nativeAudioRttMs=Double.POSITIVE_INFINITY
+    private val nativeAudio=UuNativeAudio(
+        eligible={rhythmAudio && appFocused.get() && audioFocusHeld && !closed.get()},
+        switchOutput={claimed,done->postRtc {
+            nativeAudioClaimed=claimed
+            remoteAudio?.setEnabled(audioFocusHeld && !claimed)
+            done()
+        }},
+        report={message->emit(message)},
+        pcmAllowed={nativeAudioRttMs<=12.0}
+    )
+    fun nativeAudioStatus(): String=nativeAudio.label
     private var audioFocusRequested = false
     private val audioManager =
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { focus ->
         synchronized(this) {
             audioFocusHeld = focus == AudioManager.AUDIOFOCUS_GAIN && !closed.get()
-            remoteAudio?.setEnabled(audioFocusHeld)
+            remoteAudio?.setEnabled(audioFocusHeld && !nativeAudioClaimed)
         }
     }
     private val audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -364,21 +429,25 @@ internal class UuDirectSession(
         if (!closed.get()) { diagnostics.record(text); events(text) }
     }
 
+    private val audioLatency=UuAudioLatency.Window()
     private fun reportMediaStats() {
         peer?.getStats { report ->
             if (closed.get()) return@getStats
             val summaries = report.statsMap.values.sortedBy {if(it.type=="inbound-rtp" && it.members["kind"]=="audio") 0 else 1}.mapNotNull { stat ->
                 val m = stat.members
+                if(stat.type=="candidate-pair" && m["nominated"]==true && m["state"]=="succeeded") {
+                    nativeAudioRttMs=(m["currentRoundTripTime"] as? Number)?.toDouble()?.takeIf {it.isFinite() && it>=0}?.times(1000) ?: Double.POSITIVE_INFINITY
+                }
                 when (stat.type) {
                     "transport" -> "transport(dtls=${m["dtlsState"]},ice=${m["iceState"]},sent=${m["bytesSent"]},recv=${m["bytesReceived"]})"
                     "candidate-pair" -> if (m["nominated"] == true || m["state"] == "succeeded")
                         "pair(state=${m["state"]},nominated=${m["nominated"]},sent=${m["bytesSent"]},recv=${m["bytesReceived"]})" else null
-                    "inbound-rtp" -> if(m["kind"]=="audio") UuAudioLatency.summary(m) else "rtp(kind=${m["kind"]},bytes=${m["bytesReceived"]},frames=${m["framesReceived"]},decoded=${m["framesDecoded"]})"
+                    "inbound-rtp" -> if(m["kind"]=="audio") audioLatency.summary(stat.id,m) else "rtp(kind=${m["kind"]},bytes=${m["bytesReceived"]},frames=${m["framesReceived"]},decoded=${m["framesDecoded"]})"
                     "data-channel" -> "sctp(state=${m["state"]},sent=${m["messagesSent"]},recv=${m["messagesReceived"]})"
                     else -> null
                 }
             }
-            emit("媒体诊断：" + summaries.joinToString("; ").take(1200))
+            emit("媒体诊断：" + nativeAudio.diagnostic+"; "+summaries.joinToString("; ").take(1200))
         }
     }
 
@@ -503,7 +572,7 @@ internal class UuDirectSession(
                         maybeStartCapture()
                     }
                     emit("UU WebRTC SDP 已接受（${acceptedTracks.size} 条视频轨道）")
-                }), SessionDescription(SessionDescription.Type.ANSWER, sdp))
+                }), SessionDescription(SessionDescription.Type.ANSWER, UuAudioOffer.independentPlayback(sdp,rhythmAudio)))
             }
             "candidate" -> {
                 val ice = data.optJSONObject("candidate") ?: return
@@ -695,12 +764,13 @@ internal class UuDirectSession(
         updateWindows()
         val engine=if(applicationsOnly) PeerConnectionFactory.builder().createPeerConnectionFactory() else {
         val adm=org.webrtc.audio.JavaAudioDeviceModule.builder(context)
+            .setOutputSampleRate(48000)
             .setUseLowLatency(true)
             .setUseStereoOutput(true)
             .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
             .setAudioRecordErrorCallback(object: org.webrtc.audio.JavaAudioDeviceModule.AudioRecordErrorCallback {
-                private fun fail() {audioModule?.setMicrophoneMute(true);micState.stop();postRtc {updateMicrophone()};emit("本机麦克风录音失败，已关闭回传")}
+                private fun fail() {codexMicrophoneError="头显麦克风录音失败，Codex 未启动";audioModule?.setMicrophoneMute(true);micState.stop();postRtc {updateMicrophone()};emit("本机麦克风录音失败，已关闭回传")}
                 override fun onWebRtcAudioRecordInitError(error: String) {fail()}
                 override fun onWebRtcAudioRecordStartError(code: org.webrtc.audio.JavaAudioDeviceModule.AudioRecordStartErrorCode,error: String) {fail()}
                 override fun onWebRtcAudioRecordError(error: String) {fail()}
@@ -718,7 +788,7 @@ internal class UuDirectSession(
                 .setUsername(server.username).setPassword(server.credential).createIceServer()
         }).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            audioJitterBufferMaxPackets=8
+            audioJitterBufferMaxPackets=if(rhythmAudio) 8 else 40
             audioJitterBufferFastAccelerate=true
         }
         peer = engine.createPeerConnection(config, object : PeerConnection.Observer {
@@ -790,16 +860,16 @@ internal class UuDirectSession(
         }
         for (label in listOf(
             "CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL",
-            "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL", UuTerminal.CHANNEL, UuQuickApps.CHANNEL, UuPcvrSession.CONTROL, UuPcvrSession.TRACKING, UuStereoFrames.CHANNEL
-        ).filter { (!terminalOnly || it!=UuTerminal.CHANNEL) && (!applicationsOnly || it !in setOf("STREAMER_DATA_CHANNEL",UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL)) }) {
-            val channel = connection.createDataChannel(label, DataChannel.Init().apply { ordered = label !in setOf(UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL); if(!ordered) maxRetransmits=0 })
+            "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL", UuTerminal.CHANNEL, UuQuickApps.CHANNEL, UuPcvrSession.CONTROL, UuPcvrSession.TRACKING, UuStereoFrames.CHANNEL, UuNativeAudio.CHANNEL
+        ).filter { (it!=UuNativeAudio.CHANNEL || (!terminalOnly && !applicationsOnly && rhythmAudio)) && (!terminalOnly || it!=UuTerminal.CHANNEL) && (!applicationsOnly || it !in setOf("STREAMER_DATA_CHANNEL",UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL)) }) {
+            val channel = connection.createDataChannel(label, DataChannel.Init().apply { ordered = label !in setOf(UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL,UuNativeAudio.CHANNEL); if(!ordered) maxRetransmits=0 })
             if (channel != null) {
                 channels.add(channel)
                 listenChannel(channel)
             }
         }
         connection.createOffer(sdpObserver(onCreated = offer@{ generated ->
-            val desc=SessionDescription(generated.type,UuAudioOffer.lowLatency(generated.description))
+            val desc=SessionDescription(generated.type,UuAudioOffer.lowLatency(generated.description,rhythmAudio))
             val mediaLines=generated.description.lineSequence().count {it.startsWith("m=audio ") || it.startsWith("m=video ")}
             emit("连接用途：${if(terminalOnly) "终端纯数据(kind=8)" else if(applicationsOnly) "应用/文件纯数据(kind=5)" else "桌面串流(kind=1)"}，音视频 m-line=$mediaLines")
             if(applicationsOnly && mediaLines!=0) {emit("纯数据连接出现媒体轨道，已中止");terminateUnexpectedly();return@offer}
@@ -851,8 +921,8 @@ internal class UuDirectSession(
                     AudioManager.AUDIOFOCUS_REQUEST_GRANTED
             }.getOrDefault(false)
             audioFocusHeld = granted
-            track.setEnabled(granted)
-            emit(if (granted) "UU WebRTC 远端音轨已接入头显音频输出"
+            track.setEnabled(granted && !nativeAudioClaimed)
+            emit(if (granted) "UU WebRTC 远端音轨已接入头显音频输出 · ${if(rhythmAudio) "音游：独立音频时钟" else "音画同步"}"
                  else "UU 远端音轨已接入，但 Android 音频焦点不可用")
         }
     }
@@ -866,13 +936,14 @@ internal class UuDirectSession(
                 if (closed.get()) return@postRtc
                 synchronized(this@UuDirectSession) {
                     if (closed.get()) return@postRtc
-                    val label = channel.label().takeIf { it in setOf("CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL", "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL",UuQuickApps.CHANNEL,UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL) } ?: "other"
+                    val label = channel.label().takeIf { it in setOf("CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL", "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL",UuQuickApps.CHANNEL,UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL,UuNativeAudio.CHANNEL) } ?: "other"
                     emit("数据通道 $label：${channel.state()}")
                     if (channel.state() == DataChannel.State.OPEN) {
                         when (channel.label()) {
                             UuTerminal.CHANNEL -> if(!terminalOnly) terminal.bind(channel)
                             "BINARY_DATA_CHANNEL" -> if(terminalOnly) terminal.bind(channel)
                             UuQuickApps.CHANNEL -> quickApps.bind(channel)
+                            UuNativeAudio.CHANNEL -> nativeAudio.bind(channel)
                             UuPcvrSession.CONTROL,UuPcvrSession.TRACKING -> vr.bind(channel)
                             "CONTROL_DATA_CHANNEL" -> {
                                 controlChannel = channel
@@ -887,6 +958,7 @@ internal class UuDirectSession(
                                channel.state() == DataChannel.State.CLOSING) {
                         if(channel.label()==UuTerminal.CHANNEL || (channel.label()=="BINARY_DATA_CHANNEL" && terminalOnly)) terminal.close()
                         if(channel.label()==UuQuickApps.CHANNEL) quickApps.close()
+                        if(channel.label()==UuNativeAudio.CHANNEL) nativeAudio.disconnected()
                         if(channel.label() in setOf(UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL)) vr.close()
                         val critical = channel === controlChannel || channel === textChannel
                         if (critical && !closed.get()) {
@@ -911,6 +983,7 @@ internal class UuDirectSession(
                 if(closed.get() || buffer.data.remaining()>(if(channel.label()==UuQuickApps.CHANNEL) 4*1024*1024 else 65536)) return
                 val data=buffer.data.slice()
                 val bytes=ByteArray(data.remaining());data.get(bytes)
+                if(channel.label()==UuNativeAudio.CHANNEL) {nativeAudio.receive(bytes);return}
                 postRtc {
                 synchronized(this@UuDirectSession) {
                     if (closed.get()) return@postRtc
@@ -930,7 +1003,7 @@ internal class UuDirectSession(
                         if(files.receive(bytes)) return@postRtc
                         if(clipboardWire.receive(bytes,clipboardBinding.enabled && appFocused.get() && inputReady())) return@postRtc
                         val payload = UuWire.decodeEnvelope(bytes)
-                        payload.microphoneAck?.let {(id,code) -> micState.response(id,code);updateMicrophone();if(code!=0) emit("远端麦克风策略被拒绝：$code")}
+                        payload.microphoneAck?.let {(id,code) -> micState.response(id,code);updateMicrophone();if(code!=0) {codexMicrophoneError="远端麦克风策略被拒绝：$code";emit(codexMicrophoneError!!)}}
                         payload.simpleAction?.let {action -> if(action in setOf(23,24,27)) {micState.event(action);updateMicrophone()}}
                         payload.captureLevel?.let { remoteSettings.captureLevel = it }
                         if (payload.screens.isNotEmpty()) {
@@ -1258,6 +1331,8 @@ internal class UuDirectSession(
     }
 
     override fun close() {
+        nativeAudio.close()
+        codexVoiceGeneration++;codexVoicePending=false;codexVoiceRunning=false
         // PeerConnection.dispose must not run on Observer/DataChannel callbacks.
         // Mark closed synchronously, then release on the Android main queue.
         audioModule?.setMicrophoneMute(true);micState.stop()

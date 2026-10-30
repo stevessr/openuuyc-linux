@@ -194,7 +194,7 @@ impl Peer {
                     mime_type: "audio/opus".into(),
                     clock_rate: 48_000,
                     channels: 2,
-                    sdp_fmtp_line: "minptime=10;stereo=1;useinbandfec=1".into(),
+                    sdp_fmtp_line: "minptime=3;stereo=1;useinbandfec=1".into(),
                     rtcp_feedback: vec![RTCPFeedback {
                         typ: "transport-cc".into(),
                         parameter: String::new(),
@@ -408,7 +408,7 @@ impl Peer {
                 mime_type: "audio/opus".into(),
                 clock_rate: 48_000,
                 channels: 2,
-                sdp_fmtp_line: "minptime=10;stereo=1;useinbandfec=1".into(),
+                sdp_fmtp_line: "minptime=3;stereo=1;useinbandfec=1".into(),
                 ..Default::default()
             },
             "audio_0".into(),
@@ -735,7 +735,13 @@ impl Peer {
         let diagnostics_connected = connected.clone();
         #[cfg(target_os = "linux")]
         let pcvr = crate::pcvr::host::Session::new(handle.clone(), connected.clone());
+        let native_audio = audio.clone();
         connection.on_data_channel(Box::new(move |channel| {
+            if channel.label() == crate::features::host::native_audio::CHANNEL {
+                native_audio.bind_native(channel, channel_cancel.clone());
+                return Box::pin(async {});
+            }
+
             #[cfg(target_os = "linux")]
             if matches!(
                 channel.label(),

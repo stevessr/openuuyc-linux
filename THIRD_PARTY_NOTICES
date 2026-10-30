@@ -357,3 +357,13 @@ The optional shared-library component bundle preserves upstream notices and incl
 pinned upstream source archives under sources/. xrizer is loaded by the game and
 is not linked into the OpenUUYC host executable. Source/build lock and instructions:
 drivers/openxr/components.lock.json and drivers/openxr/README.md.
+
+Native Android low-latency audio decoder (Opus 1.6.1)
+
+The native Android audio backend links libopus 1.6.1 under its BSD-style
+license. Source: https://github.com/xiph/opus/tree/v1.6.1 . The CMake download
+is SHA-256 pinned; an explicit offline source override is also supported.
+The full copyright, redistribution conditions and disclaimer are shipped in
+pico-android/app/src/main/assets/licenses/opus.txt and the APK assets.
+The AAudio API is provided by Android; the new transport/player glue is not
+an Oboe fork and does not include Oboe source.
