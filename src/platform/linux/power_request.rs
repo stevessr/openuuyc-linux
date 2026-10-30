@@ -102,7 +102,7 @@ fn wake_x11() -> Result<bool> {
     use x11rb::connection::{Connection as _, RequestConnection as _};
     use x11rb::protocol::dpms::{self, ConnectionExt as _, DPMSMode};
     use x11rb::protocol::xproto::{ConnectionExt as _, ScreenSaver};
-    let (connection, _) = x11rb::connect(None).context("连接 X11 显示失败")?;
+    let (connection, _) = crate::platform::linux::x11_connection::connect().context("连接 X11 显示失败")?;
     // Unblanks the core screen saver and restarts its timer; it does not
     // power a monitor back up.
     connection.force_screen_saver(ScreenSaver::RESET)?.check()?;

@@ -187,7 +187,7 @@ impl Offer {
     }
 
     fn publish(content: Content) -> Result<Self> {
-        let (connection, screen) = x11rb::connect(None).context("连接 X11 显示失败")?;
+        let (connection, screen) = crate::platform::linux::x11_connection::connect().context("连接 X11 显示失败")?;
         let root = connection.setup().roots[screen].root;
         let window = connection.generate_id().context("分配 X11 窗口失败")?;
         connection

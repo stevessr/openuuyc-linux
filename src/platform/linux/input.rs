@@ -1488,7 +1488,7 @@ pub(crate) struct Injector {
 
 impl Injector {
     pub fn open() -> Result<Self> {
-        let (connection, screen) = x11rb::connect(None).context("连接 X11 显示失败")?;
+        let (connection, screen) = crate::platform::linux::x11_connection::connect().context("连接 X11 显示失败")?;
         ensure!(
             connection
                 .extension_information(x11rb::protocol::xtest::X11_EXTENSION_NAME)?

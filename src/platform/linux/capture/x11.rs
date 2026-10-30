@@ -95,7 +95,8 @@ impl Grab {
             !super::wayland_session(),
             "Wayland 会话中 X11 只能看到 X 客户端的窗口"
         );
-        let (connection, screen_index) = x11rb::connect(None).context("连接 X11 显示失败")?;
+        let (connection, screen_index) =
+            crate::platform::linux::x11_connection::connect().context("连接 X11 显示失败")?;
         let setup = connection.setup();
         let root_screen = &setup.roots[screen_index];
         let root = root_screen.root;

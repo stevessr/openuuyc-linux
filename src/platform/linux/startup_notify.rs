@@ -103,7 +103,7 @@ pub(super) mod x11 {
     }
 
     pub(in super::super) fn raise(window: u32, token: &str, show: impl FnOnce()) -> Result<()> {
-        let (connection, screen) = x11rb::connect(None).context("连接 X 服务器失败")?;
+        let (connection, screen) = crate::platform::linux::x11_connection::connect().context("连接 X 服务器失败")?;
         let root = connection.setup().roots[screen].root;
         let atoms = Atoms::new(&connection)?.reply()?;
         let mapped = announce(&connection, &atoms, window, token)?;
@@ -295,7 +295,7 @@ mod tests {
     fn x11_announces_raises_and_completes_a_launch() {
         use x11rb::connection::Connection;
         use x11rb::protocol::xproto::{self, ConnectionExt as _};
-        let (connection, screen) = x11rb::connect(None).unwrap();
+        let (connection, screen) = crate::platform::linux::x11_connection::connect().unwrap();
         let root = connection.setup().roots[screen].root;
         let atoms = x11::Atoms::new(&connection).unwrap().reply().unwrap();
         let window = connection.generate_id().unwrap();

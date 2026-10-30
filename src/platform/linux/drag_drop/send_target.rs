@@ -200,7 +200,7 @@ fn watch(shared: &Shared, ready: &mpsc::SyncSender<Result<(), String>>) -> Resul
     if std::env::var("XDG_SESSION_TYPE").is_ok_and(|kind| kind == "wayland") {
         anyhow::bail!("Wayland 桌面暂不支持文件发送浮窗");
     }
-    let (connection, screen) = x11rb::connect(None).context("连接 X11 显示失败")?;
+    let (connection, screen) = crate::platform::linux::x11_connection::connect().context("连接 X11 显示失败")?;
     let root = connection.setup().roots[screen].root;
     connection.xfixes_query_version(5, 0)?.reply()?;
     let selection = connection

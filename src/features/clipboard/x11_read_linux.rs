@@ -56,7 +56,7 @@ pub(super) fn read(wayland_clipboard: bool) -> LocalSnapshot {
 }
 
 fn collect() -> Result<LocalSnapshot> {
-    let (connection, screen) = x11rb::connect(None).context("连接 X11 失败")?;
+    let (connection, screen) = crate::platform::linux::x11_connection::connect().context("连接 X11 失败")?;
     let root = connection.setup().roots[screen].root;
     let atoms = Atoms::intern(&connection)?;
     // 没人持有就没什么可读的：只有 Wayland 那侧有东西时就是这种情况。
