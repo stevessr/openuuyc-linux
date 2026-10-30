@@ -154,6 +154,7 @@ fn explain(stderr: &str) -> &'static str {
 /// One live background attach. The helper mirrors the eyes the focused scene
 /// already presents into the host-owned export; the host session aligns and
 /// encodes them. Ownership is the caller's: dropping this stops the helper.
+#[derive(Debug)]
 pub(crate) struct Attach {
     child: std::process::Child,
     stderr: Option<std::process::ChildStderr>,
@@ -166,10 +167,18 @@ impl Attach {
             export.is_absolute() && export.is_file(),
             "host stereo export must exist before attaching"
         );
-        let mut child = std::process::Command::new(install_helper()?)
+        let mut command = std::process::Command::new(install_helper()?);
+        command
             .arg("--library")
             .arg(client_library()?)
-            .env("OPENUUYC_STEREO_CAPTURE", export)
+            .env("OPENUUYC_STEREO_CAPTURE", export);
+        Self::spawn(command, Duration::from_secs(10))
+    }
+    /// Spawn a prepared helper and wait for its attach handshake. Kept apart
+    /// from [`Self::start`] so tests can drive the real process protocol with
+    /// a script instead of a SteamVR install.
+    fn spawn(mut command: std::process::Command, handshake: Duration) -> Result<Self> {
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -195,7 +204,7 @@ impl Attach {
             scene_pid: 0,
             failure: None,
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + handshake;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let outcome = if remaining.is_zero() {
@@ -310,6 +319,42 @@ mod tests {
         let mut signaled = false;
         assert!(!signal_if_running(&mut child, |_| signaled = true));
         assert!(!signaled);
+    }
+    fn script(body: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg(body);
+        command
+    }
+    #[test]
+    fn a_scene_handshake_yields_the_pid_and_a_clean_stop() {
+        let mut attach = Attach::spawn(
+            script(
+                r#"printf '{"available":true}\n{"attached":true,"scene_pid":4242}\n'; exec sleep 30"#,
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(attach.scene_pid(), 4242);
+        // The helper is still running: nothing to report yet.
+        assert!(attach.observe_failure().is_none());
+        attach.stop();
+        // stop() reaped it, so the end is now observable without a signal.
+        assert!(attach.observe_failure().is_some());
+    }
+    #[test]
+    fn an_unavailable_probe_keeps_its_openvr_error() {
+        let error = Attach::spawn(
+            script(r#"printf '{"available":false,"openvr_error":121}\n'; exec sleep 30"#),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("openvr_error=121"), "{error}");
+    }
+    #[test]
+    fn a_silent_helper_times_out_and_is_stopped() {
+        let error = Attach::spawn(script("exec sleep 30"), Duration::from_millis(250))
+            .unwrap_err();
+        assert!(error.to_string().contains("握手超时"), "{error}");
     }
 }
 /// Take this machine's single PCVR ownership lock (the same `publisher.lock`

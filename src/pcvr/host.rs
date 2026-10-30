@@ -50,6 +50,34 @@ impl Requested {
 fn started(state: &State) -> bool {
     state.socket.is_some() || state.broker.is_some() || state.attach.is_some()
 }
+/// What a `start` request means while this session already runs.
+#[derive(Debug, PartialEq, Eq)]
+enum Running {
+    /// The same live attach, or any default start: only acknowledge it.
+    Confirm,
+    /// The SteamVR helper ended and must be swapped for a new one.
+    Replace,
+    /// A tracking-only session: an explicit stop comes first.
+    Refuse,
+}
+fn running(backend: Requested, attach: Option<bool>) -> Running {
+    match (backend, attach) {
+        (Requested::Default, _) => Running::Confirm,
+        (Requested::SteamVr, Some(true)) => Running::Confirm,
+        (Requested::SteamVr, Some(false)) => Running::Replace,
+        (Requested::SteamVr, None) => Running::Refuse,
+    }
+}
+/// Whether `start_mirror` begins a session's first attach or replaces a
+/// helper that ended. Ownership, the running-session check and the failure
+/// semantics differ: a fresh attach that fails leaves nothing owned, while a
+/// failed replacement ends the degraded session instead of leaving it
+/// half-configured with a stale backend.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MirrorStart {
+    Fresh,
+    Replace,
+}
 fn tracking_fresh(last: Option<Instant>) -> bool {
     last.is_some_and(|time| time.elapsed() < Duration::from_millis(250))
 }
@@ -368,17 +396,27 @@ impl Session {
         );
         let mut state = lock(&self.state);
         if started(&state) {
-            ensure!(
-                backend != Requested::SteamVr || state.attach.is_some(),
-                "当前 VR 连接已在运行；请先停止再附加 SteamVR 场景"
-            );
-            return Ok(());
+            let live = state
+                .attach
+                .as_mut()
+                .map(|attach| attach.observe_failure().is_none());
+            match running(backend, live) {
+                Running::Confirm => return Ok(()),
+                Running::Refuse => anyhow::bail!(
+                    "当前 VR 连接已在运行（仅追踪）；请先停止再附加 SteamVR 场景"
+                ),
+                Running::Replace => {
+                    // The helper ended; a repeated request swaps in a new one.
+                    drop(state);
+                    return self.start_mirror(MirrorStart::Replace);
+                }
+            }
         }
         if backend == Requested::SteamVr {
             // The helper handshake runs outside the state lock: a slow or
             // absent SteamVR must not stall tracking, status or the worker.
             drop(state);
-            return self.start_mirror();
+            return self.start_mirror(MirrorStart::Fresh);
         }
         let root = std::path::PathBuf::from(
             std::env::var_os("XDG_RUNTIME_DIR").context("缺少 XDG_RUNTIME_DIR")?,
@@ -494,32 +532,56 @@ impl Session {
     /// session's stereo producer. The helper handshake and the cross-process
     /// ownership lock are taken first, without the state lock; only a session
     /// that is still live and tracked installs the attach.
-    fn start_mirror(&self) -> Result<()> {
+    fn start_mirror(&self, mode: MirrorStart) -> Result<()> {
         ensure!(
             super::runtime::preference()? != super::runtime::Preference::OpenXrOnly,
             "当前策略为仅内置 OpenXR；先在「此连接的 VR 后端」选择 SteamVR 再来附加"
         );
-        ensure!(
-            OWNED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "另一个会话正在使用内置 VR"
-        );
+        if mode == MirrorStart::Fresh {
+            ensure!(
+                OWNED
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok(),
+                "另一个会话正在使用内置 VR"
+            );
+        } else {
+            // Ownership is already this session's. Release the ended helper
+            // and its export before open_export() takes the flock again.
+            let mut state = lock(&self.state);
+            let ended = state.attach.take();
+            state.export = None;
+            state.publisher_lock = None;
+            drop(state);
+            drop(ended);
+        }
         let setup = super::steamvr::open_export().and_then(|(export, ownership)| {
             super::steamvr::Attach::start(export.path()).map(|attach| (export, ownership, attach))
         });
         let (export, ownership, attach) = match setup {
             Ok(setup) => setup,
             Err(error) => {
-                OWNED.store(false, Ordering::Release);
+                if mode == MirrorStart::Fresh {
+                    OWNED.store(false, Ordering::Release);
+                } else {
+                    // The request was explicit: never leave the running
+                    // session attached to a half-torn-down bridge. The
+                    // headset sees the same failure the caller returns.
+                    self.stop();
+                }
                 return Err(error);
             }
         };
         let mut state = lock(&self.state);
+        let installing = match mode {
+            // A first attach must not meet a session that already started;
+            // a replacement needs the very session it is repairing.
+            MirrorStart::Fresh => !started(&state),
+            MirrorStart::Replace => started(&state),
+        };
         if !self.allowed()
             || !self.tracking_ready.load(Ordering::Acquire)
-            || started(&state)
             || !OWNED.load(Ordering::Acquire)
+            || !installing
         {
             drop(state);
             drop(attach);
@@ -868,7 +930,20 @@ impl Session {
                 }
                 let streaming = this.stereo_streaming();
                 let status = {
-                    let state = lock(&this.state);
+                    let mut state = lock(&this.state);
+                    // "mirror" lets the headset tell a live attach from one
+                    // whose helper ended: only the latter may be re-requested
+                    // without dropping a working decoder.
+                    let mirror = match state.attach.as_mut() {
+                        None => "none",
+                        Some(attach) => {
+                            if attach.observe_failure().is_none() {
+                                "running"
+                            } else {
+                                "ended"
+                            }
+                        },
+                    };
                     let observed = send_rate.sample(
                         state.generation,
                         Instant::now(),
@@ -877,7 +952,7 @@ impl Session {
                     // `stage` is a demand of the OpenXR device bridge only
                     // (xrizer needs a floor); the mirror backend never asks.
                     let stage = state.broker.as_ref().map_or(true, |b| b.has_stage());
-                    serde_json::json!({"version":1,"id":id,"send_fps":observed,"tracking":started(&state),"tracking_version":state.tracking_version.max(1),"stage":stage,"generation":state.generation,"backend":state.backend,"stereo":streaming,"video_frames":this.sent_video_frames.load(Ordering::Relaxed),"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"video_error":state.producer_error,"target_fps":state.video_rate.refresh_hz,"captured_frames":state.captured_frames,"encoded_frames":state.encoded_frames,"external":state.external,"scene_pid":state.attach.as_ref().map_or(0,|a|a.scene_pid()),"decoder_ready":this.video_ack.load(Ordering::Acquire)==state.generation && state.generation>0,"head_valid":state.head_valid,"message":if streaming {"双眼编码帧正在发送；仍需头显确认解码与显示"} else {"等待真实合成器双眼编码帧；当前不能宣称 PCVR 可用"}})
+                    serde_json::json!({"version":1,"id":id,"send_fps":observed,"tracking":started(&state),"tracking_version":state.tracking_version.max(1),"stage":stage,"generation":state.generation,"backend":state.backend,"stereo":streaming,"video_frames":this.sent_video_frames.load(Ordering::Relaxed),"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"video_error":state.producer_error,"target_fps":state.video_rate.refresh_hz,"captured_frames":state.captured_frames,"encoded_frames":state.encoded_frames,"external":state.external,"scene_pid":state.attach.as_ref().map_or(0,|a|a.scene_pid()),"mirror":mirror,"decoder_ready":this.video_ack.load(Ordering::Acquire)==state.generation && state.generation>0,"head_valid":state.head_valid,"message":if streaming {"双眼编码帧正在发送；仍需头显确认解码与显示"} else {"等待真实合成器双眼编码帧；当前不能宣称 PCVR 可用"}})
                 };
                 let Some(ch) = weak.upgrade() else { break };
                 if ch.ready_state()
@@ -955,5 +1030,18 @@ mod stereo_async_tests {
         let unknown: ControlRequest =
             serde_json::from_str(r#"{"id":4,"op":"start","backend":"wivrn"}"#).unwrap();
         assert!(Requested::parse(Some(&unknown)).is_err());
+    }
+    #[test]
+    fn a_repeated_start_confirms_replaces_or_refuses_never_stacks() {
+        use Requested::{Default, SteamVr};
+        // A default start on any running session is only acknowledged.
+        assert_eq!(running(Default, None), Running::Confirm);
+        assert_eq!(running(Default, Some(true)), Running::Confirm);
+        assert_eq!(running(Default, Some(false)), Running::Confirm);
+        // The same live mirror is confirmed; an ended one is replaced, and a
+        // tracking-only session must be stopped explicitly first.
+        assert_eq!(running(SteamVr, Some(true)), Running::Confirm);
+        assert_eq!(running(SteamVr, Some(false)), Running::Replace);
+        assert_eq!(running(SteamVr, None), Running::Refuse);
     }
 }
