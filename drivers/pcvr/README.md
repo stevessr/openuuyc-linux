@@ -65,6 +65,10 @@ OpenVR ABI 依据 Valve 官方 SDK v2.12.14，来源与许可见 `vendor/`。下
 - PICO 沉浸菜单「应用与 VR 游戏 → 附加已有 VR 应用 → 附加 SteamVR 运行中场景」
   以 `backend:"steamvr"` 显式请求；该请求不会静默退化成仅追踪备用链路，
   失败时返回原因（未运行 SteamVR / 没有聚焦场景等）；
+- 重复请求语义（状态里的 `mirror: running/ended/none` 由头显判断）：
+  helper 仍存活时同一请求只确认、不重建；helper 已结束（SteamVR 退出等）
+  时该请求替换它并进入新的 generation（旧导出、锁与进程一并释放），失败则
+  停止已降级的会话而不是留下半配置状态；仅追踪会话必须先「停止连接」再附加；
 - 宿主在唯一 PCVR 所有权锁（跨进程 publisher.lock）下创建 0700 目录内的私有
   导出、以内嵌 helper 做最长 10 秒握手（`attached` 行意味着两面 GL 镜像纹理
   已就绪），会话停止/断连/撤销时终止 helper 并删除导出；
