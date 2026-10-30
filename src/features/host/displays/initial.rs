@@ -98,26 +98,41 @@ impl State {
         height: u32,
         lease: &Lease,
     ) -> Result<bool> {
-        let previous = self.journal.mode_changes.clone();
-        self.intend_mode(&target.identity, width, height)?;
-        match target.set_resolution(width, height, || lease.requested()) {
-            Ok(()) => Ok(true),
-            Err(error)
-                if error
-                    .downcast_ref::<display::topology::ModeTestRejected>()
-                    .is_some() =>
-            {
-                ensure!(lease.requested(), "显示操作已取消");
-                // Preflight did not modify Windows. Do not leave a fictitious
-                // desired mode for cleanup, or persist it as successfully applied.
-                self.journal.desired = None;
-                self.journal.mode_changes = previous;
-                self.save()?;
-                tracing::warn!(width, height, %error,
-                    "initial display mode rejected; retaining current mode for connection");
-                Ok(false)
+        #[cfg(not(windows))]
+        {
+            let changed = self.apply_mode_transaction(target, width, height, lease)?;
+            if !changed {
+                tracing::warn!(
+                    width,
+                    height,
+                    "initial mode did not produce a fresh frame; retaining current mode"
+                );
             }
-            Err(error) => Err(error),
+            return Ok(changed);
+        }
+        #[cfg(windows)]
+        {
+            let previous = self.journal.mode_changes.clone();
+            self.intend_mode(&target.identity, width, height)?;
+            match target.set_resolution(width, height, || lease.requested()) {
+                Ok(()) => Ok(true),
+                Err(error)
+                    if error
+                        .downcast_ref::<display::topology::ModeTestRejected>()
+                        .is_some() =>
+                {
+                    ensure!(lease.requested(), "显示操作已取消");
+                    // Preflight did not modify Windows. Do not leave a fictitious
+                    // desired mode for cleanup, or persist it as successfully applied.
+                    self.journal.desired = None;
+                    self.journal.mode_changes = previous;
+                    self.save()?;
+                    tracing::warn!(width, height, %error,
+                        "initial display mode rejected; retaining current mode for connection");
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 

@@ -9,6 +9,13 @@ pub(super) struct ModeChange {
     pub after: Option<SavedTarget>,
     pub pending: bool,
 }
+#[cfg(not(windows))]
+#[derive(Clone)]
+pub(super) struct ModeCheckpoint {
+    changes: Option<Vec<ModeChange>>,
+    desired: Option<SavedTopology>,
+    applied: Option<SavedTopology>,
+}
 
 pub(super) fn same_target(a: Option<&SavedTarget>, b: Option<&SavedTarget>) -> bool {
     match (a, b) {
@@ -231,13 +238,173 @@ impl State {
         self.journal.desired = Some(layout.clone());
         self.save()
     }
+    #[cfg(not(windows))]
+    pub(super) fn mode_checkpoint(&self) -> ModeCheckpoint {
+        ModeCheckpoint {
+            changes: self.journal.mode_changes.clone(),
+            desired: self.journal.desired.clone(),
+            applied: self.journal.applied.clone(),
+        }
+    }
+    #[cfg(not(windows))]
+    pub(super) fn restore_mode_checkpoint(&mut self, checkpoint: ModeCheckpoint) -> Result<()> {
+        self.journal.mode_changes = checkpoint.changes;
+        self.journal.desired = checkpoint.desired;
+        self.journal.applied = checkpoint.applied;
+        self.save()
+    }
+    #[cfg(not(windows))]
+    pub(super) fn observe_pending_mode(&mut self, observed: &SavedTopology) -> Result<()> {
+        if let Some(changes) = self.journal.mode_changes.as_mut() {
+            for change in changes.iter_mut().filter(|change| change.pending) {
+                let expected = change.after.as_ref();
+                let current = observed
+                    .targets
+                    .iter()
+                    .find(|target| target.identity == change.identity);
+                if let (Some(expected), Some(current)) = (expected, current)
+                    && (
+                        expected.width,
+                        expected.height,
+                        expected.left,
+                        expected.top,
+                        expected.rotation,
+                    ) == (
+                        current.width,
+                        current.height,
+                        current.left,
+                        current.top,
+                        current.rotation,
+                    )
+                {
+                    change.after = Some(current.clone());
+                }
+            }
+        }
+        self.journal.desired = Some(observed.clone());
+        self.save()
+    }
+    #[cfg(not(windows))]
+    pub(super) fn rollback_mode_transaction(
+        &mut self,
+        before: &SavedTopology,
+        after: &SavedTopology,
+        checkpoint: ModeCheckpoint,
+    ) -> Result<()> {
+        let mut transaction_changes = Vec::new();
+        record_changes(&mut transaction_changes, before, after);
+        self.journal.mode_changes = Some(transaction_changes.clone());
+        self.journal.desired = Some(after.clone());
+        self.save()?;
+
+        match self.restore_layout(before, &[], false) {
+            Ok(_) => self.restore_mode_checkpoint(checkpoint),
+            Err(error) => {
+                let current = Topology::query(true)?.snapshot()?;
+                let mut changes = checkpoint.changes.unwrap_or_default();
+                changes.retain(|change| {
+                    same_target(
+                        before
+                            .targets
+                            .iter()
+                            .find(|target| target.identity == change.identity),
+                        change.after.as_ref(),
+                    )
+                });
+                for change in transaction_changes {
+                    let before_target = before
+                        .targets
+                        .iter()
+                        .find(|target| target.identity == change.identity);
+                    let after_target = after
+                        .targets
+                        .iter()
+                        .find(|target| target.identity == change.identity);
+                    let current_target = current
+                        .targets
+                        .iter()
+                        .find(|target| target.identity == change.identity);
+                    if same_target(current_target, before_target) {
+                        continue;
+                    }
+                    if same_target(current_target, after_target) {
+                        if let Some(previous) = changes
+                            .iter_mut()
+                            .find(|previous| previous.identity == change.identity)
+                        {
+                            previous.after = current_target.cloned();
+                            previous.pending = true;
+                        } else {
+                            changes.push(ModeChange {
+                                identity: change.identity,
+                                before: before_target.cloned(),
+                                after: current_target.cloned(),
+                                pending: true,
+                            });
+                        }
+                    } else {
+                        // A partially restored or externally changed output is
+                        // no longer ours to move again during session cleanup.
+                        changes.retain(|previous| previous.identity != change.identity);
+                    }
+                }
+                self.journal.mode_changes = Some(changes);
+                self.journal.desired = Some(current);
+                self.journal.applied = checkpoint.applied;
+                self.save()?;
+                Err(error.context("display-mode rollback failed; recovery intent remains pending"))
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    pub(super) fn intend_mode(
+        &mut self,
+        identity: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<SavedTopology> {
+        let current = Topology::query(true)?.snapshot()?;
+        let mut layout = current.clone();
+        let index = layout
+            .targets
+            .iter()
+            .position(|target| target.identity == identity)
+            .context("显示目标已断开")?;
+        let old = layout.targets[index].clone();
+        let (dx, dy) = (
+            i64::from(width) - i64::from(old.width),
+            i64::from(height) - i64::from(old.height),
+        );
+        let (old_right, old_bottom) = (
+            i64::from(old.left) + i64::from(old.width),
+            i64::from(old.top) + i64::from(old.height),
+        );
+        for (other_index, other) in layout.targets.iter_mut().enumerate() {
+            if other_index == index {
+                continue;
+            }
+            if i64::from(other.left) >= old_right {
+                other.left = i32::try_from(i64::from(other.left) + dx)?;
+            }
+            if i64::from(other.top) >= old_bottom {
+                other.top = i32::try_from(i64::from(other.top) + dy)?;
+            }
+        }
+        layout.targets[index].width = width;
+        layout.targets[index].height = height;
+        // The intent includes the same adjacent-output movement as RandR apply,
+        // so the recovery guard can restore the complete transaction.
+        self.save_layout_intent(&current, &layout)?;
+        Ok(current)
+    }
+    #[cfg(windows)]
     pub(super) fn intend_mode(&mut self, identity: &str, width: u32, height: u32) -> Result<()> {
         let current = Topology::query(true)?.snapshot()?;
         let mut layout = current.clone();
         let target = layout
             .targets
             .iter_mut()
-            .find(|t| t.identity == identity)
+            .find(|target| target.identity == identity)
             .context("显示目标已断开")?;
         target.width = width;
         target.height = height;

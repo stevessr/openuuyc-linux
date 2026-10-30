@@ -470,6 +470,33 @@ fn wait(identity: &str) -> Result<capture::Screen> {
 }
 
 #[cfg(not(windows))]
+pub(super) fn wait_for_size(
+    identity: &str,
+    expected: (u32, u32),
+    timeout: Duration,
+    active: impl Fn() -> bool,
+) -> Result<capture::Screen> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        ensure!(active(), "显示操作已取消");
+        if let Ok(screens) = capture::screens()
+            && let Some(screen) = screens
+                .into_iter()
+                .find(|screen| screen.identity.as_deref() == Some(identity))
+            && (screen.width, screen.height) == expected
+        {
+            return Ok(screen);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "显示器 {identity} 未切到 {}x{}",
+            expected.0,
+            expected.1
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+#[cfg(not(windows))]
 fn verify_frame(screen: &capture::Screen) -> Result<()> {
     let _runtime = crate::features::host::encoder::Runtime::new()?;
     let mut desktop = capture::Desktop::open_selected(screen)?;
@@ -509,40 +536,86 @@ fn take_and_remove(reason: &str) -> Result<()> {
 /// 给兜底屏换分辨率。VKMS 的模式表里没有这些尺寸，只能让合成器现造一个模式；
 /// 换过的尺寸记下来，下一次按它重建。
 #[cfg(not(windows))]
-pub(super) fn resize(identity: &str, width: u32, height: u32) -> Result<capture::Screen> {
+pub(super) fn resize(
+    identity: &str,
+    width: u32,
+    height: u32,
+    active: impl Fn() -> bool,
+) -> Result<capture::Screen> {
     validate_modes(&[(width, height)])?;
     let _changing = lock(&CHANGING);
+    ensure!(active(), "显示操作已取消");
     ensure!(
         current_identity().as_deref() == Some(identity),
         "兜底屏已不在"
     );
-    crate::platform::display::compositor::set_mode(
-        crate::platform::display::topology::output_name(identity),
-        width,
-        height,
-        Some(165),
-    )?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(screens) = capture::screens()
-            && let Some(screen) = screens
-                .into_iter()
-                .find(|s| s.identity.as_deref() == Some(identity))
-            && (screen.width, screen.height) == (width, height)
-        {
-            let mut record = store::read::<Record>(&path()?)?.unwrap_or(Record {
-                width,
-                height,
-                hz: 165,
+    let before = capture::screens()?
+        .into_iter()
+        .find(|screen| screen.identity.as_deref() == Some(identity))
+        .context("兜底屏尚未进入桌面")?;
+    let previous = (before.width, before.height);
+    let mut record = store::read::<Record>(&path()?)?.unwrap_or(Record {
+        width: previous.0,
+        height: previous.1,
+        hz: 165,
+    });
+    let result = (|| -> Result<capture::Screen> {
+        ensure!(active(), "显示操作已取消");
+        let started = Instant::now();
+        crate::platform::display::compositor::set_mode(
+            crate::platform::display::topology::output_name(identity),
+            width,
+            height,
+            Some(165),
+        )?;
+        let remaining = crate::platform::display::transaction::CONFIRM_TIMEOUT
+            .saturating_sub(started.elapsed());
+        let screen = wait_for_size(identity, (width, height), remaining, || active())?;
+        let remaining = crate::platform::display::transaction::CONFIRM_TIMEOUT
+            .saturating_sub(started.elapsed());
+        super::confirm_mode_frame(&screen, (width, height), remaining, || active())?;
+        Ok(screen)
+    })();
+    let screen = match result {
+        Ok(screen) => screen,
+        Err(error) => {
+            let current = capture::screens().ok().and_then(|screens| {
+                screens
+                    .into_iter()
+                    .find(|screen| screen.identity.as_deref() == Some(identity))
             });
-            record.width = width;
-            record.height = height;
-            store::write(&path()?, &record)?;
-            return Ok(screen);
+            let still_requested = current
+                .as_ref()
+                .is_some_and(|screen| (screen.width, screen.height) == (width, height));
+            if still_requested {
+                let rollback = (|| -> Result<()> {
+                    crate::platform::display::compositor::set_mode(
+                        crate::platform::display::topology::output_name(identity),
+                        previous.0,
+                        previous.1,
+                        Some(165),
+                    )?;
+                    let restored =
+                        wait_for_size(identity, previous, Duration::from_secs(5), || true)?;
+                    super::confirm_mode_frame(&restored, previous, Duration::from_secs(3), || true)
+                })();
+                if let Err(rollback) = rollback {
+                    return Err(error.context(format!("兜底屏恢复原分辨率失败：{rollback:#}")));
+                }
+            } else if let Some(current) = current
+                && (current.width, current.height) != previous
+            {
+                record.width = current.width;
+                record.height = current.height;
+                store::write(&path()?, &record)?;
+            }
+            return Err(error);
         }
-        ensure!(Instant::now() < deadline, "兜底屏没有切到请求的分辨率");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    record.width = width;
+    record.height = height;
+    store::write(&path()?, &record)?;
+    Ok(screen)
 }
 
 #[cfg(not(windows))]

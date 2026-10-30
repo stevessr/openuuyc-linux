@@ -7,7 +7,7 @@ UUWay 是 Wine 桥接被控端；本项目保留原生 Rust 架构，不直接�
 
 | 模块 | 当前入口 | 后续验收/缺口 |
 | --- | --- | --- |
-| 显示管理 DM | platform/linux/display | 多屏切换、模式切换失败回滚、缩放 |
+| 显示管理 DM | platform/linux/display | Xorg 物理模式及 niri 虚拟/兜底模式切换均需目标屏新尺寸首帧确认；30 秒未确认回滚；缩放仍缺 |
 | 虚拟显示器 | platform/linux/virtual_display | 当前合成器接管主要为 niri；GNOME/KDE 需独立后端 |
 | GPU 视频 | decoder/vaapi、video_layer、encoder | 默认 DMA-BUF、失败回退；跨 GPU、modifier、同步与花屏实测 |
 | 音频 | media/audio、linux/loopback | 同采样率减拷贝；录放设备切换、断线恢复 |

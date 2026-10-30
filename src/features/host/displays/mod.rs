@@ -648,22 +648,10 @@ impl Session {
             // 兜底屏同样不在 VKMS 的模式表里，改尺寸要走合成器。
             if fallback::identity().as_deref() == Some(target.identity.as_str()) {
                 ensure!(lease.requested(), "显示操作已取消");
-                return fallback::resize(&target.identity, width, height);
+                return fallback::resize(&target.identity, width, height, || lease.requested());
             }
-            state.begin()?;
-            let previous = state.journal.mode_changes.clone();
-            state.intend_mode(&target.identity, width, height)?;
-            if let Err(error) = target.set_resolution(width, height, || lease.requested()) {
-                if error
-                    .downcast_ref::<display::topology::ModeTestRejected>()
-                    .is_some()
-                {
-                    state.journal.mode_changes = previous;
-                    state.journal.desired = None;
-                    state.save()?;
-                }
-                return Err(error);
-            }
+            let changed = state.apply_mode_transaction(&target, width, height, lease)?;
+            ensure!(changed, "显示模式未确认，原显示布局已恢复");
             state.applied()?;
             state.remember_physical(&target.identity, None)?;
             find_screen(&target.identity)
@@ -864,6 +852,49 @@ fn find_screen(identity: &str) -> Result<capture::Screen> {
         .into_iter()
         .find(|s| s.identity.as_deref() == Some(identity))
         .context("显示目标尚未进入桌面")
+}
+#[cfg(not(windows))]
+pub(super) fn confirm_mode_frame(
+    screen: &capture::Screen,
+    expected: (u32, u32),
+    timeout: Duration,
+    active: impl Fn() -> bool,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut confirmation =
+        display::transaction::FrameConfirmation::applied(expected, started, timeout);
+    let _runtime = crate::features::host::encoder::Runtime::new()?;
+    let mut desktop = capture::Desktop::open_selected(screen)?;
+    while !confirmation.rollback_due(std::time::Instant::now()) {
+        ensure!(active(), "显示操作已取消");
+        if desktop
+            .next(20, 4, false, false, (u32::MAX, u32::MAX))?
+            .is_some()
+            && desktop.available
+        {
+            let now = std::time::Instant::now();
+            if confirmation.observe_frame(now, (desktop.screen.width, desktop.screen.height)) {
+                tracing::info!(
+                    screen = ?screen.identity,
+                    backend = desktop.backend_name(),
+                    width = expected.0,
+                    height = expected.1,
+                    "display mode confirmed by a fresh frame"
+                );
+                return Ok(());
+            }
+        }
+        if confirmation.rollback_due(std::time::Instant::now()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(display::transaction::FrameUnconfirmed {
+        width: expected.0,
+        height: expected.1,
+        timeout,
+    }
+    .into())
 }
 fn restore_dpi(values: &[(String, u32)]) -> Result<()> {
     let targets = Topology::query(true)?.metadata()?;
@@ -1114,6 +1145,83 @@ impl State {
         self.journal.desired_dpi.clear();
         self.save()
     }
+    #[cfg(not(windows))]
+    fn apply_mode_transaction(
+        &mut self,
+        target: &Target,
+        width: u32,
+        height: u32,
+        lease: &Lease,
+    ) -> Result<bool> {
+        self.begin()?;
+        let checkpoint = self.mode_checkpoint();
+        let before = self.intend_mode(&target.identity, width, height)?;
+        if let Err(error) = target.set_resolution(width, height, || lease.requested()) {
+            if error
+                .downcast_ref::<display::topology::ModeTestRejected>()
+                .is_some()
+            {
+                self.restore_mode_checkpoint(checkpoint)?;
+                return Ok(false);
+            }
+            let expected_after = self
+                .journal
+                .desired
+                .clone()
+                .unwrap_or_else(|| before.clone());
+            let after = Topology::query(true)
+                .and_then(|topology| topology.snapshot())
+                .unwrap_or(expected_after);
+            if let Err(rollback) = self.rollback_mode_transaction(&before, &after, checkpoint) {
+                return Err(error.context(format!("无法恢复显示模式：{rollback:#}")));
+            }
+            return Err(error);
+        }
+        let after = match Topology::query(true).and_then(|topology| topology.snapshot()) {
+            Ok(after) => after,
+            Err(error) => {
+                let expected_after = self
+                    .journal
+                    .desired
+                    .clone()
+                    .unwrap_or_else(|| before.clone());
+                if let Err(rollback) =
+                    self.rollback_mode_transaction(&before, &expected_after, checkpoint)
+                {
+                    return Err(error.context(format!("无法恢复显示模式：{rollback:#}")));
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.observe_pending_mode(&after) {
+            if let Err(rollback) = self.rollback_mode_transaction(&before, &after, checkpoint) {
+                return Err(error.context(format!("无法恢复显示模式：{rollback:#}")));
+            }
+            return Err(error);
+        }
+        let confirmation = find_screen(&target.identity).and_then(|screen| {
+            confirm_mode_frame(
+                &screen,
+                (width, height),
+                display::transaction::CONFIRM_TIMEOUT,
+                || lease.requested(),
+            )
+        });
+        if let Err(error) = confirmation {
+            let unconfirmed = error
+                .downcast_ref::<display::transaction::FrameUnconfirmed>()
+                .is_some();
+            if let Err(rollback) = self.rollback_mode_transaction(&before, &after, checkpoint) {
+                return Err(error.context(format!("无法恢复显示模式：{rollback:#}")));
+            }
+            if unconfirmed {
+                tracing::warn!(identity = %target.identity, width, height, "未收到新分辨率画面，已恢复原显示布局");
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        Ok(true)
+    }
     fn driver(&mut self) -> Result<&Heartbeat> {
         if self.driver.is_none() {
             let instance = Driver::device_instance()?;
@@ -1334,31 +1442,72 @@ impl State {
     ) -> Result<capture::Screen> {
         let index = self.owned_index(identity)?;
         let hz = self.journal.owned[index].hz;
-        // 合成器认的是输出名（连接器名），不是屏幕清单里的 identity。
-        compositor::set_mode(topology::output_name(identity), width, height, Some(hz))?;
-        // 合成器说成功不等于显示器真的换了模式，所以只认观察到的尺寸。等不到就是
-        // 失败——这比让主控以为切成功了要好。
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            ensure!(lease.requested(), "显示操作已取消");
-            if let Ok(screen) = find_screen(identity)
-                && (screen.width, screen.height) == (width, height)
-            {
+        let before = find_screen(identity).context("虚拟屏尚未进入桌面")?;
+        let previous = (before.width, before.height);
+        let result = (|| -> Result<capture::Screen> {
+            let started = std::time::Instant::now();
+            compositor::set_mode(topology::output_name(identity), width, height, Some(hz))?;
+            let remaining = display::transaction::CONFIRM_TIMEOUT.saturating_sub(started.elapsed());
+            let screen = fallback::wait_for_size(identity, (width, height), remaining, || {
+                lease.requested()
+            })?;
+            let remaining = display::transaction::CONFIRM_TIMEOUT.saturating_sub(started.elapsed());
+            confirm_mode_frame(&screen, (width, height), remaining, || lease.requested())?;
+            Ok(screen)
+        })();
+        match result {
+            Ok(screen) => {
                 let record = &mut self.journal.owned[index];
                 record.width = width;
                 record.height = height;
                 if !record.modes.contains(&(width, height)) {
                     record.modes.push((width, height));
                 }
-                // 和 Windows 一样把新尺寸留下来：下次连接重建这块屏时用的就是它。
                 self.update_preferences()?;
-                return Ok(screen);
+                Ok(screen)
             }
-            ensure!(
-                std::time::Instant::now() < deadline,
-                "显示器没有切到请求的分辨率"
-            );
-            std::thread::sleep(Duration::from_millis(50));
+            Err(error) => {
+                let current = find_screen(identity).ok();
+                let still_requested = current
+                    .as_ref()
+                    .is_some_and(|screen| (screen.width, screen.height) == (width, height));
+                let mut record_changed = false;
+                if still_requested {
+                    let rollback = (|| -> Result<()> {
+                        compositor::set_mode(
+                            topology::output_name(identity),
+                            previous.0,
+                            previous.1,
+                            Some(hz),
+                        )?;
+                        let restored = fallback::wait_for_size(
+                            identity,
+                            previous,
+                            Duration::from_secs(5),
+                            || true,
+                        )?;
+                        confirm_mode_frame(&restored, previous, Duration::from_secs(3), || true)
+                    })();
+                    if let Err(rollback) = rollback {
+                        return Err(error.context(format!("虚拟屏恢复原分辨率失败：{rollback:#}")));
+                    }
+                    let record = &mut self.journal.owned[index];
+                    record.width = previous.0;
+                    record.height = previous.1;
+                    record_changed = true;
+                } else if let Some(current) = current
+                    && (current.width, current.height) != previous
+                {
+                    let record = &mut self.journal.owned[index];
+                    record.width = current.width;
+                    record.height = current.height;
+                    record_changed = true;
+                }
+                if record_changed && let Err(update) = self.update_preferences() {
+                    tracing::warn!(%update, identity, "failed to persist observed virtual display mode");
+                }
+                Err(error)
+            }
         }
     }
 
