@@ -5,11 +5,28 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use webrtc::data_channel::{RTCDataChannel, data_channel_state::RTCDataChannelState};
 pub(crate) const CHANNEL: &str = "OPENUUYC_TERMINAL_V1";
+#[derive(Debug, PartialEq, Eq)]
+enum SendGate {
+    Send,
+    Wait,
+    Stop,
+}
+fn send_gate(open: bool, buffered: usize, wait: std::time::Duration) -> SendGate {
+    if !open || wait >= std::time::Duration::from_secs(2) {
+        SendGate::Stop
+    } else if buffered > 512 * 1024 {
+        SendGate::Wait
+    } else {
+        SendGate::Send
+    }
+}
 #[derive(Clone)]
 pub(crate) struct Terminal(Arc<Mutex<State>>);
 struct State {
     tx: Option<mpsc::Sender<Vec<u8>>>,
     channel: Option<std::sync::Weak<RTCDataChannel>>,
+    cols: u16,
+    rows: u16,
     handle: u32,
     active: bool,
     pending: bool,
@@ -24,6 +41,8 @@ impl Default for Terminal {
         Self(Arc::new(Mutex::new(State {
             tx: None,
             channel: None,
+            cols: 80,
+            rows: 24,
             handle: 0,
             active: false,
             pending: false,
@@ -65,14 +84,40 @@ impl Terminal {
             Box::pin(async {})
         }));
         let weak = Arc::downgrade(channel);
+        let failed = self.clone();
         tokio::spawn(async move {
             while let Some(bytes) = rx.recv().await {
-                let Some(ch) = weak.upgrade() else { break };
-                if ch.ready_state() != RTCDataChannelState::Open
-                    || ch.buffered_amount().await > 512 * 1024
-                    || ch.send(&Bytes::from(bytes)).await.is_err()
-                {
+                let Some(ch) = weak.upgrade() else {
+                    failed.disconnected();
                     break;
+                };
+                let started = std::time::Instant::now();
+                loop {
+                    match send_gate(
+                        ch.ready_state() == RTCDataChannelState::Open,
+                        ch.buffered_amount().await,
+                        started.elapsed(),
+                    ) {
+                        SendGate::Wait => {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await
+                        }
+                        SendGate::Send => {
+                            if ch.send(&Bytes::from(bytes)).await.is_err() {
+                                failed.disconnected();
+                                return;
+                            }
+                            break;
+                        }
+                        SendGate::Stop => {
+                            // Only this optional channel is closed. Never cancel
+                            // the desktop peer, nor pretend the queued input ran.
+                            failed.disconnected();
+                            failed.lock().status =
+                                "终端发送拥塞或断开，最后输入未确认；Shell 状态待确认".into();
+                            let _ = ch.close().await;
+                            return;
+                        }
+                    }
                 }
             }
         });
@@ -138,17 +183,20 @@ impl Terminal {
         s.pending = false;
         s.visible = false;
         s.input.clear();
-        s.parser = vt100::Parser::new(24, 80, 500);
+        s.parser = vt100::Parser::new(s.rows, s.cols, 500);
     }
     pub(crate) fn disconnected(&self) {
         let mut s = self.lock();
+        let was_connected = s.tx.is_some() || s.channel.is_some();
         s.tx = None;
         s.channel = None;
         s.active = false;
         s.pending = false;
         s.input.clear();
-        s.parser = vt100::Parser::new(24, 80, 500);
-        s.status = "终端连接已结束".into();
+        s.parser = vt100::Parser::new(s.rows, s.cols, 500);
+        if was_connected {
+            s.status = "终端连接已结束".into();
+        }
     }
     fn open(&self) {
         let mut s = self.lock();
@@ -168,7 +216,11 @@ impl Terminal {
         if Self::send(
             &s,
             FrameType::Open,
-            br#"{"cols":80,"rows":24,"name":"OpenUUYC"}"#,
+            serde_json::to_string(
+                &serde_json::json!({"cols":s.cols,"rows":s.rows,"name":"OpenUUYC"}),
+            )
+            .unwrap()
+            .as_bytes(),
         ) {
             s.pending = true;
             s.started = Some(std::time::Instant::now());
@@ -221,6 +273,30 @@ impl Terminal {
                             .selectable(true),
                     );
                 });
+                ui.horizontal(|ui| {
+                    for (cols, rows) in [(80u16, 24u16), (100, 30), (120, 36)] {
+                        if ui
+                            .add_enabled(!pending, egui::Button::new(format!("{cols}×{rows}")))
+                            .clicked()
+                        {
+                            let mut s = self.lock();
+                            let payload = serde_json::json!({"cols":cols,"rows":rows}).to_string();
+                            if !s.active || Self::send(&s, FrameType::Resize, payload.as_bytes()) {
+                                s.cols = cols;
+                                s.rows = rows;
+                                s.parser.screen_mut().set_size(rows, cols);
+                                s.status = if s.active {
+                                    "终端尺寸已请求（协议无独立尺寸确认）"
+                                } else {
+                                    "已选择下一 Shell 的终端尺寸"
+                                }
+                                .into();
+                            } else {
+                                s.status = "终端尺寸未发送".into();
+                            }
+                        }
+                    }
+                });
                 ui.add_enabled_ui(active, |ui| {
                     ui.horizontal(|ui| {
                         let response = ui.add(
@@ -272,6 +348,20 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn temporary_backpressure_waits_but_timeout_and_disconnect_stop() {
+        use std::time::Duration;
+        assert_eq!(send_gate(true, 512 * 1024, Duration::ZERO), SendGate::Send);
+        assert_eq!(
+            send_gate(true, 512 * 1024 + 1, Duration::from_millis(500)),
+            SendGate::Wait
+        );
+        assert_eq!(
+            send_gate(true, 512 * 1024 + 1, Duration::from_secs(2)),
+            SendGate::Stop
+        );
+        assert_eq!(send_gate(false, 0, Duration::ZERO), SendGate::Stop);
+    }
     #[test]
     fn optional_terminal_cancellation_cannot_cancel_desktop() {
         let desktop = tokio_util::sync::CancellationToken::new();
