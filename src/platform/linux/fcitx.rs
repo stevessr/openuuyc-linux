@@ -20,6 +20,7 @@
 //! bridge: the protocol here is the stock Fcitx D-Bus interface, verified
 //! against the local `fcitx5 5.1.23` build.
 use anyhow::{Context as _, Result, ensure};
+use std::sync::{Arc, LazyLock, Mutex};
 use zbus::blocking::{Connection, Proxy};
 
 /// The service every Fcitx5 session registers, including KDE's and GNOME's.
@@ -32,10 +33,72 @@ const INTERFACE: &str = "org.fcitx.Fcitx.InputMethod1";
 /// The per-context interface returned alongside the object path.
 const CONTEXT_INTERFACE: &str = "org.fcitx.Fcitx.InputContext1";
 
-/// One short-lived input context. Dropping it closes the D-Bus connection,
-/// which also makes Fcitx destroy the context on its own.
+/// This client sends committed strings only: it offers no preedit, key-event,
+/// or surrounding-text support to the input method.
+const CAPABILITY_FLAGS: u64 = 0;
+
+/// zbus does not share `Connection::session()` automatically. Reuse one bus
+/// connection, replacing it when the underlying socket has closed.
+struct ConnectionCache<T> {
+    current: Mutex<Option<Arc<T>>>,
+}
+
+impl<T> Default for ConnectionCache<T> {
+    fn default() -> Self {
+        Self {
+            current: Mutex::new(None),
+        }
+    }
+}
+
+impl<T> ConnectionCache<T> {
+    fn get_or_try_init(
+        &self,
+        usable: impl FnOnce(&T) -> bool,
+        create: impl FnOnce() -> Result<T>,
+    ) -> Result<Arc<T>> {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(connection) = current.as_ref()
+            && usable(connection)
+        {
+            return Ok(connection.clone());
+        }
+        let connection = Arc::new(create()?);
+        *current = Some(connection.clone());
+        Ok(connection)
+    }
+
+    /// An old request must not evict a newer connection installed meanwhile.
+    fn invalidate(&self, connection: &Arc<T>) {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, connection))
+        {
+            *current = None;
+        }
+    }
+}
+
+static SESSION: LazyLock<ConnectionCache<Connection>> = LazyLock::new(ConnectionCache::default);
+
+fn session_connection() -> Result<Arc<Connection>> {
+    SESSION.get_or_try_init(
+        |connection| !connection.is_closed(),
+        || Connection::session().context("连接会话总线失败"),
+    )
+}
+
+fn invalidate_if_closed(connection: &Arc<Connection>) {
+    if connection.is_closed() {
+        SESSION.invalidate(connection);
+    }
+}
+
+/// One short-lived input context. The cached D-Bus connection is shared, but
+/// the focused input context is explicitly destroyed after each text commit.
 pub(crate) struct Context {
-    connection: Connection,
+    connection: Arc<Connection>,
     path: zbus::zvariant::OwnedObjectPath,
 }
 
@@ -44,21 +107,34 @@ impl Context {
     /// has the desktop's input focus. Fails (and the caller falls back) when
     /// no Fcitx-compatible daemon is on the session bus.
     pub(crate) fn open() -> Result<Self> {
-        let connection = Connection::session().context("连接会话总线失败")?;
+        let connection = session_connection()?;
         let proxy = Proxy::new(&connection, SERVICE, PATH, INTERFACE)
             .context("输入法的 D-Bus 门户不可用")?;
         // (program, display) pairs; `program` shows up in Fcitx's own UI, the
         // display name is informational. Only the values matter to the daemon.
         // The reply is `(objectpath ay)`: owned types keep the lifetime
         // inference from tying the response to the borrowed body.
-        let (path, _uuid): (zbus::zvariant::OwnedObjectPath, Vec<u8>) = proxy
-            .call("CreateInputContext", &(("program", "OpenUUYC"),))
-            .context("输入法门户拒绝了新的输入上下文")?;
+        let created = proxy.call("CreateInputContext", &(("program", "OpenUUYC"),));
+        let (path, _uuid): (zbus::zvariant::OwnedObjectPath, Vec<u8>) = match created {
+            Ok(reply) => reply,
+            Err(error) => {
+                invalidate_if_closed(&connection);
+                return Err(error).context("输入法门户拒绝了新的输入上下文");
+            }
+        };
         ensure!(
             path.as_str()
                 .starts_with("/org/freedesktop/portal/inputcontext/"),
             "输入法门户返回了意外的对象路径"
         );
+        let context = Proxy::new(&connection, SERVICE, path.as_str(), CONTEXT_INTERFACE)
+            .context("输入上下文接口不可用")?;
+        if let Err(error) = context.call::<_, _, ()>("SetCapability", &(CAPABILITY_FLAGS,)) {
+            let _ = context.call::<_, _, ()>("DestroyIC", &());
+            invalidate_if_closed(&connection);
+            return Err(error).context("无法设置输入法上下文能力");
+        }
+        drop(context);
         Ok(Self { connection, path })
     }
 
@@ -81,16 +157,18 @@ impl Context {
             CONTEXT_INTERFACE,
         )
         .context("输入上下文接口不可用")?;
-        proxy
-            .call::<_, _, ()>("FocusIn", &())
-            .context("输入上下文无法取得焦点")?;
-        proxy
-            .call::<_, _, ()>("CommitString", &(text,))
-            .context("文字提交失败")?;
+        if let Err(error) = proxy.call::<_, _, ()>("FocusIn", &()) {
+            invalidate_if_closed(&self.connection);
+            return Err(error).context("输入上下文无法取得焦点");
+        }
+        if let Err(error) = proxy.call::<_, _, ()>("CommitString", &(text,)) {
+            invalidate_if_closed(&self.connection);
+            return Err(error).context("文字提交失败");
+        }
         Ok(())
     }
 
-    /// Release the context without waiting for the connection to be dropped.
+    /// Release the context without closing the shared session-bus connection.
     pub(crate) fn destroy(&self) -> Result<()> {
         let proxy = Proxy::new(
             &self.connection,
@@ -98,7 +176,9 @@ impl Context {
             self.path.as_str(),
             CONTEXT_INTERFACE,
         )?;
-        proxy.call::<_, _, ()>("DestroyIC", &()).ok();
+        if proxy.call::<_, _, ()>("DestroyIC", &()).is_err() {
+            invalidate_if_closed(&self.connection);
+        }
         Ok(())
     }
 }
@@ -107,19 +187,50 @@ impl Context {
 mod tests {
     use super::*;
 
-    /// No live Fcitx daemon in the test environment: `open` must fail with a
-    /// clear reason rather than silently half-succeed.
+    /// A Fcitx-compatible daemon may or may not be present. If it is, the
+    /// test creates and explicitly destroys an empty context without typing.
     #[test]
-    fn opening_without_a_daemon_fails() {
-        // The CI/dev shells usually have no session bus; when one exists
-        // (a developer's desktop), the probe still must not type anything.
-        let result = Context::open();
-        // Either outcome is fine as long as nothing was committed: the
-        // connection may be refused, or a daemon may exist.
-        if let Ok(context) = result {
-            // A daemon is present; make sure its context is not left around.
-            let _ = context.destroy();
+    fn opening_and_destroying_an_empty_context_is_safe() {
+        if let Ok(context) = Context::open() {
+            assert!(context.destroy().is_ok());
         }
+    }
+
+    #[test]
+    fn cached_connection_is_reused_and_closed_connections_are_replaced() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cache: ConnectionCache<AtomicBool> = ConnectionCache::default();
+        let first = cache
+            .get_or_try_init(
+                |connection| connection.load(Ordering::SeqCst),
+                || Ok(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let reused = cache
+            .get_or_try_init(
+                |connection| connection.load(Ordering::SeqCst),
+                || Ok(AtomicBool::new(false)),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+
+        first.store(false, Ordering::SeqCst);
+        let replacement = cache
+            .get_or_try_init(
+                |connection| connection.load(Ordering::SeqCst),
+                || Ok(AtomicBool::new(true)),
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &replacement));
+        cache.invalidate(&first);
+        let still_cached = cache
+            .get_or_try_init(
+                |connection| connection.load(Ordering::SeqCst),
+                || Ok(AtomicBool::new(false)),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&replacement, &still_cached));
     }
 
     #[test]
@@ -128,14 +239,11 @@ mod tests {
         // reaching the daemon, so no input context here ever gets created
         // and nothing can be typed into the developer's own windows.
         let context = Context {
-            connection: Connection::session().expect("session bus"),
+            connection: session_connection().expect("session bus"),
             path: "/org/freedesktop/portal/inputcontext/0"
                 .try_into()
                 .expect("static object path"),
         };
         assert!(context.commit("").is_err());
-        // The daemon (when present) answers "unknown object" for the fake
-        // path; the assertion holds either way.
-        let _ = context.commit("ok").is_err();
     }
 }

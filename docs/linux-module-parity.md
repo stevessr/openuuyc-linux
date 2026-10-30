@@ -13,7 +13,7 @@ UUWay 是 Wine 桥接被控端；本项目保留原生 Rust 架构，不直接�
 | 音频 | media/audio、linux/loopback | 同采样率减拷贝；录放设备切换、断线恢复 |
 | 虚拟麦克风 | linux/virtual_audio | 当前明确不支持，需实现 PipeWire source 与生命周期 |
 | 键鼠/触摸 | linux/input、features/remote_input | 权限拒绝、焦点、断开释放按键、多点触摸 |
-| 中文输入 | linux/input | 已接输入法门户（Fcitx5 D-Bus `CreateInputContext` → `CommitString`），缺真实桌面提交验收 |
+| 中文输入 | linux/input | 已接 Fcitx5 门户，连接复用并在断开后重建；每条文本用独立短时上下文，缺真实桌面提交验收 |
 | 光标 | linux/cursor_shape、features/remote_cursor | 形状、热点、缩放、多屏边界 |
 | 剪贴板 | features/clipboard | 双向文本、循环抑制、Wayland 权限 |
 | 文件传输 | features/file_transfer、linux/transfer | 双向目录、取消、冲突、路径安全 |
@@ -55,18 +55,17 @@ PTY 专项 10 项通过，连续 5 轮复测通过。尚未验证跨设备应用
 
 ### 输入法门户文字提交
 
-Linux 被控端的手机输入法文字（`Event::Text`）现在先经
-`org.freedesktop.portal.Fcitx`（fcitx5 / 深度输入法等实现）的
-`CreateInputContext` → `FocusIn` → `CommitString` → `DestroyIC` 提交，
-落点由输入法自己决定：当前聚焦的输入框。这条通路不触碰剪贴板、不发合成按键、
-也不写日志；输入法不在或调用被拒时按序回退 `zwp_virtual_keyboard`（Wayland
-原生窗口）与 XTest（XWayland / Xorg），行为与之前一致。
+Linux 被控端的手机输入法文字（`Event::Text`）先经
+`org.freedesktop.portal.Fcitx`（fcitx5 / 深度输入法等实现）的门户通路。进程复用
+session D-Bus 连接，连接关闭后下次调用重建；每条文字都建立独立上下文，按
+`CreateInputContext` → `SetCapability(0)` → `FocusIn` → `CommitString` → `DestroyIC`
+提交。零能力位表示本客户端不提供预编辑、键盘事件或周边文本。落点由输入法决定：
+当前聚焦的输入框。这条通路不触碰剪贴板、不发合成按键、也不写日志；门户不可用时
+按序回退 `zwp_virtual_keyboard`（Wayland 原生窗口）与 XTest（XWayland / Xorg）。
 
-2026-10-30 本机验证：fcitx5 5.1.23 上 `CreateInputContext`、`FocusIn`、
-`SetCapability`、`FocusOut`、`DestroyIC` 全部按预期应答，探针上下文在连接
-关闭后由输入法自行回收；Rust 单元测试 2 项通过（无守护进程时 `open` 明确失败、
-空文本在任何守护进程调用前被拒绝）。尚未在真实远程会话中验证文字落入目标输入框、
-与合成类输入法（如 rime）的候选状态交互，及 KDE/GNOME 其他实现。
+2026-10-30 本机验证：fcitx5 5.1.23 上门户生命周期及 `SetCapability(0)` 应答正常；
+Rust 单元测试覆盖缓存复用/失效与零文本拒绝（共 3 项）。尚未在真实远程会话中验证
+文字落入目标输入框、与合成类输入法（如 rime）的候选状态交互，及 KDE/GNOME 其他实现。
 
 ## MR 双向控制入口
 
