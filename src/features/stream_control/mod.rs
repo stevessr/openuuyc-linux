@@ -153,7 +153,7 @@ pub struct StreamControlSettings {
 }
 
 pub(crate) fn default_auto_quality() -> i32 {
-    VIDEO_QUALITY_GENERAL
+    VIDEO_QUALITY_HD
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,7 +251,7 @@ impl StreamControlPreferences {
             auto_frame_quality: if settings.quality == StreamQuality::Auto {
                 saved.auto_frame_quality
             } else {
-                VIDEO_QUALITY_GENERAL
+                default_auto_quality()
             },
         }
     }
@@ -558,7 +558,7 @@ impl StreamControlHandle {
                 requested_fps: profile.stream_fps,
                 fps_count,
                 frame_quality: VIDEO_QUALITY_AUTO,
-                auto_frame_quality: VIDEO_QUALITY_GENERAL,
+                auto_frame_quality: VIDEO_QUALITY_HD,
                 // Independent CursorShape coordinates are only sampled at
                 // shape changes. Watching needs capture-side cursor motion.
                 cursor_capture: true,
@@ -600,7 +600,7 @@ impl StreamControlHandle {
                     custom_bitrate_mbps: DEFAULT_CUSTOM_BITRATE_MBPS,
                 },
                 audio: None,
-                auto_frame_quality: VIDEO_QUALITY_GENERAL,
+                auto_frame_quality: VIDEO_QUALITY_HD,
             },
             pending_capture_preferences: VecDeque::new(),
             user_settings_requested: false,
