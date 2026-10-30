@@ -10,6 +10,15 @@ class OptionsTests(unittest.TestCase):
         self.assertEqual(out,m.edit(out,438100,'env A="a b" %command%'))
     def test_custom_options_are_not_destroyed(self):
         with self.assertRaises(ValueError):m.edit(self.config.replace('"Playtime" "20"','"LaunchOptions" "--no-vr"'),438100,'new')
+    def test_exact_generated_upgrade_preserves_custom_options(self):
+        old='env XR_RUNTIME_JSON="/old/runtime.json" %command%'
+        new='env XR_RUNTIME_JSON="/new/runtime.json" %command%'
+        original=m.edit(self.config,438100,old)
+        upgraded=m.edit(original,438100,new,old)
+        self.assertEqual(upgraded,m.edit(self.config,438100,new))
+        with self.assertRaises(ValueError):m.edit(original,438100,new,old+' --different')
+        customized=m.edit(self.config,438100,old+' --custom')
+        with self.assertRaises(ValueError):m.edit(customized,438100,new,old)
     def test_verified_backup(self):
         with tempfile.TemporaryDirectory() as directory:
             root=pathlib.Path(directory);p=root/'user/config/localconfig.vdf';p.parent.mkdir(parents=True);p.write_text(self.config)

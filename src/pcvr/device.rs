@@ -18,6 +18,8 @@ pub(crate) struct Calibration {
     pub eye_height: u32,
     pub refresh_hz: f32,
     pub views: [f32; 22],
+    /// Actual STAGE origin expressed in headset LOCAL: xyz, xyzw. Never invented.
+    pub stage: Option<[f32; 7]>,
 }
 impl Calibration {
     pub fn validate(&self) -> Result<()> {
@@ -42,6 +44,14 @@ impl Calibration {
                 "眼部 FOV 无效"
             );
         }
+        if let Some(stage) = self.stage {
+            ensure!(
+                stage.iter().all(|v| v.is_finite()) && stage[..3].iter().all(|v| v.abs() <= 1000.0),
+                "无效地面空间变换"
+            );
+            let norm: f32 = stage[3..].iter().map(|v| v * v).sum();
+            ensure!((0.98..=1.02).contains(&norm), "无效地面空间旋转");
+        }
         let ipd = (0..3)
             .map(|i| (self.views[i] - self.views[11 + i]).powi(2))
             .sum::<f32>()
@@ -58,6 +68,7 @@ pub(crate) struct Broker {
     generation: u64,
     sequence: u64,
     calibration: Calibration,
+    haptics: super::haptics::Endpoint,
 }
 // SAFETY: mapping/file descriptors are exclusively owned and all access is serialized by Session.state.
 unsafe impl Send for Broker {}
@@ -108,6 +119,7 @@ impl Broker {
             unsafe { libc::flock(ownership.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "其他进程正在发布 VR 姿态"
         );
+        let haptics = super::haptics::Endpoint::bind(&dir)?;
         let path = dir.join("device.shm");
         if path.exists() {
             use std::io::Read;
@@ -163,18 +175,26 @@ impl Broker {
             generation,
             sequence: 0,
             calibration,
+            haptics,
         };
         broker.publish(&[0; 224], false)?;
         Ok(broker)
     }
+    pub fn has_stage(&self) -> bool {
+        self.calibration.stage.is_some()
+    }
+    pub fn haptics(&self) -> [Option<super::haptics::Pulse>; 2] {
+        self.haptics.latest(self.generation)
+    }
     pub fn publish(&mut self, tracking: &[u8], valid: bool) -> Result<()> {
-        ensure!(tracking.len() == 224, "追踪帧大小错误");
+        ensure!(matches!(tracking.len(), 224 | 400), "追踪帧大小错误");
         if valid {
             super::protocol::sequence(tracking)?;
         }
-        let mut snapshot = [0u8; 360];
+        let mut snapshot = [0u8; 568];
         snapshot[..4].copy_from_slice(b"OUXD");
-        snapshot[4..8].copy_from_slice(&1u32.to_le_bytes());
+        snapshot[4..8]
+            .copy_from_slice(&(if tracking.len() == 400 { 2u32 } else { 1u32 }).to_le_bytes());
         snapshot[16..24].copy_from_slice(&self.generation.to_le_bytes());
         snapshot[24..32].copy_from_slice(&(if valid { monotonic() } else { 0 }).to_le_bytes());
         snapshot[32..36].copy_from_slice(&self.calibration.eye_width.to_le_bytes());
@@ -183,7 +203,13 @@ impl Broker {
         for (i, v) in self.calibration.views.iter().enumerate() {
             snapshot[48 + i * 4..52 + i * 4].copy_from_slice(&v.to_le_bytes());
         }
-        snapshot[136..].copy_from_slice(tracking);
+        snapshot[136..136 + tracking.len()].copy_from_slice(tracking);
+        if let Some(stage) = self.calibration.stage {
+            snapshot[44..48].copy_from_slice(&1u32.to_le_bytes());
+            for (i, v) in stage.iter().enumerate() {
+                snapshot[536 + i * 4..540 + i * 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
         self.sequence = self.sequence.wrapping_add(2);
         // SAFETY: page alignment ensures AtomicU64 alignment; no Rust alias escapes.
         unsafe {
@@ -232,7 +258,60 @@ mod tests {
             eye_height: 1024,
             refresh_hz: 90.,
             views,
+            stage: None,
         }
+    }
+    #[test]
+    fn v2_snapshot_keeps_real_controller_tail_and_clears_it_on_v1_fallback() {
+        let root = std::env::temp_dir().join(format!("ouxd-v2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut broker = Broker::create(&root, calibration()).unwrap();
+        let mut frame = [0u8; 400];
+        frame[..4].copy_from_slice(b"OUVR");
+        frame[4] = 2;
+        frame[8] = 1;
+        frame[352] = 127;
+        frame[360..364].copy_from_slice(&0.7f32.to_le_bytes());
+        broker.publish(&frame, true).unwrap();
+        let snapshot = std::fs::read(&broker.path).unwrap();
+        assert_eq!(&snapshot[4..8], &2u32.to_le_bytes());
+        assert_eq!(&snapshot[136..536], &frame);
+        let mut old = [0u8; 224];
+        old[..4].copy_from_slice(b"OUVR");
+        old[4] = 1;
+        old[8] = 2;
+        broker.publish(&old, true).unwrap();
+        let snapshot = std::fs::read(&broker.path).unwrap();
+        assert_eq!(&snapshot[4..8], &1u32.to_le_bytes());
+        assert!(snapshot[360..536].iter().all(|v| *v == 0));
+        drop(broker);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn measured_stage_is_validated_and_published_without_fabrication() {
+        let mut calibration = calibration();
+        let mut old = serde_json::to_value(&calibration).unwrap();
+        old.as_object_mut().unwrap().remove("stage");
+        assert!(
+            serde_json::from_value::<Calibration>(old)
+                .unwrap()
+                .stage
+                .is_none()
+        );
+        calibration.stage = Some([0.0, -1.6, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        calibration.validate().unwrap();
+        let root = std::env::temp_dir().join(format!("ouxd-stage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let broker = Broker::create(&root, calibration.clone()).unwrap();
+        let data = std::fs::read(&broker.path).unwrap();
+        assert_eq!(&data[44..48], &1u32.to_le_bytes());
+        assert_eq!(&data[540..544], &(-1.6f32).to_le_bytes());
+        drop(broker);
+        std::fs::remove_dir_all(root).unwrap();
+        calibration.stage.as_mut().unwrap()[6] = 0.0;
+        assert!(calibration.validate().is_err());
+        calibration.stage.as_mut().unwrap()[6] = f32::NAN;
+        assert!(calibration.validate().is_err());
     }
     #[test]
     fn checks_real_eye_geometry() {

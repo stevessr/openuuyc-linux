@@ -17,3 +17,14 @@ inline bool notify_video_surface(JNIEnv *env, jobject activity, jmethodID ready,
     }
     return true;
 }
+
+// Android Surface-swapchain handles are runtime-owned. Borrow the original and
+// pass a newly owned local reference, even when PICO returns a global reference.
+inline bool notify_stereo_surface(JNIEnv *env,jobject activity,jmethodID ready,jobject surface,jint width,jint height) {
+    jobject local=env->NewLocalRef(surface);
+    if(!local) {if(env->ExceptionCheck())env->ExceptionClear();return false;}
+    env->CallVoidMethod(activity,ready,local,width,height);
+    env->DeleteLocalRef(local);
+    if(env->ExceptionCheck()) {env->ExceptionClear();return false;}
+    return true;
+}

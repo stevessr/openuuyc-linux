@@ -1,6 +1,6 @@
 """Real graphical compositor test with synthetic poses/colors, never game acceptance."""
 import argparse,json,mmap,os,pathlib,struct,subprocess,tempfile,threading,time
-p=argparse.ArgumentParser();p.add_argument('--runtime',required=True);p.add_argument('--smoke',required=True);p.add_argument('--gdb',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--runtime',required=True);p.add_argument('--smoke',required=True);p.add_argument('--gdb',action='store_true');p.add_argument('--expect-gpu-mismatch',action='store_true');a=p.parse_args()
 with tempfile.TemporaryDirectory(prefix='openuuyc-stereo-render-fixture-') as tmp:
     root=pathlib.Path(tmp);d=root/'openuuyc-pcvr/openxr';d.mkdir(parents=True,mode=0o700);os.chmod(d.parent,0o700)
     def mapping(path,size):
@@ -24,6 +24,11 @@ with tempfile.TemporaryDirectory(prefix='openuuyc-stereo-render-fixture-') as tm
         command=[a.smoke]
         if a.gdb:command=['gdb','-batch','-ex','run','-ex','thread apply all bt','--args']+command
         result=subprocess.run(command,env=env,text=True,capture_output=True,timeout=35)
+        if a.expect_gpu_mismatch:
+            assert result.returncode==2 and 'OpenGL GPU does not match compositor GPU' in result.stderr,result.stderr[-12000:]
+            assert struct.unpack_from('<Q',capture)[0]==0,'rejected GPU must not publish stereo'
+            print(json.dumps(dict(mismatched_gpu_rejected_without_crash=True,headset_verified=False)))
+            raise SystemExit(0)
         if result.returncode:raise RuntimeError(result.stderr[-16000:]+result.stdout+f'\nfixture exit={result.returncode}')
         if failures:raise failures[0]
         guard=struct.unpack_from('<Q',capture)[0]

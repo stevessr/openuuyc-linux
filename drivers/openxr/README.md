@@ -120,3 +120,155 @@ LaunchOptions，不修改全局 OpenXR/OpenVR 选择；必须先关闭 Steam。
 实际加载已安装内置 OpenXR 库的进程，不按 VRChat 进程名猜测，也不传输命令行。
 没有目标时明确提示，不一直等待或偷偷启动新实例。该清单证明库已加载，不证明
 应用正在渲染、双眼帧已到达头显或控制器已经可用。
+
+### Real graphical stereo fixture (not headset acceptance)
+
+`tests/stereo_render_smoke.cpp` creates an actual OpenXR OpenGL session, clears
+separate left/right swapchains red/green, and submits 90 projection frames.
+`tests/stereo_render_fixture.py` supplies temporary synthetic tracking IPC and
+asserts distinct colors in the compositor's actual OUST v2 readback. It never
+writes the live headset publisher or starts a game.
+
+```sh
+c++ -std=c++17 -O1 -Wall tests/stereo_render_smoke.cpp \
+  $(pkg-config --cflags --libs x11 gl openxr) -o /tmp/openuuyc-stereo-render-smoke
+python3 tests/stereo_render_fixture.py --runtime /path/to/openxr_openuuyc-dev.json \
+  --smoke /tmp/openuuyc-stereo-render-smoke
+```
+
+The fixture needs a reachable X display and the application/compositor on the
+same GPU. On the tested Intel/NVIDIA machine, `DISPLAY=:0` with
+`__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia` passes; default Intel
+GL against NVIDIA Vulkan previously crashed during opaque-FD import. The
+`gl_gpu_identity_v1` overlay now checks GL device UUIDs before swapchain import
+and returns `XR_ERROR_GRAPHICS_DEVICE_INVALID` on mismatch. The fixture's
+`--expect-gpu-mismatch` option verifies rejection with no published stereo.
+This is a local GPU/compositor regression test, not VRChat/Proton, transport,
+decoder, headset projection, controller or latency acceptance.
+
+### Controller input transport v2
+
+The negotiated 400-byte OUVR v2 frame preserves the 224-byte v1 prefix, adds two
+independent measured aim poses (64 bytes each), then two 24-byte controls:
+`u32 validity, u32 buttons, f32 trigger, squeeze, stick_x, stick_y`.
+Validity bits 0..6 denote trigger/squeeze/stick/stick-click/primary/secondary/menu;
+button bits 0..3 denote stick-click/primary/secondary/menu. V2 pose flags add actual
+orientation/position TRACKED bits 4/5. A v1 peer receives only the legacy prefix,
+version 1 and masked pose flags; aim and analog values are not synthesized.
+OUXD snapshot v2 is 536 bytes inside the unchanged private 4096-byte mapping.
+
+`controller_input_v2` registers left/right Touch-compatible logical devices for
+OpenVR/xrizer compatibility, with real grip/aim spaces, analog trigger/squeeze,
+stick and digital X/Y/A/B/menu. No capacitive touch, skeleton or haptic feedback
+is claimed. Inputs become inactive/neutral on stale tracking; reconnect keeps the
+same devices and action bindings. A local toolbar owns axes/buttons while shown,
+and release-to-neutral is required before forwarding game input again. During
+PCVR, X+A together toggle the local toolbar so individual X/A remain game inputs;
+this shortcut still requires headset usability validation.
+
+`tests/controller_fixture.py --runtime MANIFEST --smoke BINARY` publishes synthetic
+v2 data for `tests/controller_smoke.cpp`. It verifies the real OpenXR action
+binding path for both hands, distinct grip/aim positions, tracked bits, trigger,
+stick, primary button and input release after tracking loss. This does not prove
+physical-controller capture, VRChat interoperability, or end-to-end control.
+
+### Haptic feedback transport
+
+`haptics_v1` adds `/output/haptic` to both logical controllers. The runtime sends
+40-byte OUHP v1 datagrams to the current host's private `haptics.sock`:
+magic/version, publisher generation, host monotonic timestamp, hand, amplitude,
+frequency, duration-ms. The host accepts only its current generation, packets at
+most 250 ms old, amplitude 0..1, frequency 0..1000 Hz and duration at most 1000 ms.
+It coalesces bounded batches per hand and forwards them only over the authorized
+peer's control channel. The headset additionally checks the peer generation and
+current owner. No public socket or global runtime setting is created.
+
+Native OpenXR application occurs only while the session is focused, actual PCVR
+video is presenting and the local toolbar is hidden. A stop request, local menu,
+loss of focus or revoked stream cancels vibration; pending pulses older than
+250 ms are never replayed. XR_MIN_HAPTIC_DURATION maps to a 1 ms pulse; longer
+requests are capped at 1 s, and explicit stops remain stops.
+
+The real headless OpenXR controller fixture verifies both hands' apply/stop
+requests reach the private socket, including duration capping and minimum-duration
+handling. Rust socket/generation tests, Kotlin message validation and native
+focus/expiry policy tests cover other boundaries. Physical PICO actuation and
+VRChat's end-to-end feedback are still hardware acceptance items, not established
+by those fixtures.
+
+### Measured STAGE and Proton/OpenVR initialization
+
+The PICO client optionally creates its runtime's STAGE space and reports its
+actual pose in LOCAL alongside eye calibration. The host validates xyz/xyzw and
+publishes it only when supplied; OUXD's reserved bit0 marks the measured pose at
+offset 536 (the snapshot is now 568 bytes in the same 4096-byte map). Monado
+exports STAGE using that transform, without inventing floor height or play-area
+bounds. Changed stage transforms are incompatible with same-session reattachment.
+
+A Proton diagnostic using VRChat's unmodified `openvr_api.dll` exposed a real
+xrizer startup panic: its unconditional STAGE creation unwrap failed with
+`ERROR_REFERENCE_SPACE_UNSUPPORTED`. The source-packaged `xrizer_overlay.py`
+propagates that error normally instead of substituting LOCAL as a fake floor or
+opening a panic dialog. If PICO cannot provide floor calibration, OpenVR remains
+unavailable and the client asks for floor setup/reconnection. Native LOCAL-only
+OpenXR clients can still use the tracking bridge.
+
+`tests/openvr_windows_probe.c` is a standalone Windows diagnostic (build with
+`zig cc -target x86_64-windows-gnu`). `tests/proton_openvr_fixture.py` supplies
+synthetic poses/floor in private temporary IPC and uses a separately marked,
+locked diagnostic Proton prefix. It never launches VRChat or modifies its DLL,
+game prefix, global runtime, or existing game scene. The probe verifies background
+initialization, the five interface versions referenced by the installed
+XRSDKOpenVR DLL, and clean shutdown. `--without-stage --expect-init-error` verifies
+normal rejection, and `--container /path/to/SteamLinuxRuntime_4/run` exercises the
+actual Steam container. Only its own marked Wine prefix is stopped during test
+cleanup. A synthetic 1.6 m floor in this fixture is not a runtime default and is
+not headset or VRChat gameplay acceptance.
+
+### Calibrated cadence and producer restart
+
+The host uses the headset's validated 30..165 Hz calibration for the encoder's
+rate hint and the capture worker's frame budget. Encoding/readback time counts
+inside that budget rather than adding a fixed 33 ms sleep after each frame.
+Over-budget work does not enqueue catch-up frames: the reader still takes only
+the latest complete compositor export. This removes the artificial 30 fps cap;
+it does not promise that CPU readback/software encoding sustain the target rate.
+Status distinguishes `target_fps` from measured `send_fps` (host-sent complete
+frames, not proof of headset display), resetting measurements across generations.
+
+An application's compositor frame ID can reset on process restart. Capture-reader
+sequence therefore uses the shared export's completed-publication seqlock serial,
+which persists while ownership transfers between producers of the same inode.
+Encoded transport sequence is separate: it increments only for produced access
+units, so intentionally skipped capture frames do not look like network loss.
+The actual source ID still pairs eyes inside the compositor. A replacement
+producer no longer waits to exceed an old game's potentially huge frame ID.
+
+CPU export consumption reads each tightly packed eye in one operation instead
+of issuing a read for every scanline; a single temporary eye buffer is reused.
+The final seqlock check still rejects a pair changed during either read. This is
+an optimization of the CPU baseline, not a GPU zero-copy implementation.
+
+### Windows D3D11 submissions and projection-only export
+
+`tests/openvr_d3d11_probe.cpp` uses the IVRCompositor_028 ABI from the SHA-pinned
+xrizer archive's `openvr/headers/openvr-2.5.1.h`. Build with `zig c++ -target
+x86_64-windows-gnu -O1 -I/path/to/xrizer/openvr/headers ... -ld3d11 -ldxgi`, then
+run `proton_openvr_fixture.py --render` with that executable and a dedicated
+marked prefix. It uses the runtime-recommended DXGI adapter, clears separate
+D3D11 textures red/green, submits 90 frames, and shuts OpenVR down before releasing
+its texture/device resources. Success requires actual matching pixels in a
+complete compositor export, not merely successful Submit return codes.
+
+This exposed a real startup bug: an empty/background initialization frame could
+claim the exclusive export and leave the consumer seeing only black, even when
+D3D11 submissions succeeded. `projection_only_export_v1` gates capture on an
+actual projection/projection-depth layer, never empty or quad-only output. The
+controlled old/new test uses the same installed xrizer and D3D11 probe: the old
+runtime exports a single black pair, the new runtime exports distinct red/green
+eyes. Native OpenXR graphical regression remains a separate check.
+
+An earlier test destroyed D3D resources before OpenVR shutdown and hung in
+cleanup. With corrected test resource ordering, the existing xrizer shuts down
+normally; an evaluated cleanup modification was not included in the installed
+bundle. D3D11 diagnostics are not VRChat gameplay or PICO decode/display evidence.

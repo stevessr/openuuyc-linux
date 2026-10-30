@@ -69,6 +69,8 @@ def main():
     if len(roots) != 1:
         raise SystemExit('Unexpected archive layout')
     xrizer = roots[0]
+    from xrizer_overlay import apply as apply_xrizer_overlay
+    apply_xrizer_overlay(xrizer)
     # Preserve the pinned checkout. Compile an explicit, source-packaged overlay.
     patched = work / 'monado-openuuyc'
     if patched.exists():
@@ -106,7 +108,7 @@ def main():
                 '-DXRT_OXR_RUNTIME_SUFFIX=openuuyc']
     run('cmake', '-S', patched, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', *options)
     run('cmake', '--build', build, '--target', 'openxr_openuuyc', '-j', args.jobs)
-    env = os.environ.copy(); env['CARGO_TARGET_DIR'] = str(work / 'xrizer-target'); env['XRIZER_VERSION'] = '0.6.0-' + LOCK['xrizer']['revision'][:7]
+    env = os.environ.copy(); env['CARGO_TARGET_DIR'] = str(work / 'xrizer-target'); env['XRIZER_VERSION'] = '0.6.0-' + LOCK['xrizer']['revision'][:7]+'-openuuyc-stage'
     run('cargo', '+'+args.toolchain, 'build', '--locked', '--release', '--no-default-features', '--features', 'monado', cwd=xrizer, env=env)
     output.mkdir(parents=True)
     (output / 'lib').mkdir(); (output / 'openxr').mkdir(); (output / 'bin').mkdir()
@@ -125,10 +127,10 @@ def main():
     run('git', '-C', monado, 'archive', '--format=tar.gz', '--prefix=monado/', '-o', sources / 'monado.tar.gz', LOCK['monado']['revision'])
     shutil.copy2(archive, sources / 'xrizer.tar.gz')
     with tarfile.open(sources / 'openuuyc-overlay.tar.gz', 'w:gz') as archive_out:
-        for name in ('build_components.py', 'components.lock.json', 'pico_builder.c', 'device_ipc.h', 'runtime_probe.cpp', 'stereo_capture.c', 'stereo_capture.h', 'stereo_overlay.py'):
+        for name in ('build_components.py', 'components.lock.json', 'pico_builder.c', 'device_ipc.h', 'controller_device.h', 'haptics_output.h', 'runtime_probe.cpp', 'stereo_capture.c', 'stereo_capture.h', 'stereo_overlay.py', 'xrizer_overlay.py'):
             archive_out.add(HERE / name, arcname='openuuyc-openxr/' + name)
     files = {str(p.relative_to(output)): digest(p) for p in output.rglob('*') if p.is_file()}
-    (output / 'bundle.json').write_text(json.dumps({'version': 1, 'features': ['pico_device_v1', 'stereo_cpu_v2', 'device_reattach_v1'], 'arch': arch, 'monado_revision': actual, 'xrizer_revision': LOCK['xrizer']['revision'], 'files': files}, indent=2)+'\n')
+    (output / 'bundle.json').write_text(json.dumps({'version': 1, 'features': ['pico_device_v1', 'stereo_cpu_v2', 'device_reattach_v1', 'gl_gpu_identity_v1', 'controller_input_v2', 'haptics_v1', 'stage_space_v1', 'xrizer_space_errors_v1', 'projection_only_export_v1'], 'arch': arch, 'monado_revision': actual, 'xrizer_revision': LOCK['xrizer']['revision'], 'files': files}, indent=2)+'\n')
     print('Built component bundle:', output)
     print('Runtime includes real stereo CPU readback; verify end-to-end before claiming PCVR readiness.')
 

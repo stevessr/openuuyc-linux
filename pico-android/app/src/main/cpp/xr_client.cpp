@@ -3,6 +3,7 @@
 // tracks, with each Android decoder producing into its own Surface.
 #include <jni.h>
 #include "pcvr_protocol.h"
+#include "pcvr_haptics.h"
 #include "pcvr_projection_probe.h"
 #include "pcvr_stereo_layer.h"
 #include "xr_environment.h"
@@ -42,6 +43,7 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "OpenUUYC-PICO", __VA_ARGS__)
 static PcvrStereoState stereo_state;
 static std::atomic<bool> stereo_presenting{false};
+static std::atomic<bool> pcvr_tracking_active{false};
 static std::mutex environment_mutex;
 static XrEnvironmentSettings environment_settings;
 static std::atomic<bool> stop_requested{false};
@@ -210,7 +212,9 @@ static XrPath path(XrInstance instance, const char *name) {
 struct Actions {
     XrActionSet set = XR_NULL_HANDLE;
     XrAction aim = XR_NULL_HANDLE;
+    XrAction haptic=XR_NULL_HANDLE;
     XrAction tracked_grip = XR_NULL_HANDLE;
+    XrAction pcvr_trigger=XR_NULL_HANDLE,pcvr_squeeze=XR_NULL_HANDLE,pcvr_secondary=XR_NULL_HANDLE,pcvr_menu=XR_NULL_HANDLE;
     XrSpace tracked_hands[2] = {XR_NULL_HANDLE,XR_NULL_HANDLE};
     XrAction click = XR_NULL_HANDLE;
     XrAction grip = XR_NULL_HANDLE;
@@ -261,6 +265,21 @@ struct Actions {
         std::strcpy(info.actionName,"menu_nav_click");std::strcpy(info.localizedActionName,"Menu joystick confirm");
         if(!xr_ok(xrCreateAction(set,&info,&nav_click),"create navigation click")) return false;
 
+        info.actionType=XR_ACTION_TYPE_FLOAT_INPUT;
+        std::strcpy(info.actionName,"pcvr_trigger");std::strcpy(info.localizedActionName,"PCVR analog trigger");
+        if(!xr_ok(xrCreateAction(set,&info,&pcvr_trigger),"create PCVR trigger")) return false;
+        std::strcpy(info.actionName,"pcvr_squeeze");std::strcpy(info.localizedActionName,"PCVR analog squeeze");
+        if(!xr_ok(xrCreateAction(set,&info,&pcvr_squeeze),"create PCVR squeeze")) return false;
+        info.actionType=XR_ACTION_TYPE_BOOLEAN_INPUT;
+        std::strcpy(info.actionName,"pcvr_secondary");std::strcpy(info.localizedActionName,"PCVR Y B");
+        if(!xr_ok(xrCreateAction(set,&info,&pcvr_secondary),"create PCVR secondary")) return false;
+        std::strcpy(info.actionName,"pcvr_menu");std::strcpy(info.localizedActionName,"PCVR application menu");
+        if(!xr_ok(xrCreateAction(set,&info,&pcvr_menu),"create PCVR menu")) return false;
+
+        info.actionType=XR_ACTION_TYPE_VIBRATION_OUTPUT;
+        std::strcpy(info.actionName,"pcvr_haptic");std::strcpy(info.localizedActionName,"PCVR vibration");
+        if(!xr_ok(xrCreateAction(set,&info,&haptic),"create PCVR haptic output"))return false;
+
         // Try each PICO generation, then the Khronos simple controller.
         // Profiles unsupported by older runtimes are harmlessly ignored.
         const char *profiles[] = {
@@ -271,7 +290,7 @@ struct Actions {
         };
         for (const auto *profile : profiles) {
             bool simple = std::strcmp(profile, "/interaction_profiles/khr/simple_controller") == 0;
-            XrActionSuggestedBinding bindings[16] = {
+            XrActionSuggestedBinding bindings[26] = {
                 {aim, path(instance, "/user/hand/left/input/aim/pose")},
                 {aim, path(instance, "/user/hand/right/input/aim/pose")},
                 {click, path(instance, simple ? "/user/hand/left/input/select/click" : "/user/hand/left/input/trigger/click")},
@@ -287,15 +306,32 @@ struct Actions {
                 {quick_menu,path(instance,"/user/hand/left/input/x/click")},
                 {quick_menu,path(instance,"/user/hand/right/input/a/click")},
                 {nav_click,path(instance,"/user/hand/left/input/thumbstick/click")},
-                {nav_click,path(instance,"/user/hand/right/input/thumbstick/click")}
+                {nav_click,path(instance,"/user/hand/right/input/thumbstick/click")},
+                {pcvr_trigger,path(instance,"/user/hand/left/input/trigger/value")},
+                {pcvr_trigger,path(instance,"/user/hand/right/input/trigger/value")},
+                {pcvr_squeeze,path(instance,"/user/hand/left/input/squeeze/value")},
+                {pcvr_squeeze,path(instance,"/user/hand/right/input/squeeze/value")},
+                {pcvr_secondary,path(instance,"/user/hand/left/input/y/click")},
+                {pcvr_secondary,path(instance,"/user/hand/right/input/b/click")},
+                {haptic,path(instance,"/user/hand/left/output/haptic")},
+                {haptic,path(instance,"/user/hand/right/output/haptic")},
+                {pcvr_menu,path(instance,"/user/hand/left/input/menu/click")},
+                {pcvr_menu,path(instance,"/user/hand/right/input/menu/click")}
             };
             XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggested.interactionProfile = path(instance, profile);
-            suggested.suggestedBindings = bindings;
-            suggested.countSuggestedBindings = simple ? 6 : 16;
+            XrActionSuggestedBinding simple_bindings[8];std::copy(bindings,bindings+6,simple_bindings);simple_bindings[6]=bindings[22];simple_bindings[7]=bindings[23];
+            suggested.suggestedBindings = simple?simple_bindings:bindings;
+            suggested.countSuggestedBindings = simple ? 8 : 26;
             if (suggested.interactionProfile != XR_NULL_PATH) {
                 const auto result=xrSuggestInteractionProfileBindings(instance,&suggested);
                 LOGE("Controller binding %s: %d",profile,int(result));
+                if(XR_FAILED(result) && !simple) {
+                    suggested.countSuggestedBindings=24;
+                    auto fallback=xrSuggestInteractionProfileBindings(instance,&suggested);
+                    if(XR_FAILED(fallback)) {suggested.countSuggestedBindings=16;fallback=xrSuggestInteractionProfileBindings(instance,&suggested);}
+                    LOGE("Controller legacy binding fallback %s: %d",profile,int(fallback));
+                }
 
             }
         }
@@ -322,22 +358,53 @@ struct Actions {
     }
 };
 
+struct PcvrHapticRequest {bool pending=false,active=false;float amplitude=0,frequency=0;int duration_ms=0;std::chrono::steady_clock::time_point received;};
+static std::mutex pcvr_haptic_mutex;
+static PcvrHapticRequest pcvr_haptic_requests[2];
+static void process_pcvr_haptics(XrSession session,Actions& actions,bool allowed) {
+    if(actions.haptic==XR_NULL_HANDLE)return;
+    for(int hand=0;hand<2;hand++) {
+        PcvrHapticRequest request;
+        {std::lock_guard<std::mutex> lock(pcvr_haptic_mutex);request=pcvr_haptic_requests[hand];pcvr_haptic_requests[hand].pending=false;
+            if(!allowed)pcvr_haptic_requests[hand].active=false;}
+        XrHapticActionInfo info{XR_TYPE_HAPTIC_ACTION_INFO};info.action=actions.haptic;info.subactionPath=actions.hand_paths[hand];
+        const auto decision=pcvr_haptic_decision(allowed,request.pending,request.active,request.amplitude==0 || request.duration_ms==0,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-request.received).count());
+        if(decision==PcvrHapticDecision::Stop) {
+            if(request.active || request.pending)xrStopHapticFeedback(session,&info);
+            std::lock_guard<std::mutex> lock(pcvr_haptic_mutex);pcvr_haptic_requests[hand].active=false;continue;
+        }
+        if(decision!=PcvrHapticDecision::Apply)continue;
+        XrHapticVibration pulse{XR_TYPE_HAPTIC_VIBRATION};pulse.amplitude=request.amplitude;pulse.frequency=request.frequency;pulse.duration=int64_t(request.duration_ms)*1000000;
+        const bool active=XR_SUCCEEDED(xrApplyHapticFeedback(session,&info,reinterpret_cast<const XrHapticBaseHeader*>(&pulse)));
+        std::lock_guard<std::mutex> lock(pcvr_haptic_mutex);pcvr_haptic_requests[hand].active=active;
+    }
+}
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativePcvrHaptic(JNIEnv*,jobject,jint hand,jfloat amplitude,jfloat frequency,jint duration_ms) {
+    if(hand<0 || hand>1 || !std::isfinite(amplitude)||amplitude<0||amplitude>1||!std::isfinite(frequency)||frequency<0||frequency>1000||duration_ms<0||duration_ms>1000)return;
+    std::lock_guard<std::mutex> lock(pcvr_haptic_mutex);auto& request=pcvr_haptic_requests[hand];request.pending=true;request.amplitude=amplitude;request.frequency=frequency;request.duration_ms=duration_ms;request.received=std::chrono::steady_clock::now();
+}
+
 static void emit_pcvr_tracking(JNIEnv* env,jobject activity,jmethodID enabled,jmethodID callback,
                                XrSession session,XrSpace world,XrSpace view,Actions& actions,XrTime time,bool focused) {
-    if(!env->CallBooleanMethod(activity,enabled)) return;
+    static bool controls_blocked[2]={true,true};
+    const bool active=env->CallBooleanMethod(activity,enabled);pcvr_tracking_active.store(active);
+    if(!active) {controls_blocked[0]=controls_blocked[1]=true;return;}
     static uint64_t sequence=0;
-    OuvrFrame frame{};std::memcpy(frame.magic,"OUVR",4);frame.version=1;frame.sequence=++sequence;
+    OuvrFrameV2 packet{};auto& frame=packet.base;std::memcpy(frame.magic,"OUVR",4);frame.version=2;frame.sequence=++sequence;
     frame.xr_time=static_cast<uint64_t>(time);
     frame.sample_time=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    for(int i=0;i<3;++i) {
-        auto& out=frame.devices[i];
+    for(int i=0;i<5;++i) {
+        auto& out=i<3?frame.devices[i]:packet.aim[i-3];
+        const int hand=i<3?i-1:i-3;
         if(!focused) continue;
         if(i>0) {
             XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};
-            query.action=actions.tracked_grip;query.subactionPath=actions.hand_paths[i-1];
+            query.action=i<3?actions.tracked_grip:actions.aim;query.subactionPath=actions.hand_paths[hand];
             XrActionStatePose pose{XR_TYPE_ACTION_STATE_POSE};
             if(XR_FAILED(xrGetActionStatePose(session,&query,&pose)) || !pose.isActive) continue;
-            for(int button=0;button<2;++button) {
+            for(int button=0;i<3 && button<2;++button) {
                 query.action=button?actions.grip:actions.click;
                 XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
                 if(XR_SUCCEEDED(xrGetActionStateBoolean(session,&query,&state)) && state.isActive && state.currentState)
@@ -346,7 +413,9 @@ static void emit_pcvr_tracking(JNIEnv* env,jobject activity,jmethodID enabled,jm
         }
         XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
         XrSpaceLocation location{XR_TYPE_SPACE_LOCATION,&velocity};
-        if(XR_FAILED(xrLocateSpace(i==0?view:actions.tracked_hands[i-1],world,time,&location))) continue;
+        if(XR_FAILED(xrLocateSpace(i==0?view:(i<3?actions.tracked_hands[hand]:actions.hands[hand]),world,time,&location))) continue;
+        if(location.locationFlags&XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT) out.flags|=16;
+        if(location.locationFlags&XR_SPACE_LOCATION_POSITION_TRACKED_BIT) out.flags|=32;
         if(location.locationFlags&XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) {
             out.flags|=1;const auto& q=location.pose.orientation;
             out.orientation[0]=q.x;out.orientation[1]=q.y;out.orientation[2]=q.z;out.orientation[3]=q.w;
@@ -364,10 +433,26 @@ static void emit_pcvr_tracking(JNIEnv* env,jobject activity,jmethodID enabled,jm
             out.angular[0]=v.x;out.angular[1]=v.y;out.angular[2]=v.z;
         }
     }
-    if(!ouvr_valid(frame)) return;
-    auto bytes=env->NewByteArray(sizeof(frame));
+    if(focused) for(int hand=0;hand<2;hand++) {
+        auto& control=packet.controls[hand];
+        XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};query.subactionPath=actions.hand_paths[hand];
+        const XrAction axes[]={actions.pcvr_trigger,actions.pcvr_squeeze,actions.nav_x,actions.scroll};
+        float *values[]={&control.trigger,&control.squeeze,&control.x,&control.y};
+        bool axis_active[4]{};
+        for(int i=0;i<4;i++) {query.action=axes[i];XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+            if(XR_SUCCEEDED(xrGetActionStateFloat(session,&query,&state)) && state.isActive) {*values[i]=state.currentState;axis_active[i]=true;}}
+        if(axis_active[0])control.flags|=1;if(axis_active[1])control.flags|=2;
+        if(axis_active[2]&&axis_active[3])control.flags|=4;
+        const XrAction buttons[]={actions.nav_click,actions.quick_menu,actions.pcvr_secondary,actions.pcvr_menu};
+        for(int i=0;i<4;i++) {query.action=buttons[i];XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+            if(XR_SUCCEEDED(xrGetActionStateBoolean(session,&query,&state)) && state.isActive) {control.flags|=1u<<(i+3);if(state.currentState)control.buttons|=1u<<i;}}
+    }
+    const bool local_ui=!focused || controller_menu_layout.load()!=4 || menu_host.load()>=0;
+    ouvr_route_controls(packet,local_ui,controls_blocked);
+    if(!ouvr_valid(packet)) return;
+    auto bytes=env->NewByteArray(sizeof(packet));
     if(bytes) {
-        env->SetByteArrayRegion(bytes,0,sizeof(frame),reinterpret_cast<const jbyte*>(&frame));
+        env->SetByteArrayRegion(bytes,0,sizeof(packet),reinterpret_cast<const jbyte*>(&packet));
         env->CallVoidMethod(activity,callback,bytes);env->DeleteLocalRef(bytes);
     }
 }
@@ -424,10 +509,21 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
     sync.countActiveActionSets = 1;
     sync.activeActionSets = &active;
     if (XR_FAILED(xrSyncActions(session, &sync))) return;
-    for(int hand=0;hand<2;++hand) {
+    // In PCVR, individual X/A belong to the game. Both together summon the
+    // local toolbar; one edge only, and held chords cannot repeatedly toggle it.
+    bool quick_down[2]{},quick_edge[2]{};
+    for(int hand=0;hand<2;hand++) {
         XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};query.subactionPath=actions.hand_paths[hand];query.action=actions.quick_menu;
         XrActionStateBoolean quick{XR_TYPE_ACTION_STATE_BOOLEAN};
-        if(XR_SUCCEEDED(xrGetActionStateBoolean(session,&query,&quick)) && quick.isActive && quick.changedSinceLastSync && quick.currentState && quick_method) {
+        if(XR_SUCCEEDED(xrGetActionStateBoolean(session,&query,&quick)) && quick.isActive) {quick_down[hand]=quick.currentState;quick_edge[hand]=quick.changedSinceLastSync&&quick.currentState;}
+    }
+    static bool chord_was_down=false;
+    const bool chord=quick_down[0]&&quick_down[1];
+    const bool chord_edge=chord&&!chord_was_down;chord_was_down=chord;
+    for(int hand=0;hand<2;++hand) {
+        XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};query.subactionPath=actions.hand_paths[hand];
+        const bool summon=pcvr_tracking_active.load()?hand==0&&chord_edge:quick_edge[hand];
+        if(summon && quick_method) {
             menu_stick[0].reset();menu_stick[1].reset();last_menu_nav=0;
             menu_reset_requested.store(true);menu_host.store(-1);controller_menu_hand.store(2);menu_nav_hand=hand;menu_nav_until=timestamp+5000000000LL;quick_navigation_hand=hand;
             env->CallVoidMethod(activity,quick_method,jint(hand));
@@ -764,7 +860,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeStereoFormat(JNIEnv*,jobject,jint generation,jint width,jint height) {
-    stereo_presenting.store(false);
+    stereo_presenting.store(false);pcvr_tracking_active.store(false);
     std::lock_guard<std::mutex> lock(stereo_state.mutex);
     stereo_state.generation=generation>0?uint32_t(generation):0;
     stereo_state.width=width>0?uint32_t(width):0;stereo_state.height=height>0?uint32_t(height):0;stereo_state.frame=0;
@@ -899,6 +995,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     XrInstance instance = XR_NULL_HANDLE;
     XrSession session = XR_NULL_HANDLE;
     XrSpace world = XR_NULL_HANDLE;
+    XrSpace measured_stage=XR_NULL_HANDLE;
     XrSpace view = XR_NULL_HANDLE;
     XrSpace frozen = XR_NULL_HANDLE;
     bool actual_follow=false;
@@ -907,11 +1004,15 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     PcvrProjectionProbe pcvr_probe;
     PcvrStereoLayer stereo_video;
     bool stereo_open=false;
+    bool surface_probe_done=false;
+    jmethodID probe_surface_ready=env->GetMethodID(klass,"onXrSurfaceProbeSurface","(Landroid/view/Surface;II)V");
+    jmethodID probe_surface_report=env->GetMethodID(klass,"onXrSurfaceProbe","(ZIIZ)V");
     jmethodID stereo_ready=env->GetMethodID(klass,"onXrStereoSurface","(Landroid/view/Surface;II)V");
+    jmethodID stereo_failure=env->GetMethodID(klass,"onXrStereoFailure","(II)V");
     XrEnvironmentRenderer environment;
     uint64_t input_frames=0;
     uint64_t calibration_ticks=0;
-    jmethodID calibration_report=env->GetMethodID(klass,"onXrCalibration","(IIJ[F)V");
+    jmethodID calibration_report=env->GetMethodID(klass,"onXrCalibration","(IIJ[F[F)V");
     grip_dragging=false;grip_holds[0].reset();grip_holds[1].reset();
     menu_host.store(-1);menu_reset_requested.store(true);menu_portrait.store(false);
     menu_panel=default_menu_panel();menu_grab=false;menu_grip=false;interaction_hand=-1;
@@ -1022,6 +1123,8 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         if (!xr_ok(xrCreateReferenceSpace(session, &space_info, &world), "local reference space")) {
             failure = "No local tracking reference space"; break;
         }
+        XrReferenceSpaceCreateInfo stage_info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};stage_info.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_STAGE;stage_info.poseInReferenceSpace=identity_pose();
+        if(XR_FAILED(xrCreateReferenceSpace(session,&stage_info,&measured_stage)))measured_stage=XR_NULL_HANDLE;
         XrReferenceSpaceCreateInfo view_info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         view_info.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_VIEW;view_info.poseInReferenceSpace=identity_pose();
         xrCreateReferenceSpace(session,&view_info,&view);
@@ -1077,6 +1180,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                     // immediately. A remote PC must not keep dragging while
                     // the user is no longer interacting with our XR layer.
                     input_focused = changed->state == XR_SESSION_STATE_FOCUSED;
+                    if(!input_focused && action_ready)process_pcvr_haptics(session,actions,false);
                     if (!input_focused) {if(hover_method) env->CallVoidMethod(activity,hover_method,-1,0.f,0.f,JNI_FALSE);trigger_blocked[0]=trigger_blocked[1]=true;grabbed_pane=-1;menu_grab=false;interaction_hand=-1;grip_dragging=false;grip_holds[0].reset();grip_holds[1].reset();}
                     if (!input_focused && previous_down) {
                         env->CallVoidMethod(activity, pointer, previous_pane, previous_u, previous_v, JNI_FALSE);
@@ -1099,6 +1203,16 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             if (!running) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
+            }
+            if(pcvr_probe_requested.load() && !surface_probe_done) {
+                surface_probe_done=true;PcvrStereoLayer probe;jobject borrowed=nullptr;
+                bool created=probe.create(session,create_surface,1,1280,512,&borrowed);
+                const int kind=created?int(env->GetObjectRefType(borrowed)):0;
+                if(created)created=notify_stereo_surface(env,activity,probe_surface_ready,borrowed,1280,512);
+                const XrResult error=created?XR_SUCCESS:(XR_FAILED(probe.last_error())?probe.last_error():XR_ERROR_RUNTIME_FAILURE);
+                probe.destroy();
+                env->CallVoidMethod(activity,probe_surface_report,jboolean(created),jint(kind),jint(error),jboolean(measured_stage!=XR_NULL_HANDLE));
+                if(env->ExceptionCheck())env->ExceptionClear();
             }
             XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
             XrFrameState state{XR_TYPE_FRAME_STATE};
@@ -1243,11 +1357,21 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                     const uint32_t w=std::max(64u,uint32_t(max_w*scale)&~1u),h=std::max(64u,uint32_t(max_h*scale)&~1u);
                     float values[22];
                     for(int eye=0;eye<2;++eye) {const auto& p=eyes[eye].pose;const auto& f=eyes[eye].fov;float v[11]={p.position.x,p.position.y,p.position.z,p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w,f.angleLeft,f.angleRight,f.angleUp,f.angleDown};std::copy(v,v+11,values+eye*11);}
-                    auto array=env->NewFloatArray(22);if(array) {env->SetFloatArrayRegion(array,0,22,values);env->CallVoidMethod(activity,calibration_report,jint(w),jint(h),jlong(state.predictedDisplayPeriod),array);env->DeleteLocalRef(array);}
+                    jfloatArray stage_array=nullptr;
+                    if(measured_stage!=XR_NULL_HANDLE) {
+                        XrSpaceLocation floor{XR_TYPE_SPACE_LOCATION};const auto flags=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+                        if(XR_SUCCEEDED(xrLocateSpace(measured_stage,world,state.predictedDisplayTime,&floor)) && (floor.locationFlags&flags)==flags) {
+                            const float values[7]={floor.pose.position.x,floor.pose.position.y,floor.pose.position.z,floor.pose.orientation.x,floor.pose.orientation.y,floor.pose.orientation.z,floor.pose.orientation.w};
+                            stage_array=env->NewFloatArray(7);if(stage_array)env->SetFloatArrayRegion(stage_array,0,7,values);
+                        }
+                    }
+                    auto array=env->NewFloatArray(22);if(array) {env->SetFloatArrayRegion(array,0,22,values);env->CallVoidMethod(activity,calibration_report,jint(w),jint(h),jlong(state.predictedDisplayPeriod),array,stage_array);env->DeleteLocalRef(array);}
+                    if(stage_array)env->DeleteLocalRef(stage_array);
                 }
             }
             if(tracking_enabled && tracking_callback && action_ready)
                 emit_pcvr_tracking(env,activity,tracking_enabled,tracking_callback,session,world,view,actions,state.predictedDisplayTime,input_focused && state.shouldRender);
+            if(action_ready)process_pcvr_haptics(session,actions,input_focused && state.shouldRender && pcvr_tracking_active.load() && stereo_presenting.load() && controller_menu_layout.load()==4 && menu_host.load()<0);
             if(!input_focused || !state.shouldRender) {ray_visible[0]=ray_visible[1]=false;controller_menu_available=false;}
             if(pointer_probe_requested.load() && pointer_probe_report) {
                 const auto& a=focus_poses[0].position;const auto& b=focus_poses[1].position;
@@ -1357,8 +1481,15 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 stereo_open=false;
                 jobject surface=nullptr;
                 if(stereo_video.create(session,create_surface,stereo_gen,stereo_w,stereo_h,&surface)) {
-                    env->CallVoidMethod(activity,stereo_ready,surface,jint(stereo_w),jint(stereo_h));env->DeleteLocalRef(surface);stereo_open=true;
-                } else {std::lock_guard<std::mutex> lock(stereo_state.mutex);stereo_state.generation=0;}
+                    stereo_open=notify_stereo_surface(env,activity,stereo_ready,surface,jint(stereo_w),jint(stereo_h));
+                    if(!stereo_open)stereo_video.destroy();
+                }
+                if(!stereo_open) {
+                    const XrResult error=XR_FAILED(stereo_video.last_error())?stereo_video.last_error():XR_ERROR_RUNTIME_FAILURE;
+                    {std::lock_guard<std::mutex> lock(stereo_state.mutex);if(stereo_state.generation==stereo_gen)stereo_state.generation=0;}
+                    if(stereo_failure)env->CallVoidMethod(activity,stereo_failure,jint(stereo_gen),jint(error));
+                    if(env->ExceptionCheck())env->ExceptionClear();
+                }
             }
             if(!stereo_gen && stereo_open) {
                 env->CallVoidMethod(activity,stereo_ready,nullptr,jint(0),jint(0));stereo_video.destroy();stereo_open=false;
@@ -1412,8 +1543,9 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         env->CallVoidMethod(activity, pointer, previous_pane, previous_u, previous_v, JNI_FALSE);
         previous_down = false;
     }
+    if(action_ready)process_pcvr_haptics(session,actions,false);
     if (running) xrEndSession(session);
-    stereo_presenting.store(false);
+    stereo_presenting.store(false);pcvr_tracking_active.store(false);
     if(stereo_ready) env->CallVoidMethod(activity,stereo_ready,nullptr,jint(0),jint(0));
     stereo_video.destroy();
     environment.destroy();
@@ -1423,6 +1555,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     if (following_space != XR_NULL_HANDLE) xrDestroySpace(following_space);
     if (frozen != XR_NULL_HANDLE) xrDestroySpace(frozen);
     if (view != XR_NULL_HANDLE) xrDestroySpace(view);
+    if(measured_stage!=XR_NULL_HANDLE)xrDestroySpace(measured_stage);
     if (world != XR_NULL_HANDLE) xrDestroySpace(world);
     if (session != XR_NULL_HANDLE) xrDestroySession(session);
     if (instance != XR_NULL_HANDLE) xrDestroyInstance(instance);

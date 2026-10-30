@@ -17,15 +17,25 @@ struct PcvrStereoState {
 class PcvrStereoLayer {
     XrSwapchain chain=XR_NULL_HANDLE;
     uint32_t generation=0,width=0,height=0;
+    XrResult creation_result=XR_SUCCESS;
     std::array<XrCompositionLayerProjectionView,2> views{};
 public:
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     bool matches(uint32_t gen,uint32_t w,uint32_t h) const {return chain!=XR_NULL_HANDLE && generation==gen && width==w && height==h;}
+    XrResult last_error() const {return creation_result;}
     bool create(XrSession session,PFN_xrCreateSwapchainAndroidSurfaceKHR factory,uint32_t gen,uint32_t w,uint32_t h,jobject* surface) {
-        destroy();if(!gen || w<128 || w>8192 || w%4 || h<64 || h>4096 || h%2) return false;
+        destroy();creation_result=XR_ERROR_VALIDATION_FAILURE;
+        if(!surface) return false;
+        *surface=nullptr;
+        if(session==XR_NULL_HANDLE || !gen || w<128 || w>8192 || w%4 || h<64 || h>4096 || h%2) return false;
+        if(!factory) {creation_result=XR_ERROR_FUNCTION_UNSUPPORTED;return false;}
+        // XR_KHR_android_surface_swapchain requires format/sampleCount/faceCount/
+        // arraySize/mipCount to remain zero, unlike ordinary image swapchains.
         XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};info.width=w;info.height=h;
         info.usageFlags=XR_SWAPCHAIN_USAGE_SAMPLED_BIT|XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-        if(XR_FAILED(factory(session,&info,&chain,surface))) return false;
+        creation_result=factory(session,&info,&chain,surface);
+        if(XR_FAILED(creation_result)) {chain=XR_NULL_HANDLE;*surface=nullptr;return false;}
+        if(chain==XR_NULL_HANDLE || !*surface) {destroy();*surface=nullptr;creation_result=XR_ERROR_RUNTIME_FAILURE;return false;}
         generation=gen;width=w;height=h;
         for(int eye=0;eye<2;++eye) {
             views[eye]={XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
@@ -36,7 +46,7 @@ public:
     }
     bool prepare(XrSpace world,PcvrStereoState& state) {
         std::lock_guard<std::mutex> lock(state.mutex);
-        if(!matches(state.generation,state.width,state.height) || !state.frame || std::chrono::steady_clock::now()-state.received>std::chrono::milliseconds(250)) return false;
+        if(world==XR_NULL_HANDLE || !matches(state.generation,state.width,state.height) || !state.frame || std::chrono::steady_clock::now()-state.received>std::chrono::milliseconds(250)) return false;
         for(int eye=0;eye<2;++eye) {
             const float* v=state.views.data()+eye*11;
             views[eye].pose.position={v[0],v[1],v[2]};

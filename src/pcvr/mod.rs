@@ -171,3 +171,9 @@ pub mod steamvr;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod applications;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod haptics;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod pacing;

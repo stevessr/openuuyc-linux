@@ -29,7 +29,12 @@ def apply(root):
         "comp_mirror_fini(&r->mirror_to_debug_gui, vk);\n if(r->oust_initialized) for(int i=0;i<2;i++) comp_mirror_fini(&r->oust[i],vk);")
     # Initialize lazily after a real frame exists; skip capture on failure.
     marker="\tbool present_success = renderer_present_swapchain_image"
-    capture="""    if (getenv("OPENUUYC_STEREO_CAPTURE") && view_count == 2) {
+    capture="""    bool oust_has_projection=false;
+    for(uint32_t i=0;i<c->base.layer_accum.layer_count;i++) {
+        enum xrt_layer_type type=c->base.layer_accum.layers[i].data.type;
+        if(type==XRT_LAYER_PROJECTION || type==XRT_LAYER_PROJECTION_DEPTH)oust_has_projection=true;
+    }
+    if (getenv("OPENUUYC_STEREO_CAPTURE") && view_count == 2 && oust_has_projection) {
         if (!r->oust_initialized) {
             for (uint32_t eye=0;eye<2;eye++) {
                 const struct comp_scratch_single_images *v=&c->scratch.views[eye].cssi;
@@ -72,6 +77,31 @@ oust_done:
     replace(compositor,"!c->peek &&","!c->peek && !getenv(\"OPENUUYC_STEREO_CAPTURE\") &&")
     # getenv has an explicit declaration even if upstream's transitive includes change.
     compositor.write_text('#include <stdlib.h>\n'+compositor.read_text())
+    # GL opaque-FD import is not cross-GPU. Reject mismatched GLX contexts before
+    # touching driver memory-import paths (Mesa can segfault on NVIDIA handles).
+    glx=Path(root)/"src/xrt/state_trackers/oxr/oxr_session_gfx_gl_xlib.c"
+    replace(glx,'#include <stdlib.h>', '#include <stdlib.h>\n#include <string.h>\n#include "ogl/ogl_api.h"\n#include "client/comp_gl_client.h"')
+    replace(glx,"\tsess->compositor = xc;","""    if (client_gl_compositor_context_begin(xc, CLIENT_GL_CONTEXT_REASON_OTHER) != XRT_SUCCESS) {
+        xrt_comp_destroy(&xc);
+        return oxr_error(log, XR_ERROR_GRAPHICS_DEVICE_INVALID, "Cannot inspect OpenGL GPU identity");
+    }
+    bool matched = false;
+    if (GLAD_GL_EXT_memory_object && glGetUnsignedBytei_vEXT) {
+        GLint count = 0;
+        glGetIntegerv(GL_NUM_DEVICE_UUIDS_EXT, &count);
+        for (GLint i = 0; i < count && i < 16; i++) {
+            GLubyte uuid[GL_UUID_SIZE_EXT] = {0};
+            glGetUnsignedBytei_vEXT(GL_DEVICE_UUID_EXT, i, uuid);
+            if (memcmp(uuid, sys->xsysc->info.compositor_vk_deviceUUID.data, XRT_UUID_SIZE) == 0) matched = true;
+        }
+    }
+    client_gl_compositor_context_end(xc, CLIENT_GL_CONTEXT_REASON_OTHER);
+    if (!matched) {
+        xrt_comp_destroy(&xc);
+        return oxr_error(log, XR_ERROR_GRAPHICS_DEVICE_INVALID,
+            "OpenGL GPU does not match compositor GPU; select the same GPU for application and runtime");
+    }
+    sess->compositor = xc;""")
 if __name__=="__main__":
     import sys
     apply(Path(sys.argv[1]))

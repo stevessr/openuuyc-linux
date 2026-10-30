@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Explicit, per-game Steam setup. No global runtime change; private verified backup."""
-import argparse, hashlib, os, pathlib, re, stat, subprocess, tempfile
+import argparse, hashlib, json, os, pathlib, re, stat, subprocess, tempfile
 
 def game_block(text, appid):
     # Tokens retain offsets so unrelated config (including account data) is never rewritten.
@@ -24,7 +24,7 @@ def game_block(text, appid):
         else:pending=None
     return None
 
-def edit(text,appid,options):
+def edit(text,appid,options,previous_options=None):
     block=game_block(text,appid)
     if block is None: raise ValueError('This Steam account has no configuration for the requested app')
     a,b=block
@@ -32,13 +32,14 @@ def edit(text,appid,options):
     escaped=options.replace('\\','\\\\').replace('"','\\"')
     if current:
         if current.group(1)==escaped:return text
-        if current.group(1):raise ValueError('Existing launch options preserved; merge them manually before retrying')
+        previous_escaped=None if previous_options is None else previous_options.replace('\\','\\\\').replace('"','\\"')
+        if current.group(1) and current.group(1)!=previous_escaped:raise ValueError('Existing launch options preserved; merge them manually before retrying')
         return text[:a+current.start()]+f'"LaunchOptions"\t\t"{escaped}"'+text[a+current.end():]
     return text[:b]+f'\t\t\t\t\t"LaunchOptions"\t\t"{escaped}"\n'+text[b:]
 
-def apply(path,appid,options,backup_root):
+def apply(path,appid,options,backup_root,previous_options=None):
     data=path.read_bytes()
-    updated=edit(data.decode('utf-8'),appid,options).encode('utf-8')
+    updated=edit(data.decode('utf-8'),appid,options,previous_options).encode('utf-8')
     if updated==data:return False
     backup_root.mkdir(parents=True,exist_ok=True,mode=0o700)
     os.chmod(backup_root,0o700)
@@ -63,6 +64,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--appid',type=int,required=True)
     parser.add_argument('--client',type=pathlib.Path,default=pathlib.Path('target/debug/OpenUUYC'))
+    parser.add_argument('--previous-component-id',help='Replace only an exact previous generated command differing in component bundle path')
     args=parser.parse_args()
     if not 0<args.appid<2**32:parser.error('invalid Steam app id')
     if subprocess.run(['pgrep','-x','steam'],stdout=subprocess.DEVNULL).returncode==0:
@@ -72,9 +74,17 @@ def main():
     options=next((line[len(prefix):] for line in result.splitlines() if line.startswith(prefix)),None)
     if not options or 'OPENUUYC_STEREO_CAPTURE=' not in options:parser.error('Selected runtime does not supply the real stereo export')
     home=pathlib.Path.home()
+    previous_options=None
+    if args.previous_component_id:
+        if not re.fullmatch(r'[0-9a-f]{12}-[0-9a-f]{12}-[0-9a-f]{12}',args.previous_component_id):parser.error('Invalid previous component id')
+        components=home/'.local/share/openuuyc/pcvr/components'
+        current_id=json.loads((components/'active.json').read_text())
+        previous=components/args.previous_component_id;current=components/current_id
+        if not (previous/'bundle.json').is_file() or str(current) not in options:parser.error('Cannot establish previous/current installed component paths')
+        previous_options=options.replace(str(current),str(previous))
     candidates=[p for p in (home/'.local/share/Steam/userdata').glob('*/config/localconfig.vdf')
                 if game_block(p.read_text(),args.appid)]
     if len(candidates)!=1:parser.error('Expected exactly one matching local Steam account; no files changed')
-    changed=apply(candidates[0],args.appid,options,home/'.local/state/OpenUUYC/steam-config-backups')
+    changed=apply(candidates[0],args.appid,options,home/'.local/state/OpenUUYC/steam-config-backups',previous_options)
     print('Per-game launch options updated with a verified private backup' if changed else 'Per-game launch options already match')
 if __name__=='__main__':main()

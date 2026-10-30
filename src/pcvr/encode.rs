@@ -12,18 +12,26 @@ pub(crate) struct Encoder {
     size: (u16, u16),
     generation: u32,
     previous: u64,
+    sequence: u64,
+    fps: u32,
 }
 impl Encoder {
-    pub(crate) fn new(generation: u32) -> Result<Self> {
+    pub(crate) fn new(generation: u32, fps: u32) -> Result<Self> {
         ensure!(
             generation > 0 && generation <= i32::MAX as u32,
             "invalid stereo generation"
+        );
+        ensure!(
+            (30..=165).contains(&fps),
+            "invalid stereo encoder frame rate"
         );
         Ok(Self {
             core: None,
             size: (0, 0),
             generation,
             previous: 0,
+            sequence: 0,
+            fps,
         })
     }
     pub(crate) fn encode(
@@ -56,7 +64,7 @@ impl Encoder {
                     chroma: 1,
                     depth: 8,
                 },
-                fps: 30,
+                fps: self.fps,
                 bitrate: 20_000_000,
             })?);
             self.size = size;
@@ -68,9 +76,16 @@ impl Encoder {
         let Some(packet) = packet else {
             return Ok(None);
         };
+        // Capture may legitimately skip compositor publications. Only lost
+        // encoded access units should appear as transport gaps to the decoder.
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .filter(|v| *v <= i64::MAX as u64)
+            .ok_or_else(|| anyhow::anyhow!("stereo transport sequence exhausted"))?;
         let frame = Frame {
             generation: self.generation,
-            sequence: raw.sequence,
+            sequence: self.sequence,
             predicted_time: raw.predicted_time,
             width: raw.width,
             height: raw.height,
@@ -109,16 +124,38 @@ mod tests {
             views,
             bgra: pixels,
         };
-        let mut encoder = Encoder::new(7).unwrap();
+        let mut encoder = Encoder::new(7, 72).unwrap();
         let frame = encoder
             .encode(raw, true, &Arc::new(AtomicBool::new(false)))
             .unwrap()
             .unwrap();
+        assert_eq!(encoder.fps, 72);
+        assert!(Encoder::new(7, 29).is_err());
+        assert!(Encoder::new(7, 166).is_err());
         assert!(frame.keyframe && !frame.annex_b.is_empty());
         assert_eq!(
             (frame.generation, frame.predicted_time, frame.views),
             (7, 123_456_700, views)
         );
         assert!(!frame.fragments().unwrap().is_empty());
+        assert_eq!(frame.sequence, 1);
+        for (source, wire) in [(4, 2), (9, 3)] {
+            let raw = RawFrame {
+                sequence: source,
+                predicted_time: 123_456_700 + source as i64 * 1_000_000,
+                width: 128,
+                height: 64,
+                views,
+                bgra: vec![64; 128 * 64 * 4],
+            };
+            let next = encoder
+                .encode(raw, false, &Arc::new(AtomicBool::new(false)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                next.sequence, wire,
+                "capture skips must not look like lost encoded frames"
+            );
+        }
     }
 }

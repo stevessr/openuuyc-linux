@@ -20,7 +20,7 @@ internal class UuStereoDecoder(private val rendered: (UuStereoFrames.Frame)->Uni
     private var codec: MediaCodec?=null
     private var expectedWidth=0
     private var expectedHeight=0
-    private val metadata=linkedMapOf<Long,UuStereoFrames.Frame>()
+    private val metadata=UuStereoOutput()
     private val queued=AtomicInteger()
     @Volatile private var closed=false
     @Volatile private var waitingKeyframe=true
@@ -37,7 +37,12 @@ internal class UuStereoDecoder(private val rendered: (UuStereoFrames.Frame)->Uni
                         val height=if(format.containsKey("crop-bottom")) format.getInteger("crop-bottom")-format.getInteger("crop-top")+1 else format.getInteger(MediaFormat.KEY_HEIGHT)
                         require(width==expectedWidth && height==expectedHeight) {"双眼码流尺寸与协商格式不符"}
                     }
-                    if(index>=0) decoder.releaseOutputBuffer(index,true)
+                    if(index>=0) {
+                        val known=metadata.contains(info.presentationTimeUs)
+                        val fresh=metadata.fresh(info.presentationTimeUs,android.os.SystemClock.elapsedRealtime())
+                        decoder.releaseOutputBuffer(index,fresh)
+                        if(known && !fresh) {metadata.remove(info.presentationTimeUs);waitingKeyframe=true;lost()}
+                    }
                 }
             }.onFailure {fail(it)}
             if(codec!=null && !closed) handler.postDelayed(this,2)
@@ -61,7 +66,13 @@ internal class UuStereoDecoder(private val rendered: (UuStereoFrames.Frame)->Uni
                 expectedWidth=width;expectedHeight=height
                 val decoder=MediaCodec.createByCodecName(name)
                 codec=decoder
-                decoder.setOnFrameRenderedListener({_,pts,_->metadata.remove(pts)?.let(rendered)},handler)
+                decoder.setOnFrameRenderedListener({source,pts,_->
+                    if(source===codec && !closed) {
+                        val known=metadata.contains(pts)
+                        val frame=metadata.take(pts,android.os.SystemClock.elapsedRealtime())
+                        if(frame!=null)rendered(frame) else if(known){waitingKeyframe=true;lost()}
+                    }
+                },handler)
                 decoder.configure(format,surface,null,0);decoder.start();ready.set(true);handler.post(drain)
             }.onFailure {fail(it)}
             done.countDown()
@@ -71,18 +82,22 @@ internal class UuStereoDecoder(private val rendered: (UuStereoFrames.Frame)->Uni
     }
     fun frame(frame: UuStereoFrames.Frame) {
         if(closed) return
+        val arrived=frame.receivedAtMs ?: android.os.SystemClock.elapsedRealtime()
         if(queued.incrementAndGet()>2) {queued.decrementAndGet();waitingKeyframe=true;lost();return}
         handler.post {
             queued.decrementAndGet()
             val decoder=codec ?: return@post
             runCatching {
+                val now=android.os.SystemClock.elapsedRealtime()
+                if(!UuStereoOutput.withinDeadline(arrived,now)) {waitingKeyframe=true;lost();return@post}
                 if(waitingKeyframe && !frame.keyframe) return@post
                 if(frame.keyframe && waitingKeyframe) {decoder.flush();metadata.clear();waitingKeyframe=false}
+                if(metadata.size>=UuStereoOutput.MAX_PENDING || metadata.contains(frame.id)) {waitingKeyframe=true;lost();return@post}
                 val index=decoder.dequeueInputBuffer(0)
-                if(index<0 || metadata.size>=8) {waitingKeyframe=true;lost();return@post}
+                if(index<0) {waitingKeyframe=true;lost();return@post}
                 val input=checkNotNull(decoder.getInputBuffer(index));input.clear()
                 require(input.remaining()>=frame.bytes.size) {"双眼帧超过硬件输入缓冲区"}
-                input.put(frame.bytes);metadata[frame.id]=frame
+                input.put(frame.bytes);check(metadata.put(frame,arrived,now))
                 decoder.queueInputBuffer(index,0,frame.bytes.size,frame.id,if(frame.keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
             }.onFailure {fail(it)}
         }

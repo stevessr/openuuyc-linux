@@ -17,6 +17,7 @@ class UuStereoFramesTest {
         val receiver=UuStereoFrames()
         assertNull(receiver.accept(packet(offset=48000),0));assertNull(receiver.accept(packet(offset=48000),1))
         val frame=receiver.accept(packet(),2)!!
+        assertEquals(0L,frame.receivedAtMs)
         assertEquals(48003,frame.bytes.size);assertEquals(22,frame.views.size);assertEquals(2048,frame.width)
         assertTrue(frame.bytes.indices.all {frame.bytes[it]==(it%251).toByte()})
         assertNull(receiver.accept(packet(),3))

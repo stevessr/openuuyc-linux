@@ -10,10 +10,25 @@ internal class PicoPcvrProbeStats {
     private var headValid=0L
     private val handsValid=LongArray(2)
     private var sequence=0L
+    private var stageSamples=0L
+    private var stageValid=0L
+    private var surfaceAttempted=false
+    private var surfaceCreated=false
+    private var surfaceReference=0
+    private var surfaceError=0
+    private var stageSupported=false
+    @Synchronized fun calibration(stage:FloatArray?) {
+        stageSamples++
+        if(stage!=null && stage.size==7 && stage.all {it.isFinite()} && stage.sliceArray(3..6).sumOf {it.toDouble()*it.toDouble()} in .98..1.02)stageValid++
+    }
+    @Synchronized fun surface(created:Boolean,reference:Int,error:Int,supportsStage:Boolean) {surfaceAttempted=true;surfaceCreated=created;surfaceReference=reference;surfaceError=error;stageSupported=supportsStage}
+    @Synchronized fun initialization():JSONObject=JSONObject().put("surfaceAttempted",surfaceAttempted).put("surfaceCreated",surfaceCreated)
+        .put("surfaceReferenceKind",surfaceReference).put("surfaceError",surfaceError).put("stageSupported",stageSupported)
+        .put("stageSamples",stageSamples).put("stageValidSamples",stageValid).put("remoteVideo",false).put("probeOnly",true)
     @Synchronized fun accept(bytes: ByteArray) {
-        if(bytes.size!=224 || !bytes.copyOfRange(0,4).contentEquals("OUVR".toByteArray())) return
-        val b=ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        if(b.getInt(4)!=1 || b.getLong(8)<=sequence) return
+        val packet=org.openuuyc.pico.uu.UuPcvrTracking.packet(bytes,2) ?: return
+        val b=ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
+        if(b.getLong(8)<=sequence) return
         sequence=b.getLong(8);samples++
         if(b.getInt(32) and 3 == 3) headValid++
         for(i in 0..1) if(b.getInt(96+i*64) and 3 == 3) handsValid[i]++

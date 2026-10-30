@@ -16,10 +16,12 @@ internal class UuPcvrSession {
         fun stereoTarget()=owner.get()
     }
     private var eyeCalibration: JSONObject?=null
-    @Synchronized fun calibration(width: Int,height: Int,periodNs: Long,views: FloatArray) {
+    @Synchronized fun calibration(width: Int,height: Int,periodNs: Long,views: FloatArray,stage:FloatArray?=null) {
         if(width<64 || height<64 || periodNs<=0 || views.size!=22 || views.any {!it.isFinite()}) return
         val array=org.json.JSONArray();views.forEach {array.put(it.toDouble())}
-        eyeCalibration=JSONObject().put("eye_width",width).put("eye_height",height).put("refresh_hz",1e9/periodNs.toDouble()).put("views",array)
+        eyeCalibration=JSONObject().put("eye_width",width).put("eye_height",height).put("refresh_hz",1e9/periodNs.toDouble()).put("views",array).also {calibration->
+            if(stage!=null && stage.size==7 && stage.all {it.isFinite()})calibration.put("stage",org.json.JSONArray().also {data->stage.forEach {data.put(it.toDouble())}})
+        }
     }
     private val stereoFrames=UuStereoFrames()
     @Volatile private var stereoDecoder: UuStereoDecoder?=null
@@ -28,11 +30,20 @@ internal class UuPcvrSession {
     @Volatile private var stereoHeight=0
     @Volatile private var stereoCodec=0
     private var stereoNative: ((Int,Int,Int)->Unit)?=null
+    private var localFailure:String?=null
+    private var controlGeneration=0
+    private var hapticNative:((Int,Float,Float,Int)->Unit)?=null
     private var stereoRendered: ((Int,Long,FloatArray)->Unit)?=null
     private val decodedFrames=java.util.concurrent.atomic.AtomicLong(0)
     private val lastDecoded=java.util.concurrent.atomic.AtomicLong(0)
     private var lastKeyframeRequest=0L
-    fun setStereoCallbacks(format: (Int,Int,Int)->Unit,frame: (Int,Long,FloatArray)->Unit) {stereoNative=format;stereoRendered=frame}
+    fun setStereoCallbacks(format: (Int,Int,Int)->Unit,frame: (Int,Long,FloatArray)->Unit,haptics:((Int,Float,Float,Int)->Unit)?=null) {stereoNative=format;stereoRendered=frame;hapticNative=haptics}
+    @Synchronized fun stereoSurfaceFailed(generation:Int,code:Int) {
+        if(owner.get()!==this || generation!=stereoGeneration) return
+        request(false)
+        localFailure="OpenXR 双眼 Surface 创建失败（$code）；VR 已停止，可重试连接"
+        status=localFailure!!
+    }
     fun stereoSurface(surface: android.view.Surface?,width: Int,height: Int) {
         stereoDecoder?.surface(surface,width,height,if(stereoCodec==1) "video/avc" else "video/hevc")
         synchronized(this) {
@@ -121,6 +132,7 @@ internal class UuPcvrSession {
         main.post {poll()}
     }
     @Synchronized fun request(start: Boolean): Boolean {
+        if(start)localFailure=null
         val c=control
         if(c?.state()!=DataChannel.State.OPEN || (start && poses?.state()!=DataChannel.State.OPEN)) {
             revoke();status="远端不支持内置 VR，或通道尚未就绪";return false
@@ -152,22 +164,31 @@ internal class UuPcvrSession {
         if(bytes.size>4096) return
         runCatching {
             val value=JSONObject(String(bytes,Charsets.UTF_8))
+            if(value.optString("type")=="haptic") {
+                if(active && owner.get()===this) UuPcvrHaptics.parse(value,controlGeneration)?.let {hapticNative?.invoke(it.hand,it.amplitude,it.frequency,it.durationMs)}
+                return
+            }
             if(value.optString("type")=="video-config") {configureStereo(value);return}
             if(value.optInt("version")!=1) {revoke();status="VR 协议不兼容";return}
+            trackingVersion=if(value.optInt("tracking_version",1)>=2) 2 else 1
             val ready=value.optBoolean("tracking") && control?.state()==DataChannel.State.OPEN && poses?.state()==DataChannel.State.OPEN
             if(!state.receive(value.optInt("id"),ready,!value.isNull("error"))) return
             active=state.active && owner.get()===this
+            controlGeneration=if(active) value.optInt("generation",0).coerceAtLeast(0) else 0
             if(!active) stopStereo()
             if(!state.desired) owner.compareAndSet(this,null)
-            status=if(!value.isNull("error")) value.optString("error") else
-                if(active) "${value.optString("backend","追踪")} · 已转发 ${value.optLong("frames")} 帧 · ${if(value.optBoolean("fresh")) "近期发送" else "等待头显"} · ${if(lastDecoded.get()>0 && android.os.SystemClock.elapsedRealtime()-lastDecoded.get()<1000) "双眼解码输出 ${decodedFrames.get()} 帧" else if(value.optBoolean("stereo")) "远端正在发送双眼视频，等待本机解码输出" else if(!value.isNull("video_error")) value.optString("video_error") else if(!value.optBoolean("fresh") || !value.optBoolean("head_valid",true)) "等待有效头部追踪" else if(value.optLong("captured_frames")==0L) "等待合成器双眼画面" else if(value.optLong("encoded_frames")==0L) "等待双眼视频编码" else if(!value.optBoolean("decoder_ready")) "等待本机解码器就绪" else "等待双眼视频传输"}" else "内置 VR 追踪已停止"
+            val cadence=if(value.has("target_fps")) "目标 ${value.optDouble("target_fps")} Hz · ${if(value.isNull("send_fps")) "发送统计中" else "发送 ${String.format(java.util.Locale.ROOT,"%.1f",value.optDouble("send_fps"))} fps"} · " else ""
+            status=localFailure ?: if(!value.isNull("error")) value.optString("error") else
+                if(active) "${value.optString("backend","追踪")} · ${cadence}已转发 ${value.optLong("frames")} 帧 · ${if(value.optBoolean("fresh")) "近期发送" else "等待头显"} · ${if(lastDecoded.get()>0 && android.os.SystemClock.elapsedRealtime()-lastDecoded.get()<1000) "双眼解码输出 ${decodedFrames.get()} 帧" else if(value.optBoolean("stereo")) "远端正在发送双眼视频，等待本机解码输出" else if(!value.isNull("video_error")) value.optString("video_error") else if(!value.optBoolean("stage",true)) "未获得真实地面；请在 PICO 设置地面后重连，OpenVR 当前不可用" else if(!value.optBoolean("fresh") || !value.optBoolean("head_valid",true)) "等待有效头部追踪" else if(value.optLong("captured_frames")==0L) "等待合成器双眼画面" else if(value.optLong("encoded_frames")==0L) "等待双眼视频编码" else if(!value.optBoolean("decoder_ready")) "等待本机解码器就绪" else "等待双眼视频传输"}" else "内置 VR 追踪已停止"
         }.onFailure {revoke();status="VR 状态无效"}
     }
+    private var trackingVersion=1
     @Synchronized fun frame(bytes: ByteArray) {
         val c=poses
-        if(!active || bytes.size!=224 || c?.state()!=DataChannel.State.OPEN || c.bufferedAmount()>224*2) return
-        c.send(DataChannel.Buffer(ByteBuffer.wrap(bytes),true))
+        if(!active || c?.state()!=DataChannel.State.OPEN || c.bufferedAmount()>800) return
+        val packet=UuPcvrTracking.packet(bytes,trackingVersion) ?: return
+        c.send(DataChannel.Buffer(ByteBuffer.wrap(packet),true))
     }
-    private fun revoke() {stopStereo();active=false;state.reset();owner.compareAndSet(this,null)}
+    private fun revoke() {if(owner.get()===this) for(hand in 0..1) hapticNative?.invoke(hand,0f,0f,0);controlGeneration=0;trackingVersion=1;stopStereo();active=false;state.reset();owner.compareAndSet(this,null)}
     @Synchronized fun close() {revoke();eyeCalibration=null;control=null;poses=null;status="VR 会话已结束"}
 }

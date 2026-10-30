@@ -5,7 +5,7 @@ import java.nio.ByteOrder
 
 /** Unordered/lossy media channel: one bounded frame, no stale-frame queue. */
 internal class UuStereoFrames {
-    data class Frame(val generation: Int,val id: Long,val predictedTime: Long,val width: Int,val height: Int,val codec: Int,val keyframe: Boolean,val views: FloatArray,val bytes: ByteArray)
+    data class Frame(val generation: Int,val id: Long,val predictedTime: Long,val width: Int,val height: Int,val codec: Int,val keyframe: Boolean,val views: FloatArray,val bytes: ByteArray,val receivedAtMs:Long?=null)
     companion object {const val CHANNEL="OPENUUYC_VR_VIDEO_V1";const val HEADER=136;const val CHUNK=48000;const val MAX=4*1024*1024}
     private var assembling: Frame?=null
     private var fragments=BooleanArray(0)
@@ -17,6 +17,7 @@ internal class UuStereoFrames {
     fun reset() {assembling=null;fragments=BooleanArray(0);received=0;highest=0;generation=0;needsKeyframe=true}
     fun lost() {assembling=null;needsKeyframe=true}
     fun accept(packet: ByteArray,nowMs: Long): Frame? {
+        require(nowMs>=0)
         require(packet.size in HEADER+1..HEADER+CHUNK)
         val b=ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
         require(b.int==0x5356554f && b.short.toInt()==1)
@@ -39,7 +40,7 @@ internal class UuStereoFrames {
         if(id>highest || assembling==null) {
             if(highest!=0L && id!=highest+1) needsKeyframe=true
             highest=id;started=nowMs
-            assembling=Frame(gen,id,time,width,height,codec,flags==1,views,ByteArray(total));fragments=BooleanArray((total+CHUNK-1)/CHUNK);received=0
+            assembling=Frame(gen,id,time,width,height,codec,flags==1,views,ByteArray(total),nowMs);fragments=BooleanArray((total+CHUNK-1)/CHUNK);received=0
         }
         val frame=checkNotNull(assembling)
         require(frame.bytes.size==total && frame.width==width && frame.height==height && frame.codec==codec && frame.keyframe==(flags==1) && frame.predictedTime==time && frame.views.contentEquals(views))

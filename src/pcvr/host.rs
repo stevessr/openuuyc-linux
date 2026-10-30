@@ -30,6 +30,12 @@ struct ControlRequest {
 fn tracking_fresh(last: Option<Instant>) -> bool {
     last.is_some_and(|time| time.elapsed() < Duration::from_millis(250))
 }
+fn video_recent(last: Option<(u32, Instant)>, generation: u32) -> bool {
+    generation > 0
+        && last.is_some_and(|(epoch, time)| {
+            epoch == generation && time.elapsed() < Duration::from_millis(500)
+        })
+}
 static NEXT_GENERATION: AtomicU32 = AtomicU32::new(1);
 static OWNED: AtomicBool = AtomicBool::new(false);
 #[derive(Default)]
@@ -44,6 +50,8 @@ struct State {
     last: Option<Instant>,
     backend: Option<&'static str>,
     head_valid: bool,
+    video_rate: super::pacing::Rate,
+    tracking_version: u32,
     captured_frames: u64,
     encoded_frames: u64,
     producer_error: Option<&'static str>,
@@ -62,7 +70,7 @@ pub(crate) struct Session {
     video_send: tokio::sync::Mutex<()>,
     producer: tokio::sync::mpsc::Sender<super::stereo::Frame>,
     sent_video_frames: AtomicU64,
-    last_video: Mutex<Option<Instant>>,
+    last_video: Mutex<Option<(u32, Instant)>>,
 }
 impl Session {
     pub(crate) fn new(lease: Lease, connected: Arc<AtomicBool>) -> Arc<Self> {
@@ -98,21 +106,23 @@ impl Session {
             let mut previous = 0;
             let mut encoder: Option<super::encode::Encoder> = None;
             while let Some(session) = weak.upgrade() {
-                let source = {
+                let began = Instant::now();
+                let (rate, source) = {
                     let state = lock(&session.state);
-                    state
+                    let source = state
                         .export
                         .as_ref()
                         .filter(|_| state.head_valid && tracking_fresh(state.last))
                         .and_then(|export| export.file.try_clone().ok())
-                        .map(|f| (state.generation, f))
+                        .map(|f| (state.generation, f));
+                    (state.video_rate, source)
                 };
                 if session.allowed() {
                     if let Some((epoch, file)) = source {
                         if epoch != generation {
                             generation = epoch;
                             previous = 0;
-                            encoder = match super::encode::Encoder::new(epoch) {
+                            encoder = match super::encode::Encoder::new(epoch, rate.fps) {
                                 Ok(encoder) => Some(encoder),
                                 Err(error) => {
                                     tracing::warn!(%error,"PCVR encoder initialization failed");
@@ -186,7 +196,48 @@ impl Session {
                     session.stop();
                 }
                 drop(session);
-                std::thread::sleep(Duration::from_millis(33));
+                let remaining = rate.remaining(began.elapsed());
+                if !remaining.is_zero() {
+                    std::thread::sleep(remaining);
+                }
+            }
+        });
+        let weak = Arc::downgrade(&session);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                tick.tick().await;
+                let Some(session) = weak.upgrade() else { break };
+                if !session.allowed() {
+                    continue;
+                }
+                let (generation, pulses) = {
+                    let state = lock(&session.state);
+                    (
+                        state.generation,
+                        state
+                            .broker
+                            .as_ref()
+                            .map(|b| b.haptics())
+                            .unwrap_or([None, None]),
+                    )
+                };
+                let channel = lock(&session.control)
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                if let Some(channel) = channel {
+                    for pulse in pulses.into_iter().flatten() {
+                        if !session.allowed() || lock(&session.state).generation != generation {
+                            break;
+                        }
+                        let request = serde_json::json!({"type":"haptic","generation":generation,"hand":pulse.hand,"amplitude":pulse.amplitude,"frequency":pulse.frequency,"duration_ms":pulse.duration_ms});
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(16),
+                            channel.send_text(request.to_string()),
+                        )
+                        .await;
+                    }
+                }
             }
         });
         session
@@ -228,12 +279,17 @@ impl Session {
         self.keyframe_requested.load(Ordering::Acquire)
     }
     fn stereo_streaming(&self) -> bool {
-        self.allowed()
-            && {
-                let state = lock(&self.state);
-                state.head_valid && tracking_fresh(state.last)
+        if !self.allowed() {
+            return false;
+        }
+        let generation = {
+            let state = lock(&self.state);
+            if !state.head_valid || !tracking_fresh(state.last) {
+                return false;
             }
-            && lock(&self.last_video).is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+            state.generation
+        };
+        video_recent(*lock(&self.last_video), generation)
     }
     fn allowed(&self) -> bool {
         self.lease.app_launch_allowed() && self.connected.load(Ordering::Acquire)
@@ -276,6 +332,12 @@ impl Session {
             );
             let calibration = calibration.context("PICO 尚未上报真实眼位/FOV；请唤醒头显后重试")?;
             calibration.validate()?;
+            let video_rate = super::pacing::Rate::new(calibration.refresh_hz)?;
+            let tracking_version = if super::runtime::controller_component_available()? {
+                2
+            } else {
+                1
+            };
             ensure!(
                 OWNED
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -299,6 +361,8 @@ impl Session {
                             }));
                         }
                     }
+                    state.video_rate = video_rate;
+                    state.tracking_version = tracking_version;
                     state.broker = Some(broker);
                     state.backend = Some("openxr-pico-device");
                     return Ok(());
@@ -377,6 +441,17 @@ impl Session {
         if sequence <= state.sequence {
             return;
         }
+        let mut compatibility = [0u8; protocol::FRAME_BYTES];
+        let data = if state.tracking_version < 2 && data.len() == protocol::FRAME_V2_BYTES {
+            compatibility.copy_from_slice(&data[..protocol::FRAME_BYTES]);
+            compatibility[4..8].copy_from_slice(&1u32.to_le_bytes());
+            for offset in [32, 96, 160] {
+                compatibility[offset] &= 15;
+            }
+            &compatibility[..]
+        } else {
+            data
+        };
         if let Some(broker) = state.broker.as_mut() {
             if broker.publish(data, true).is_ok() {
                 state.sequence = sequence;
@@ -389,7 +464,14 @@ impl Session {
         let Some(socket) = state.socket.as_ref() else {
             return;
         };
-        match socket.send(data) {
+        // The legacy SteamVR tracker protocol remains v1, never send its v2 tail.
+        let mut legacy = [0u8; protocol::FRAME_BYTES];
+        legacy.copy_from_slice(&data[..protocol::FRAME_BYTES]);
+        legacy[4..8].copy_from_slice(&1u32.to_le_bytes());
+        for offset in [32, 96, 160] {
+            legacy[offset] &= 15;
+        }
+        match socket.send(&legacy) {
             Ok(protocol::FRAME_BYTES) => {
                 state.sequence = sequence;
                 state.frames += 1;
@@ -486,8 +568,19 @@ impl Session {
                 }
             }
         }
+        // A stop/new generation may have raced the final await. Never mark a
+        // new session ready or count old completion against its measured rate.
+        ensure!(
+            self.allowed(),
+            "stereo session permission changed before completion"
+        );
+        let state = lock(&self.state);
+        ensure!(
+            state.generation == frame.generation,
+            "stereo session changed before completion"
+        );
         self.sent_video_frames.fetch_add(1, Ordering::Relaxed);
-        *lock(&self.last_video) = Some(Instant::now());
+        *lock(&self.last_video) = Some((frame.generation, Instant::now()));
         Ok(())
     }
     pub(crate) fn bind(self: &Arc<Self>, channel: Arc<RTCDataChannel>, parent: CancellationToken) {
@@ -547,6 +640,7 @@ impl Session {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             let mut last_error: Option<String> = None;
+            let mut send_rate = super::pacing::Meter::default();
             loop {
                 let request = tokio::select! {_=stop.cancelled()=>break,_=tick.tick()=>None,r=rx.recv()=>match r {Some(s)=>Some(s),None=>break}};
                 if !this.allowed() {
@@ -608,7 +702,12 @@ impl Session {
                 let streaming = this.stereo_streaming();
                 let status = {
                     let state = lock(&this.state);
-                    serde_json::json!({"version":1,"id":id,"tracking":(state.socket.is_some() || state.broker.is_some()),"backend":state.backend,"stereo":streaming,"video_frames":this.sent_video_frames.load(Ordering::Relaxed),"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"video_error":state.producer_error,"captured_frames":state.captured_frames,"encoded_frames":state.encoded_frames,"decoder_ready":this.video_ack.load(Ordering::Acquire)==state.generation && state.generation>0,"head_valid":state.head_valid,"message":if streaming {"双眼编码帧正在发送；仍需头显确认解码与显示"} else {"等待真实合成器双眼编码帧；当前不能宣称 PCVR 可用"}})
+                    let observed = send_rate.sample(
+                        state.generation,
+                        Instant::now(),
+                        this.sent_video_frames.load(Ordering::Relaxed),
+                    );
+                    serde_json::json!({"version":1,"id":id,"send_fps":observed,"tracking":(state.socket.is_some() || state.broker.is_some()),"tracking_version":state.tracking_version.max(1),"stage":state.broker.as_ref().is_some_and(|b|b.has_stage()),"generation":state.generation,"backend":state.backend,"stereo":streaming,"video_frames":this.sent_video_frames.load(Ordering::Relaxed),"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"video_error":state.producer_error,"target_fps":state.video_rate.refresh_hz,"captured_frames":state.captured_frames,"encoded_frames":state.encoded_frames,"decoder_ready":this.video_ack.load(Ordering::Acquire)==state.generation && state.generation>0,"head_valid":state.head_valid,"message":if streaming {"双眼编码帧正在发送；仍需头显确认解码与显示"} else {"等待真实合成器双眼编码帧；当前不能宣称 PCVR 可用"}})
                 };
                 let Some(ch) = weak.upgrade() else { break };
                 if ch.ready_state()
@@ -647,6 +746,18 @@ mod stereo_async_tests {
     }
 
     use super::*;
+    #[test]
+    fn old_generation_completion_cannot_make_new_video_ready() {
+        let now = Instant::now();
+        assert!(video_recent(Some((7, now)), 7));
+        assert!(!video_recent(Some((7, now)), 8));
+        assert!(!video_recent(Some((0, now)), 0));
+        assert!(!video_recent(None, 7));
+        assert!(!video_recent(
+            Some((7, now - Duration::from_millis(501))),
+            7
+        ));
+    }
     #[test]
     fn tracking_timeout_never_treats_missing_or_old_samples_as_fresh() {
         assert!(!tracking_fresh(None));

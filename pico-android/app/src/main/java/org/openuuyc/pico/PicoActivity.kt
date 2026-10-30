@@ -49,10 +49,16 @@ open class PicoActivity : Activity() {
         private const val XR_REQUEST = 1
     }
     private external fun nativeStereoFormat(generation: Int,width: Int,height: Int)
+    private external fun nativePcvrHaptic(hand:Int,amplitude:Float,frequency:Float,durationMs:Int)
     private external fun nativeStereoFrame(generation: Int,frame: Long,views: FloatArray)
-    fun onXrCalibration(width: Int,height: Int,periodNs: Long,views: FloatArray) {
-        session?.vr?.calibration(width,height,periodNs,views)
-        xrExtraSessions.values.forEach {it.vr.calibration(width,height,periodNs,views)}
+    fun onXrCalibration(width: Int,height: Int,periodNs: Long,views: FloatArray,stage:FloatArray?) {
+        if(pcvrProbe) {pcvrProbeStats.calibration(stage);writePcvrInitializationProbe()}
+        session?.vr?.calibration(width,height,periodNs,views,stage)
+        xrExtraSessions.values.forEach {it.vr.calibration(width,height,periodNs,views,stage)}
+    }
+    fun onXrStereoFailure(generation:Int,code:Int) {
+        val target=org.openuuyc.pico.uu.UuPcvrSession.stereoTarget()
+        runOnUiThread {target?.stereoSurfaceFailed(generation,code)}
     }
     fun onXrStereoSurface(surface: android.view.Surface?,width: Int,height: Int) {
         org.openuuyc.pico.uu.UuPcvrSession.stereoTarget()?.stereoSurface(surface,width,height)
@@ -648,6 +654,9 @@ open class PicoActivity : Activity() {
         // Only an internal debug Activity/instrumentation can reach this path.
         // No UU login, remote media, microphone, clipboard or network is started.
         setContentView(status);status.text="内置 PCVR 双眼投影诊断（非远端游戏画面）"
+        // A system readiness dialog can delay instrumentation's Activity monitor.
+        // A late diagnostic must not keep the headset scene indefinitely.
+        ui.postDelayed({if(pcvrProbe && !pcvrProbeStopped && !isDestroyed) {nativeStop();finishAndRemoveTask()}},75000)
         nativeSetPcvrProbe(!pcvrPointerProbe);nativeSetPointerProbe(pcvrPointerProbe);nativeSetPassthroughEnabled(false)
         for(i in 0..5) nativeSetWindowVisible(i,false)
         running.set(true)
@@ -753,7 +762,7 @@ open class PicoActivity : Activity() {
                                 if(running.get() && xrMainAlive && pane>0) xrSurfaces[pane]?.let {session?.addWindowSurface(pane,it)}
                             }
                         }}
-                        extra.vr.setStereoCallbacks(::nativeStereoFormat,::nativeStereoFrame);xrExtraSessions[pane]=extra;xrQuickAppNames[pane]=device.alias;xrExtraDeviceIds[pane]=device.id
+                        extra.vr.setStereoCallbacks(::nativeStereoFormat,::nativeStereoFrame,::nativePcvrHaptic);xrExtraSessions[pane]=extra;xrQuickAppNames[pane]=device.alias;xrExtraDeviceIds[pane]=device.id
                         worker.execute {
                             try {
                                 if(!running.get()) {extra.close();org.openuuyc.pico.uu.UuRoomRelease.cancel(room);return@execute}
@@ -863,8 +872,8 @@ open class PicoActivity : Activity() {
 
     @Suppress("unused")
     fun onXrSurface(index: Int, surface: Surface) {
-        session?.vr?.setStereoCallbacks(::nativeStereoFormat,::nativeStereoFrame)
-        xrExtraSessions.values.forEach {it.vr.setStereoCallbacks(::nativeStereoFormat,::nativeStereoFrame)}
+        session?.vr?.setStereoCallbacks(::nativeStereoFormat,::nativeStereoFrame,::nativePcvrHaptic)
+        xrExtraSessions.values.forEach {it.vr.setStereoCallbacks(::nativeStereoFormat,::nativeStereoFrame,::nativePcvrHaptic)}
         ui.post {
             if (index == 7 && running.get()) {
                 xrWindowFrame?.close(); xrWindowFrame=PicoXrWindowFrame(surface).also { it.draw() };applyXrAppearance();session?.publishWindowInfo(); return@post
@@ -959,6 +968,17 @@ open class PicoActivity : Activity() {
             val temporary=java.io.File(filesDir,"pointer-probe.json.tmp")
             runCatching {temporary.writeText(pointerProbeStats.report().toString());check(temporary.renameTo(java.io.File(filesDir,"pointer-probe.json")))}
         }
+    }
+    fun onXrSurfaceProbeSurface(surface:Surface?,width:Int,height:Int) {
+        check(pcvrProbe && surface?.isValid==true && width==1280 && height==512) {"Invalid diagnostic stereo Surface"}
+    }
+    fun onXrSurfaceProbe(created:Boolean,reference:Int,error:Int,stageSupported:Boolean) {
+        if(!pcvrProbe)return
+        pcvrProbeStats.surface(created,reference,error,stageSupported);writePcvrInitializationProbe()
+    }
+    private fun writePcvrInitializationProbe() {
+        val tmp=java.io.File(filesDir,"pcvr-init-probe.tmp")
+        runCatching {tmp.writeText(pcvrProbeStats.initialization().toString());check(tmp.renameTo(java.io.File(filesDir,"pcvr-init-probe.json")))}
     }
     fun onXrStereoProbe(frames: Long,lw: Int,lh: Int,rw: Int,rh: Int,ipd: Float) {
         if(!pcvrProbe) return

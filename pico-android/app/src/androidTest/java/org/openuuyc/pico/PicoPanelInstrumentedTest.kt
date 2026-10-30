@@ -27,7 +27,7 @@ class PicoPanelInstrumentation : Instrumentation() {
         val error = AtomicReference<Throwable?>(null)
         if(phase=="native-ime") {
             try {verifyNativeIme()} catch(failure: Throwable) {error.set(failure)}
-        } else if(phase=="pcvr-stereo" || phase=="xr-pointer") {
+        } else if(phase=="pcvr-stereo" || phase=="xr-pointer" || phase=="pcvr-init") {
             try {verifyPcvrStereo()} catch(failure: Throwable) {error.set(failure)}
         } else runOnMainSync {
             try { when (phase) { "full-keyboard" -> verifyFullKeyboard(); "rounded-video" -> verifyRoundedVideo(); "controller-menu" -> verifyControllerMenu(); "focus-dots" -> verifyFocusDotsSetting(); "xr-menu" -> verifyXrGlobalMenu(); "quality" -> verifyQualityCanvas(); "profile" -> { val p=org.openuuyc.pico.uu.UuAndroidDeviceProfile.read(targetContext); check(p.memoryMiB>0 && p.cpu.isNotBlank() && p.screen.contains("x")); sendStatus(0,Bundle().apply {putString("stream","Hardware profile: CPU=${p.cpu}; memory=${p.memoryMiB} MiB; GPU=${p.video}; display=${p.screen}\n")}) }; "runtime" -> { val info=PicoRuntimeProbe.extensions(targetContext); check(!info.startsWith("error:")) { info }; sendStatus(0, Bundle().apply { putString("stream", "PICO runtime extensions:\n$info\n") }) }; "network-denied" -> verifyMissingNetworkPermission(); "network" -> verifyRtcStartup(); null -> verifyPanel(); else -> verifyVaultPhase(phase!!) } } catch (failure: Throwable) { error.set(failure) }
@@ -40,7 +40,8 @@ class PicoPanelInstrumentation : Instrumentation() {
     }
     private fun verifyPcvrStereo() {
         val pointer=phase=="xr-pointer"
-        val report=File(targetContext.filesDir,if(pointer) "pointer-probe.json" else "pcvr-probe.json")
+        val initialization=phase=="pcvr-init"
+        val report=File(targetContext.filesDir,if(initialization) "pcvr-init-probe.json" else if(pointer) "pointer-probe.json" else "pcvr-probe.json")
         val error=File(targetContext.filesDir,"pcvr-probe-error.txt")
         report.delete();error.delete()
         val intent=android.content.Intent(targetContext,XrActivity::class.java)
@@ -60,12 +61,15 @@ class PicoPanelInstrumentation : Instrumentation() {
                 check(!error.exists()) {error.readText()}
                 if(report.exists()) {
                     value=runCatching {org.json.JSONObject(report.readText())}.getOrNull()
+                    if(initialization && value?.optBoolean("surfaceAttempted")==true && android.os.SystemClock.elapsedRealtime()>=minimum)break
                     if((value?.optLong(if(pointer) "samples" else "projectionFrames") ?: 0)>=120 && android.os.SystemClock.elapsedRealtime()>=minimum) break
                 }
                 Thread.sleep(200)
             }
             val result=checkNotNull(value) {"No stereo projection report; wear/wake the headset and keep OpenUUYC focused"}
-            if(pointer) {
+            if(initialization) {
+                check(result.optBoolean("surfaceAttempted") && result.optBoolean("surfaceCreated")) {result.toString()}
+            } else if(pointer) {
                 check(result.getLong("samples")>=120 && result.getLong("leftValid")>0 && result.getLong("rightValid")>0) {result.toString()}
             } else {
                 check(result.getLong("projectionFrames")>=120 && result.getLong("headValid")>0) {result.toString()}

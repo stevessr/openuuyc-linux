@@ -256,6 +256,13 @@ pub(crate) fn stereo_component_available() -> Result<bool> {
     let (manifest, _) = bundle(&path)?;
     Ok(manifest.features.contains("stereo_cpu_v2"))
 }
+pub(crate) fn controller_component_available() -> Result<bool> {
+    let Some(path) = active_bundle()? else {
+        return Ok(false);
+    };
+    let (manifest, _) = bundle(&path)?;
+    Ok(manifest.features.contains("controller_input_v2"))
+}
 pub fn plan() -> Result<Plan> {
     let preference = preference()?;
     if preference == Preference::SteamVr {

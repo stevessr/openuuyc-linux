@@ -11,11 +11,12 @@ struct ouxd_snapshot {
     int64_t received_ns;
     uint32_t eye_width,eye_height;
     float refresh_hz;
-    uint32_t reserved;
+    uint32_t reserved; // bit0: measured STAGE pose present
     float views[22]; // per eye: xyz, xyzw, FOV left/right/up/down
-    uint8_t tracking[224];
+    uint8_t tracking[400];
+    float stage[7]; // xyz, xyzw: STAGE in LOCAL, only valid with reserved bit0
 };
-_Static_assert(sizeof(struct ouxd_snapshot)==360,"device snapshot ABI size");
+_Static_assert(sizeof(struct ouxd_snapshot)==568,"device snapshot ABI size");
 _Static_assert(offsetof(struct ouxd_snapshot,tracking)==136,"tracking offset");
 // Bounded seqlock read. Publisher is the authenticated host, readers never write.
 static inline int ouxd_copy(const volatile struct ouxd_snapshot *source,struct ouxd_snapshot *dest) {

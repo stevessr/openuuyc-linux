@@ -1,22 +1,26 @@
 //! Fixed-size, bounded binary tracking frames shared with drivers/pcvr/protocol.h.
 use anyhow::{Result, ensure};
 pub(crate) const FRAME_BYTES: usize = 224;
+pub(crate) const FRAME_V2_BYTES: usize = 400;
 pub(crate) fn sequence(frame: &[u8]) -> Result<u64> {
     ensure!(
-        frame.len() == FRAME_BYTES && &frame[..4] == b"OUVR",
+        matches!(frame.len(), FRAME_BYTES | FRAME_V2_BYTES) && &frame[..4] == b"OUVR",
         "invalid tracking frame"
     );
+    let version = u32::from_le_bytes(frame[4..8].try_into()?);
     ensure!(
-        u32::from_le_bytes(frame[4..8].try_into()?) == 1,
-        "unsupported tracking version"
+        (version == 1 && frame.len() == FRAME_BYTES)
+            || (version == 2 && frame.len() == FRAME_V2_BYTES),
+        "unsupported tracking version/size"
     );
+    let devices_end = if version == 2 { 352 } else { 224 };
     let sequence = u64::from_le_bytes(frame[8..16].try_into()?);
     ensure!(sequence > 0, "zero sequence");
-    for device in frame[32..].chunks_exact(64) {
+    for device in frame[32..devices_end].chunks_exact(64) {
         let flags = u32::from_le_bytes(device[..4].try_into()?);
         let buttons = u32::from_le_bytes(device[4..8].try_into()?);
         ensure!(
-            flags <= 15 && buttons <= 3 && device[60..64] == [0; 4],
+            flags <= if version == 2 { 63 } else { 15 } && buttons <= 3 && device[60..64] == [0; 4],
             "invalid tracking flags"
         );
         let mut values = [0f32; 13];
@@ -30,6 +34,25 @@ pub(crate) fn sequence(frame: &[u8]) -> Result<u64> {
         if flags & 1 != 0 {
             let norm: f32 = values[3..7].iter().map(|v| v * v).sum();
             ensure!((0.98..=1.02).contains(&norm), "invalid quaternion");
+        }
+    }
+    if version == 2 {
+        for control in frame[352..].chunks_exact(24) {
+            let flags = u32::from_le_bytes(control[..4].try_into()?);
+            let buttons = u32::from_le_bytes(control[4..8].try_into()?);
+            ensure!(flags <= 127 && buttons <= 15, "invalid controller flags");
+            for (i, bytes) in control[8..].chunks_exact(4).enumerate() {
+                let value = f32::from_le_bytes(bytes.try_into()?);
+                ensure!(
+                    value.is_finite()
+                        && if i < 2 {
+                            (0.0..=1.0).contains(&value)
+                        } else {
+                            (-1.0..=1.0).contains(&value)
+                        },
+                    "invalid controller axis"
+                );
+            }
         }
     }
     Ok(sequence)
@@ -57,6 +80,26 @@ mod tests {
         let mut f = frame();
         f[8] = 0;
         assert!(sequence(&f).is_err());
+    }
+    #[test]
+    fn v2_validates_real_aim_and_analog_controls() {
+        let mut f = frame();
+        f.resize(FRAME_V2_BYTES, 0);
+        f[4] = 2;
+        assert!(sequence(&f).is_ok());
+        f[32] = 51;
+        f[64..68].copy_from_slice(&1f32.to_le_bytes());
+        assert!(sequence(&f).is_ok());
+        assert!(sequence(&f[..224]).is_err());
+        f[224] = 3;
+        assert!(sequence(&f).is_err());
+        f[256..260].copy_from_slice(&1f32.to_le_bytes());
+        assert!(sequence(&f).is_ok());
+        f[360..364].copy_from_slice(&1.01f32.to_le_bytes());
+        assert!(sequence(&f).is_err());
+        f[360..364].copy_from_slice(&0.5f32.to_le_bytes());
+        f[368..372].copy_from_slice(&(-1f32).to_le_bytes());
+        assert!(sequence(&f).is_ok());
     }
     #[test]
     fn head_requires_both_orientation_and_position() {

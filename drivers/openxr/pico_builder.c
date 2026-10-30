@@ -35,10 +35,15 @@ static int open_map(struct pico_map *map) {
     map->fd=fd;map->data=data;return 1;
 }
 static int snapshot(struct pico_map *map,struct ouxd_snapshot *out) {
-    if(!map->data || !ouxd_copy(map->data,out) || memcmp(out->magic,"OUXD",4) || out->version!=1 || !out->generation) return 0;
+    if(!map->data || !ouxd_copy(map->data,out) || memcmp(out->magic,"OUXD",4) || (out->version!=1 && out->version!=2) || !out->generation) return 0;
     int64_t now=os_monotonic_get_ns();
     if(out->received_ns<=0 || out->received_ns>now || now-out->received_ns>250000000) return 0;
     if(out->eye_width<64 || out->eye_width>4096 || out->eye_height<64 || out->eye_height>4096 || out->eye_width%2 || out->eye_height%2 || !isfinite(out->refresh_hz) || out->refresh_hz<30 || out->refresh_hz>165) return 0;
+    if(out->reserved&~1u)return 0;
+    if(out->reserved&1) {
+        float norm=0;for(int i=0;i<7;i++) {if(!isfinite(out->stage[i]) || fabsf(out->stage[i])>1000)return 0;if(i>=3)norm+=out->stage[i]*out->stage[i];}
+        if(norm<.98f || norm>1.02f)return 0;
+    }
     float ipd2=0;
     for(int eye=0;eye<2;++eye) {
         float *v=out->views+eye*11;float norm=0;
@@ -52,7 +57,7 @@ static int snapshot(struct pico_map *map,struct ouxd_snapshot *out) {
     for(int i=0;i<3;++i) {float d=out->views[i]-out->views[11+i];ipd2+=d*d;}
     if(ipd2<.0009f || ipd2>.01f || memcmp(out->tracking,"OUVR",4)) return 0;
     uint32_t version,flags;memcpy(&version,out->tracking+4,4);memcpy(&flags,out->tracking+32,4);
-    if(version!=1 || (flags&3)!=3) return 0;
+    if(version!=out->version || (flags&3)!=3) return 0;
     float head[13];memcpy(head,out->tracking+40,sizeof(head));float norm=0;
     for(int i=0;i<13;++i) if(!isfinite(head[i]) || fabsf(head[i])>1000) return 0;
     for(int i=3;i<7;++i) {norm+=head[i]*head[i];}
@@ -62,6 +67,8 @@ static int same_calibration(const struct ouxd_snapshot *a,const struct ouxd_snap
     if(a->eye_width!=b->eye_width || a->eye_height!=b->eye_height ||
        fabsf(a->refresh_hz-b->refresh_hz)>.1f) return 0;
     for(int i=0;i<22;i++) if(fabsf(a->views[i]-b->views[i])>.0001f) return 0;
+    if(a->reserved!=b->reserved)return 0;
+    if(a->reserved&1)for(int i=0;i<7;i++)if(fabsf(a->stage[i]-b->stage[i])>.0001f)return 0;
     return 1;
 }
 /* Existing applications retain their XrInstance/XrSession. Reopen only a fresh,
@@ -98,6 +105,8 @@ static xrt_result_t tracked(struct xrt_device *device,enum xrt_input_name name,i
     float p[13];uint32_t flags;memcpy(&flags,frame.tracking+32,4);memcpy(p,frame.tracking+40,sizeof(p));
     out->pose.position=(struct xrt_vec3){p[0],p[1],p[2]};out->pose.orientation=(struct xrt_quat){p[3],p[4],p[5],p[6]};
     out->relation_flags=XRT_SPACE_RELATION_ORIENTATION_VALID_BIT|XRT_SPACE_RELATION_POSITION_VALID_BIT;
+    if(frame.version==2 && (flags&17)==17)out->relation_flags|=XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
+    if(frame.version==2 && (flags&34)==34)out->relation_flags|=XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
     if(flags&4) {out->linear_velocity=(struct xrt_vec3){p[7],p[8],p[9]};out->relation_flags|=XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT;}
     if(flags&8) {out->angular_velocity=(struct xrt_vec3){p[10],p[11],p[12]};out->relation_flags|=XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;}
     return XRT_SUCCESS;
@@ -125,8 +134,9 @@ static struct xrt_device *create_hmd(void) {
     for(int eye=0;eye<2;++eye) {struct xrt_view *v=&d->hmd->views[eye];v->viewport.x_pixels=eye*initial.eye_width;v->viewport.y_pixels=0;v->viewport.w_pixels=initial.eye_width;v->viewport.h_pixels=initial.eye_height;v->display.w_pixels=initial.eye_width;v->display.h_pixels=initial.eye_height;v->rot=u_device_rotation_ident;const float *f=initial.views+eye*11+7;d->hmd->distortion.fov[eye]=(struct xrt_fov){f[0],f[1],f[2],f[3]};}
     u_distortion_mesh_set_none(d);return d;
 }
-static xrt_result_t roles(struct xrt_system_devices *system,struct xrt_system_roles *out) {(void)system;struct xrt_system_roles r=XRT_SYSTEM_ROLES_INIT;r.generation_id=1;*out=r;return XRT_SUCCESS;}
-static void destroy_system(struct xrt_system_devices *system) {for(uint32_t i=0;i<system->static_xdev_count;++i) xrt_device_destroy(&system->static_xdevs[i]);free(system);}
+#include "controller_device.h"
+static xrt_result_t roles(struct xrt_system_devices *system,struct xrt_system_roles *out) {(void)system;struct xrt_system_roles r=XRT_SYSTEM_ROLES_INIT;r.generation_id=1;r.left=1;r.right=2;r.left_profile=XRT_DEVICE_TOUCH_CONTROLLER;r.right_profile=XRT_DEVICE_TOUCH_CONTROLLER;*out=r;return XRT_SUCCESS;}
+static void destroy_system(struct xrt_system_devices *system) {for(uint32_t i=system->static_xdev_count;i>0;--i) xrt_device_destroy(&system->static_xdevs[i-1]);free(system);}
 static xrt_result_t estimate(struct xrt_builder *builder,cJSON *config,struct xrt_prober *prober,struct xrt_builder_estimate *out) {
     (void)builder;(void)config;(void)prober;memset(out,0,sizeof(*out));struct pico_map map;struct ouxd_snapshot frame;int available=open_map(&map);if(available) {available=snapshot(&map,&frame);close_map(&map);}out->certain.head=available;out->priority=100;return XRT_SUCCESS;
 }
@@ -134,10 +144,24 @@ static xrt_result_t open_system(struct xrt_builder *builder,cJSON *config,struct
     (void)builder;(void)config;(void)prober;
     struct xrt_device *head=create_hmd();if(!head) return XRT_ERROR_DEVICE_CREATION_FAILED;
     struct xrt_system_devices *system=U_TYPED_CALLOC(struct xrt_system_devices);u_system_devices_populate_function_pointers(system,roles,destroy_system);system->create_io_cache=b_io_cache_create;system->static_xdevs[0]=head;system->static_xdev_count=1;system->static_roles.head=head;
+    for(int hand=0;hand<2;hand++) {
+        struct xrt_device *controller=create_controller((struct pico_hmd*)head,hand);
+        if(!controller) {destroy_system(system);return XRT_ERROR_DEVICE_CREATION_FAILED;}
+        system->static_xdevs[system->static_xdev_count++]=controller;
+    }
     struct b_space_overseer *bso=b_space_overseer_create(events);struct xrt_space_overseer *space=(struct xrt_space_overseer*)bso;
     struct xrt_space *offset=NULL;b_space_overseer_create_offset_space(bso,space->semantic.root,&head->tracking_origin->initial_offset,&offset);
-    b_space_overseer_link_space_to_device(bso,offset,head);xrt_space_reference(&offset,NULL);
-    // Headset LOCAL is not a measured floor: do not invent STAGE/local-floor height.
+    b_space_overseer_link_space_to_device(bso,offset,head);
+    for(int hand=0;hand<2;hand++)b_space_overseer_link_space_to_device(bso,offset,system->static_xdevs[hand+1]);
+    xrt_space_reference(&offset,NULL);
+    // Only export STAGE when PICO supplied a measured transform in LOCAL.
+    struct pico_hmd *h=(struct pico_hmd*)head;
+    if(h->calibration.reserved&1) {
+        const float *v=h->calibration.stage;
+        struct xrt_pose stage={{v[3],v[4],v[5],v[6]},{v[0],v[1],v[2]}};
+        b_space_overseer_create_offset_space(bso,space->semantic.root,&stage,&space->semantic.stage);
+    }
+    // No measured play-area bounds or LOCAL_FLOOR is invented.
     struct xrt_pose identity=XRT_POSE_IDENTITY;b_space_overseer_create_offset_space(bso,space->semantic.root,&identity,&space->semantic.local);
     b_space_overseer_create_pose_space(bso,head,XRT_INPUT_GENERIC_HEAD_POSE,&space->semantic.view);
     *out_system=system;*out_space=space;return XRT_SUCCESS;

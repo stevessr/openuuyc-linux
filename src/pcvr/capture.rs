@@ -52,7 +52,11 @@ pub(crate) fn read_latest(file: &File, previous: u64) -> Result<Option<RawFrame>
         u32_at(44) == 0,
         "external compositor coordinate space requires alignment before PICO projection"
     );
-    let sequence = u64_at(16);
+    // Producer frame IDs restart at one when an attached application restarts.
+    // The export inode's seqlock serial persists across producer ownership, so
+    // use completed publications as the transport sequence (same generation).
+    ensure!(u64_at(16) > 0, "invalid compositor source frame id");
+    let sequence = guard / 2;
     if sequence <= previous {
         return Ok(None);
     }
@@ -86,10 +90,12 @@ pub(crate) fn read_latest(file: &File, previous: u64) -> Result<Option<RawFrame>
         );
     }
     let mut bgra = vec![0; w * h * 8];
-    let mut row = vec![0; w * 4];
+    // Exported eye pixels are tightly packed. One read per eye avoids a
+    // syscall for every scanline at headset frame rates; reuse the eye buffer.
+    let mut pixels = vec![0; w * h * 4];
     for eye in 0..2 {
-        for y in 0..h {
-            file.read_exact_at(&mut row, (HEADER + eye * EYE_BYTES + y * w * 4) as u64)?;
+        file.read_exact_at(&mut pixels, (HEADER + eye * EYE_BYTES) as u64)?;
+        for (y, row) in pixels.chunks_exact(w * 4).enumerate() {
             let output = &mut bgra[y * w * 8 + eye * w * 4..y * w * 8 + (eye + 1) * w * 4];
             for (src, dst) in row.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
                 dst.copy_from_slice(&[src[2], src[1], src[0], 255]);
@@ -185,6 +191,21 @@ mod tests {
         assert_eq!(&frame.bgra[256..260], &[7, 6, 5, 255]);
         assert_eq!(frame.views[6], 1.);
         assert!(read_latest(&file, 1).unwrap().is_none());
+    }
+    #[test]
+    fn new_application_source_ids_do_not_stall_an_existing_export() {
+        let file = fixture();
+        file.write_all_at(&200u64.to_le_bytes(), 0).unwrap();
+        file.write_all_at(&50_000u64.to_le_bytes(), 16).unwrap();
+        let old = read_latest(&file, 0).unwrap().unwrap();
+        assert_eq!(old.sequence, 100);
+        // A replacement compositor starts at source frame one, in the same map.
+        file.write_all_at(&202u64.to_le_bytes(), 0).unwrap();
+        file.write_all_at(&1u64.to_le_bytes(), 16).unwrap();
+        let replacement = read_latest(&file, old.sequence).unwrap().unwrap();
+        assert_eq!(replacement.sequence, 101);
+        assert_eq!(replacement.views, old.views);
+        assert!(read_latest(&file, replacement.sequence).unwrap().is_none());
     }
     #[test]
     fn rejects_unaligned_external_compositor_space() {
