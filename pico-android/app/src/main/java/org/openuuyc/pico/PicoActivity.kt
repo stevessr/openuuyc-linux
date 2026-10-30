@@ -93,7 +93,7 @@ open class PicoActivity : Activity() {
         val pane=paneHint ?: xrActivePane
         if(pane !in 0..5 || xrPaneVisible.get(pane)==0) return if(paneHint!=null) "该窗口已不可见，请重新打开设置后再调整尺寸" else "先指向一个可见串流窗口，再调整尺寸"
         nativeScaleWindow(pane,direction)
-        return "当前窗口${if(direction>0) "放大" else "缩小"}6% · 保持比例"
+        return "已请求${if(direction>0) "放大" else "缩小"}6% · 保持比例（达到${if(direction>0) "上限" else "下限"}后不再变化）"
     }
 
     private var panelMicButton: Button?=null
