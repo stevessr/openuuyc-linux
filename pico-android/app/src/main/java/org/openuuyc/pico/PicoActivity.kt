@@ -89,9 +89,9 @@ open class PicoActivity : Activity() {
     }
     private fun currentXrSession()=xrSettingsSession ?: xrExtraSessions[xrActivePane] ?: session
 
-    private fun adjustActiveXrWindow(direction: Int): String {
-        val pane=xrActivePane
-        if(pane !in 0..5 || xrPaneVisible.get(pane)==0) return "先指向一个可见串流窗口，再调整尺寸"
+    private fun adjustActiveXrWindow(paneHint: Int?,direction: Int): String {
+        val pane=paneHint ?: xrActivePane
+        if(pane !in 0..5 || xrPaneVisible.get(pane)==0) return if(paneHint!=null) "该窗口已不可见，请重新打开设置后再调整尺寸" else "先指向一个可见串流窗口，再调整尺寸"
         nativeScaleWindow(pane,direction)
         return "当前窗口${if(direction>0) "放大" else "缩小"}6% · 保持比例"
     }
@@ -930,7 +930,7 @@ open class PicoActivity : Activity() {
             3 -> xrToolbar?.confirmVirtualScreen()
             4 -> toggleMicrophone(target)
             5 -> target?.setClipboardEnabled(!target.clipboardEnabled)
-            else -> target?.windowScreen(if(extra!=null) 0 else pane)?.let {xrToolbar?.openScreenSettings(it)}
+            else -> target?.windowScreen(if(extra!=null) 0 else pane)?.let {xrToolbar?.openScreenSettings(it,pane)}
         }
     }}
 

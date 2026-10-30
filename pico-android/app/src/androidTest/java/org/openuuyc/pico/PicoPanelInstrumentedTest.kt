@@ -193,23 +193,21 @@ class PicoPanelInstrumentation : Instrumentation() {
 
     private fun verifyWindowScaleMenu() {
         val reader=android.media.ImageReader.newInstance(1200,800,android.graphics.PixelFormat.RGBA_8888,4)
-        val steps=mutableListOf<Int>()
+        val steps=mutableListOf<Pair<Int?,Int>>()
         val menu=PicoXrToolbar(surface=reader.surface,session={null},followView={},reset={},touchMode={},keyboardModeChanged={},
             appearance={_,_,_->},closeScreenMenu={},home={},connectImmersive={_,_->},pickBackground={},useImage={},
             backgroundAction={},menuShape={},connectedIds={emptySet()},disconnect={})
-        menu.setWindowScale { direction -> steps.add(direction); "窗口已微调" }
-        fun click(index: Int) {
-            val r=PicoXrMenuHit.toolbarRect(index)
-            menu.activate((r[0]+r[2])/1200f,(r[1]+r[3])/800f)
+        menu.setWindowScale { paneHint,direction -> steps.add(paneHint to direction); "窗口已微调" }
+        fun clickRow(index: Int) {
+            val y=PicoXrDropdownLayout.ROW_TOP+index*PicoXrDropdownLayout.ROW_HEIGHT+(PicoXrDropdownLayout.ROW_HEIGHT-8f)/2
+            menu.activate(.5f,y/800f)
             reader.acquireLatestImage()?.close()
         }
         try {
-            menu.openScreenSettings(0)
-            click(7);click(7);click(1) // Advanced settings is the second entry on the last quality-ring page.
-            click(5) // Per-window size action remains on the first advanced ring page.
-            click(4)
-            click(5)
-            assertEquals(listOf(-1,1),steps)
+            menu.openScreenSettings(0,paneHint=3)
+            clickRow(0)
+            clickRow(1)
+            assertEquals(listOf(3 to -1,3 to 1),steps)
         } finally {menu.close();reader.close()}
     }
 
@@ -292,14 +290,16 @@ class PicoPanelInstrumentation : Instrumentation() {
     }
 
     private fun verifyQualityCanvas() {
-        val state=org.openuuyc.pico.uu.UuRemoteSettingsState().apply {
-            selected=0;current=current.copy(fps=165)
-            profiles=listOf(org.openuuyc.pico.uu.UuCodecProfile(1,1920,1080,165))
-            screens=listOf(org.openuuyc.pico.uu.UuRemoteScreen(0,0,"显示器1",165,org.openuuyc.pico.uu.UuDisplayMode(1920,1080),emptyList(),100,emptyList()))
-        }
-        val bitmap=Bitmap.createBitmap(600,1000,Bitmap.Config.ARGB_8888)
-        val canvas=Canvas(bitmap);canvas.scale(.5f,2.5f)
-        PicoXrQualityCanvas.draw(canvas,state,-1f,-1f,false,"本地画质菜单测试 · 非真实串流")
+        val rows=listOf(
+            PicoXrDropdownRow("编码偏好","自动"),
+            PicoXrDropdownRow("视频帧率","90 fps"),
+            PicoXrDropdownRow("视频码率","120 / 500 Mbps",PicoXrDropdownRow.SLIDER,sliderFraction=.24f),
+            PicoXrDropdownRow("焦点圆点","开启",PicoXrDropdownRow.TOGGLE),
+            PicoXrDropdownRow("缩小 XR 窗口（−6%）",kind=PicoXrDropdownRow.ACTION)
+        )
+        val bitmap=Bitmap.createBitmap(600,400,Bitmap.Config.ARGB_8888)
+        val canvas=Canvas(bitmap);canvas.scale(.5f,.5f)
+        PicoXrDropdownCanvas.draw(canvas,"本地画质菜单测试",rows,0,-1f,-1f,false,"非真实串流")
         File(targetContext.cacheDir,"xr-quality-fixture.png").outputStream().use {check(bitmap.compress(Bitmap.CompressFormat.PNG,100,it))}
         bitmap.recycle()
     }
@@ -412,15 +412,15 @@ class PicoPanelInstrumentation : Instrumentation() {
     private fun verifyXrMaterials() {
         val bitmap=Bitmap.createBitmap(1200,2000,Bitmap.Config.ARGB_8888)
         fun render(name: String,draw: (Canvas)->Unit) {
-            val c=Canvas(bitmap);c.scale(1f,5f);draw(c)
+            val c=Canvas(bitmap);c.scale(1f,2.5f);draw(c)
             assertEquals(0,android.graphics.Color.alpha(bitmap.getPixel(0,0)))
             val alpha=android.graphics.Color.alpha(bitmap.getPixel(600,1000))
             assertTrue(alpha in 180..254) // Real alpha, not opaque painted faux glass.
             File(targetContext.cacheDir,"pico-ui-xr-$name.png").outputStream().use {bitmap.compress(Bitmap.CompressFormat.PNG,100,it)}
         }
-        render("quality") {PicoXrQualityCanvas.draw(it,null,.4f,.2f,false,"等待真实远端能力")}
-        render("options") {PicoXrOptionCanvas.draw(it,"编码偏好",listOf("自动","H.264","H.265"),0,0,30,.4f,.2f,"仅作绘制测试")}
-        render("bitrate") {PicoXrOptionCanvas.draw(it,"自定义码率",emptyList(),-1,0,120,.75f,.8f,"尚未应用")}
+        render("quality") {PicoXrDropdownCanvas.draw(it,"画质",listOf(PicoXrDropdownRow("编码偏好","自动"),PicoXrDropdownRow("帧率","90 fps")),0,.4f,.2f,false,"等待真实远端能力")}
+        render("options") {PicoXrDropdownCanvas.draw(it,"编码偏好",listOf(PicoXrDropdownRow("自动"),PicoXrDropdownRow("H.264"),PicoXrDropdownRow("H.265")),0,.4f,.2f,false,"仅作绘制测试")}
+        render("bitrate") {PicoXrDropdownCanvas.draw(it,"自定义码率",listOf(PicoXrDropdownRow("视频码率","120 / 500 Mbps",PicoXrDropdownRow.SLIDER,sliderFraction=.24f),PicoXrDropdownRow("取消",kind=PicoXrDropdownRow.ACTION),PicoXrDropdownRow("应用 120 Mbps",kind=PicoXrDropdownRow.ACTION,selected=true)),0,.75f,.8f,false,"尚未应用",0)}
         bitmap.recycle()
     }
 

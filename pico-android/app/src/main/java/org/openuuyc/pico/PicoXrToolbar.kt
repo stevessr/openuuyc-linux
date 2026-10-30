@@ -120,7 +120,7 @@ internal class PicoXrToolbar(
         closeScreenMenu()
         menuVisible=!(menuVisible && quickHand==hand);quickHand=if(menuVisible) hand else -1
         controllerHand=2;previousLayout=-1;navigationCell=0;stickFocused=false
-        optionTitle=null;optionApply=null;devicePage=false;screenPage=false;spacePage=false;environmentPage=false;backgroundPage=false;keyboardPage=false;targetScreen=null;collapsed=false
+        optionTitle=null;optionApply=null;devicePage=false;screenPage=false;spacePage=false;environmentPage=false;backgroundPage=false;keyboardPage=false;targetScreen=null;targetPaneHint=null;collapsed=false;dropdownOffset=0;sliderDrag=-1
         notice="左 X / 右 A 唤起 · 摇杆选择、松开执行 · 内侧扳机拖动"
         draw();if(menuVisible) navigate(0,false)
     }
@@ -130,8 +130,14 @@ internal class PicoXrToolbar(
         if(direction>=100 && keyboardPage) return
         if(confirm && !stickSelectionValid) return
         val hit: (Float,Float)->Int? = if(!isRoot() && !keyboardPage) {
-            val count=ringEntries().size;val page=ringPage
-            {u,v->PicoXrMenuHit.toolbar(u,v)?.takeIf {PicoXrRingPage.enabled(it,page,count)}}
+            // Dropdown pages: joystick up/down scrolls rows past the visible window.
+            {u,v->PicoXrDropdownLayout.hit(u,v,if(qualityPage()) qualityRows().size else dropdownRows().size,dropdownOffset)?.also {index ->
+                if(index>=0) {
+                    val visible=PicoXrDropdownLayout.visibleRows
+                    if(index<dropdownOffset) dropdownOffset=PicoXrDropdownLayout.pageOf(index)
+                    if(index>=dropdownOffset+visible) dropdownOffset=(index-visible+1).coerceAtLeast(0)
+                }
+            }}
         } else ::hoverCell
         val selected=PicoMenuNavigation.select(navigationCell,direction,hit) ?: run {stickSelectionValid=false;return}
         if(direction>=100) stickSelectionValid=true
@@ -158,7 +164,8 @@ internal class PicoXrToolbar(
     private var screenOffset=0
     private var devices=emptyList<org.openuuyc.pico.uu.UuDevice>()
     private var pendingTakeover: org.openuuyc.pico.uu.UuDevice?=null
-    fun showHome(list: List<org.openuuyc.pico.uu.UuDevice>) {optionTitle=null;optionApply=null;pendingTakeover=null;confirmingVirtual=false;devices=list;deviceOffset=deviceOffset.coerceAtMost(PicoXrOptionLayout.pageOf((list.size-1).coerceAtLeast(0)));backgroundPage=false;environmentPage=false;spacePage=false;devicePage=true;screenPage=false;keyboardPage=false;targetScreen=null;notice="主页面 · 仅沉浸式连接 · 当前串流保持运行";draw()}
+    fun showHome(list: List<org.openuuyc.pico.uu.UuDevice>) {optionTitle=null;optionApply=null;pendingTakeover=null;confirmingVirtual=false;devices=list;deviceOffset=deviceOffset.coerceAtMost(PicoXrDropdownLayout.pageOf((list.size-1).coerceAtLeast(0)));backgroundPage=false;environmentPage=false;spacePage=false;devicePage=true;screenPage=false;keyboardPage=false;targetScreen=null;targetPaneHint=null;dropdownOffset=0;notice="主页面 · 仅沉浸式连接 · 当前串流保持运行";draw()}
+    private var targetPaneHint: Int?=null
     private var targetScreen: Int?=null
     private var advanced=false
     private var portrait=false
@@ -172,7 +179,7 @@ internal class PicoXrToolbar(
     private var optionApply: ((Int)->Unit)?=null
     private var bitrateDraft=30
     private fun options(title: String, labels: List<String>, selected: Int, apply: (Int)->Unit) {
-        optionIcons=emptyList();optionTitle=title;optionLabels=labels;optionSelected=selected;optionOffset=PicoXrOptionLayout.pageOf(selected);optionApply=apply
+        optionIcons=emptyList();optionTitle=title;optionLabels=labels;optionSelected=selected;optionOffset=PicoXrDropdownLayout.pageOf(selected);optionApply=apply
     }
     private fun bitrate(current: org.openuuyc.pico.uu.UuCaptureSettings, direct: UuDirectSession) {
         bitrateDraft=current.bitrateMbps.coerceIn(1,500)
@@ -180,21 +187,27 @@ internal class PicoXrToolbar(
             check(direct.applySettings(current.copy(quality=6,bitrateMbps=bitrateDraft),targetScreen=targetScreen)) {"控制通道未就绪"}
         }
     }
+    private fun optionRows(): List<PicoXrDropdownRow> = if(optionTitle=="自定义码率") listOf(
+        PicoXrDropdownRow("视频码率","$bitrateDraft / 500 Mbps",PicoXrDropdownRow.SLIDER,sliderFraction=bitrateDraft/500f),
+        PicoXrDropdownRow("取消",kind=PicoXrDropdownRow.ACTION),
+        PicoXrDropdownRow("应用 $bitrateDraft Mbps",kind=PicoXrDropdownRow.ACTION,selected=true)
+    ) else optionLabels.mapIndexed {index,label ->
+        PicoXrDropdownRow(label,"",selected=index==optionSelected)
+    }
     private fun optionClick(u: Float,v: Float) {
         try {
             if(optionTitle=="自定义码率") {
-                if(v<.1f) {optionTitle=null;optionApply=null}
-                else if(v in .25f.. .65f) bitrateDraft=PicoXrOptionLayout.bitrate(u)
-                else if(v in .7f.. .92f) {
-                    if(u>.5f) optionApply?.invoke(bitrateDraft)
-                    optionTitle=null
+                val rows=optionRows().size
+                when(PicoXrDropdownLayout.hit(u,v,rows,optionOffset)) {
+                    -1 -> {optionTitle=null;optionApply=null}
+                    0 -> bitrateDraft=PicoXrDropdownLayout.sliderValue(PicoXrDropdownLayout.sliderFraction(u,v,0,rows,optionOffset) ?: return,1,500)
+                    1 -> {optionTitle=null;optionApply=null}
+                    2 -> {val apply=optionApply;optionTitle=null;optionApply=null;apply?.invoke(bitrateDraft)}
                 }
-            } else PicoXrOptionLayout.hit(u,v,(optionLabels.size-optionOffset).coerceAtLeast(0))?.let {i ->
+            } else PicoXrDropdownLayout.hit(u,v,optionLabels.size,optionOffset)?.let {i ->
                 when(i) {
-                    8 -> optionOffset=(optionOffset-8).coerceAtLeast(0)
-                    9 -> if(optionOffset+8<optionLabels.size) optionOffset+=8
-                    10,11 -> optionTitle=null
-                    else -> if(optionOffset+i<optionLabels.size) {optionApply?.invoke(optionOffset+i);optionTitle=null}
+                    -1 -> {optionTitle=null;optionApply=null}
+                    else -> if(optionOffset+i<optionLabels.size) {val apply=optionApply;optionTitle=null;optionApply=null;apply?.invoke(i);draw();return}
                 }
             }
         } catch(e: Exception) {notice=e.message ?: "设置未完成"}
@@ -209,8 +222,8 @@ internal class PicoXrToolbar(
     private var brightness=75
     private var backgroundFlow=true
     private var spacePage=false
-    private var windowScale: (Int) -> String = { "请先选中一个串流窗口" }
-    fun setWindowScale(action: (Int) -> String) { windowScale=action }
+    private var windowScale: (Int?,Int) -> String = {_,_-> "请先选中一个串流窗口" }
+    fun setWindowScale(action: (Int?,Int) -> String) {windowScale=action}
     private var mrVisibility=100
     private var customImage=false
     fun setAppearance(visibility: Int,custom: Boolean,color: Int,preset: String="black",brightness: Int=75,flow: Boolean=true) {
@@ -221,11 +234,11 @@ internal class PicoXrToolbar(
     private val backgrounds=listOf(Color.BLACK,Color.rgb(15,20,28),Color.rgb(12,22,42))
     private var backgroundIndex=0
     fun setMr(enabled: Boolean) {mr=enabled;draw()}
-    fun openScreenSettings(screen: Int) {optionTitle=null;optionApply=null;pendingTakeover=null;confirmingVirtual=false;targetScreen=screen;advanced=false;backgroundPage=false;environmentPage=false;spacePage=false;devicePage=false;screenPage=false;keyboardPage=false;notice="屏幕设置 · ${session()?.screenSnapshot()?.firstOrNull {it.id==screen} ?: screen}";draw()}
-    fun openScreens() {optionTitle=null;optionApply=null;pendingTakeover=null;confirmingVirtual=false;keyboardPage=false;spacePage=false;screenOffset=0;targetScreen=null;advanced=false;devicePage=false;environmentPage=false;backgroundPage=false;screenPage=true;menuScreens=session()?.screenSnapshot().orEmpty();screenOffset=PicoXrOptionLayout.pageOf(menuScreens.indexOfFirst {it.id==session()?.selectedScreen()});notice="选择显示器";draw()}
+    fun openScreenSettings(screen: Int,paneHint: Int?=null) {optionTitle=null;optionApply=null;pendingTakeover=null;confirmingVirtual=false;targetScreen=screen;targetPaneHint=paneHint;advanced=false;backgroundPage=false;environmentPage=false;spacePage=false;devicePage=false;screenPage=false;keyboardPage=false;dropdownOffset=0;notice="屏幕设置 · ${session()?.screenSnapshot()?.firstOrNull {it.id==screen} ?: screen}";draw()}
+    fun openScreens() {optionTitle=null;optionApply=null;pendingTakeover=null;confirmingVirtual=false;keyboardPage=false;spacePage=false;screenOffset=0;targetScreen=null;targetPaneHint=null;advanced=false;devicePage=false;environmentPage=false;backgroundPage=false;screenPage=true;menuScreens=session()?.screenSnapshot().orEmpty();screenOffset=PicoXrDropdownLayout.pageOf(menuScreens.indexOfFirst {it.id==session()?.selectedScreen()});dropdownOffset=0;notice="选择显示器";draw()}
     fun confirmVirtualScreen() {optionTitle=null;
         if((session()?.settingsSnapshot()?.captureLevel ?: 0)<5) {status("远端未开放虚拟屏能力");return}
-        confirmingVirtual=true;pendingTakeover=null;keyboardPage=false;environmentPage=false;backgroundPage=false;spacePage=false;devicePage=false;screenPage=false;notice="确认在远端创建1920×1080虚拟屏？";draw()
+        confirmingVirtual=true;pendingTakeover=null;keyboardPage=false;environmentPage=false;backgroundPage=false;spacePage=false;devicePage=false;screenPage=false;dropdownOffset=0;notice="确认在远端创建1920×1080虚拟屏？";draw()
     }
     private var keyboardPage=false
     private var keyboardMode=PicoKeyboardMode.CUSTOM
@@ -243,12 +256,10 @@ internal class PicoXrToolbar(
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private fun hoverCell(u: Float,v: Float): Int? = when {
         terminalTarget!=null -> if(v in .81f.. .89f && u in 0f..<1f) (u*8).toInt() else null
-        !isRoot() && !keyboardPage -> ringHit(u,v)
-        optionTitle!=null -> PicoXrOptionLayout.hit(u,v,optionLabels.size)
-        devicePage || screenPage -> PicoXrSelectionCanvas.hit(u,v,8)
-        qualityPage() -> PicoXrQualityLayout.hit(u,v)
+        optionTitle!=null -> PicoXrDropdownLayout.hit(u,v,optionRows().size,optionOffset)
+        !isRoot() && !keyboardPage -> PicoXrDropdownLayout.hit(u,v,dropdownRows().size,dropdownOffset)
         isRoot() -> PicoXrMenuHit.toolbar(u,v)
-        else -> PicoXrMenuHit.settings(u,v)
+        else -> PicoXrDropdownLayout.hit(u,v,dropdownRows().size,dropdownOffset)
     }
     fun hover(u: Float,v: Float,down: Boolean) {
         if(stickFocused && !down) return
@@ -264,9 +275,25 @@ internal class PicoXrToolbar(
                 if(voiceGesture.up(android.os.SystemClock.elapsedRealtime())==PicoVoiceGesture.Action.STOP) voiceStop()
             }
         }
+        if(sliderDrag>=0) {
+            pressed=down
+            if(down) dragSlider(u,v) else endSliderDrag()
+            return
+        }
+        if(down) {
+            // Rising press edge: entering a slider track starts a drag immediately,
+            // because the native menu click only reports on release.
+            val rows=dropdownRowsForDrag()
+            if(rows!=null) rows.forEachIndexed {index,row ->
+                if(row.kind==PicoXrDropdownRow.SLIDER && PicoXrDropdownLayout.sliderFraction(u,v,index,rows.size,dropdownOffset)!=null) {
+                    sliderDrag=index;applySlider(index,PicoXrDropdownLayout.sliderFraction(u,v,index,rows.size,dropdownOffset)!!,rows);pressed=true;return
+                }
+            }
+        }
+        if(!down && pressed) endSliderDrag()
         val previousCell=hoverCell(hoverU,hoverV)
         val nextCell=hoverCell(u,v)
-        val continuous=keyboardPage
+        val continuous=keyboardPage || sliderDrag>=0
         val redraw=pressed!=down || previousCell!=nextCell ||
             (continuous && (kotlin.math.abs(u-hoverU)>=.003f || kotlin.math.abs(v-hoverV)>=.003f))
         hoverU=u;hoverV=v;pressed=down
@@ -295,11 +322,11 @@ internal class PicoXrToolbar(
         }
         if(!isRoot() && !keyboardPage) {
             try {
-                val entries=ringEntries()
-                when(val cell=ringHit(u,v)) {
-                    6->{ringPage--;draw()};7->{ringPage++;draw()};10->ringBack()
-                    null->Unit
-                    else->entries.getOrNull(ringPage*6+cell)?.run?.invoke()
+                when {
+                    optionTitle!=null->optionClick(u,v)
+                    (devicePage || screenPage) && pendingTakeover==null->dropdownClick(u,v,selectionRows())
+                    qualityPage()->dropdownClick(u,v,qualityRows())
+                    else->dropdownClick(u,v,dropdownRows())
                 }
             } catch(e: Exception) {notice=e.message ?: "操作未完成";draw()}
             return
@@ -309,25 +336,8 @@ internal class PicoXrToolbar(
     private fun activateLegacy(u: Float, v: Float) {
         if(isRoot() && collapsed) {collapsed=false;draw();return}
         if(optionTitle!=null) {optionClick(u,v);return}
-        if((devicePage || screenPage) && pendingTakeover==null) {
-            PicoXrSelectionCanvas.hit(u,v,if(devicePage) minOf(8,(devices.size-deviceOffset).coerceAtLeast(0)) else minOf(8,(menuScreens.size-screenOffset).coerceAtLeast(0)))?.let(::click)
-            return
-        }
-        if(qualityPage()) {
-            PicoXrQualityLayout.hit(u,v)?.let {action ->
-                if(action==99 || action==98) {advanced=true;draw();return}
-                if(action in 102..105 || action>=200) {
-                    try {
-                        val direct=session() ?: return
-                        val current=direct.settingsSnapshot(targetScreen).current
-                        val next=if(action>=200) current.copy(fps=action-200) else current.copy(quality=action-100)
-                        check(direct.applySettings(next,targetScreen=targetScreen)) {"控制通道未就绪"}
-                    } catch(e: Exception) {notice=e.message ?: "设置未完成"}
-                    draw()
-                } else click(action)
-            }
-            return
-        }
+        if((devicePage || screenPage) && pendingTakeover==null) {dropdownClick(u,v,selectionRows());return}
+        if(qualityPage()) {dropdownClick(u,v,qualityRows());return}
         if(keyboardPage) {
             when(PicoKeyboardLayout.headerAt(keyboardMode,u,v)) {
                 PicoKeyboardLayout.Header.MODE->{keyboardKeys.release();voiceCancel();keyboardOptions()}
@@ -343,15 +353,350 @@ internal class PicoXrToolbar(
         if(isRoot()) PicoXrMenuHit.toolbar(u,v)?.let {index ->
             when(index) {
                 0 -> inputOptions()
-                3 -> {spacePage=true;notice="空间布局 · 尺寸每次调整6%，保持比例；最小宽40cm，最大对角线100英寸";draw()}
+                3 -> {spacePage=true;dropdownOffset=0;notice="空间布局 · 跟随与固定使用菜单按钮";draw()}
                 8 -> {setFollowing(true);draw()}
                 9 -> {setFollowing(false);draw()}
                 10 -> {collapsed=true;draw()}
-                4 -> {environmentPage=true;notice="环境 · MR 透视与背景";draw()}
+                4 -> {environmentPage=true;dropdownOffset=0;notice="环境 · MR 透视与背景";draw()}
                 else -> click(listOf(10,8,2,0,4,6,7,11)[index])
             }
-        } else PicoXrMenuHit.settings(u,v,if(confirmingVirtual) 4 else 12)?.let(::click)
+        } else dropdownClick(u,v,dropdownRows())
     }
+    /** --- Dropdown model: one page = one flat list; two levels max, sliders for deep knobs. --- */
+    private var dropdownOffset=0
+    private var sliderDrag=-1
+
+    private fun dropdownTitle()=when {
+        pendingTakeover!=null->"抢占确认"
+        backgroundPage->"背景库"
+        environmentPage->"环境"
+        spacePage->"空间布局"
+        confirmingVirtual->"创建虚拟屏"
+        targetScreen!=null->"屏幕设置 · ${session()?.screenSnapshot()?.firstOrNull {it.id==targetScreen} ?: targetScreen}"
+        devicePage->"设备"
+        screenPage->"显示器"
+        else->"串流设置"
+    }
+
+    private fun selectionRows(): List<PicoXrDropdownRow> {
+        val rows=if(devicePage) devices.map {device ->
+            PicoXrDropdownRow(device.alias,if(device.online && device.controllable) "在线" else "不可连接",selected=device.id in connectedIds(),enabled=device.online && device.controllable)
+        } else menuScreens.map {screen ->
+            PicoXrDropdownRow(screen.name.ifBlank {"屏幕 ${screen.id+1}"},"${screen.current ?: ""}",selected=screen.id==session()?.selectedScreen(),enabled=true)
+        }
+        return rows+if(devicePage) listOf(PicoXrDropdownRow("刷新设备列表",kind=PicoXrDropdownRow.ACTION),PicoXrDropdownRow("返回主菜单",kind=PicoXrDropdownRow.ACTION))
+        else listOf(PicoXrDropdownRow("刷新屏幕",kind=PicoXrDropdownRow.ACTION),PicoXrDropdownRow("返回串流设置",kind=PicoXrDropdownRow.ACTION))
+    }
+
+    private fun windowScaleRows(): List<PicoXrDropdownRow> = listOf(
+        PicoXrDropdownRow("缩小 XR 窗口（−6%）","保持比例",PicoXrDropdownRow.ACTION),
+        PicoXrDropdownRow("放大 XR 窗口（＋6%）","保持比例",PicoXrDropdownRow.ACTION)
+    )
+
+    private fun qualityRows(): List<PicoXrDropdownRow> {
+        val scaleRows=windowScaleRows()
+        val state=session()?.settingsSnapshot(targetScreen)
+            ?: return scaleRows+listOf(PicoXrDropdownRow("等待串流就绪…",enabled=false),PicoXrDropdownRow("返回",kind=PicoXrDropdownRow.ACTION))
+        val c=state.current
+        val source=state.screens.firstOrNull {it.id==state.selected}
+        val ceiling=minOf(source?.fps ?: 0,state.profiles.filter {c.codec==0 || it.codec==c.codec}.maxOfOrNull {it.fps} ?: 0)
+        return listOf(
+            PicoXrDropdownRow("画质",when(c.quality) {5->"自动（原画）";4->"原画";3->"超清";2->"高清";else->"${c.quality}"}),
+            PicoXrDropdownRow("帧率上限","${c.fps} FPS",enabled=ceiling>0),
+            PicoXrDropdownRow("视频码率","${c.bitrateMbps} / 500 Mbps",PicoXrDropdownRow.SLIDER,sliderFraction=c.bitrateMbps/500f),
+            PicoXrDropdownRow("编码偏好",when(c.codec) {1->"H.264";2->"H.265";5->"AV1";else->"自动"})
+        )+scaleRows+listOf(
+            PicoXrDropdownRow("显示器分辨率与 DPI","当前屏幕 ›"),
+            PicoXrDropdownRow("高级设置","›"),
+            PicoXrDropdownRow("返回串流设置",kind=PicoXrDropdownRow.ACTION)
+        )
+    }
+
+    private fun dropdownRows(): List<PicoXrDropdownRow> = when {
+        pendingTakeover!=null->listOf(
+            PicoXrDropdownRow("确认抢占 · 断开现有会话",kind=PicoXrDropdownRow.ACTION,danger=true),
+            PicoXrDropdownRow("取消",kind=PicoXrDropdownRow.ACTION)
+        )
+        confirmingVirtual->listOf(
+            PicoXrDropdownRow("确认创建 1920×1080 虚拟屏",kind=PicoXrDropdownRow.ACTION,selected=true),
+            PicoXrDropdownRow("取消",kind=PicoXrDropdownRow.ACTION)
+        )
+        backgroundPage->PicoBackgroundPattern.presets.map {preset ->
+            PicoXrDropdownRow(preset.label,if(preset.procedural) "程序生成" else "",selected=!customImage && selectedPreset==preset.id)
+        }+listOf(PicoXrDropdownRow("返回环境设置",kind=PicoXrDropdownRow.ACTION))
+        environmentPage->listOf(
+            PicoXrDropdownRow("MR 透视",if(mr) "开启" else "关闭",PicoXrDropdownRow.TOGGLE),
+            PicoXrDropdownRow("透视可见度","$mrVisibility%",PicoXrDropdownRow.SLIDER,sliderFraction=mrVisibility/100f),
+            PicoXrDropdownRow("图片背景",if(customImage) "开启" else "关闭",PicoXrDropdownRow.TOGGLE),
+            PicoXrDropdownRow("选择图片 / 全景图…",kind=PicoXrDropdownRow.ACTION),
+            PicoXrDropdownRow("背景颜色",when(backgroundIndex) {0->"全黑";1->"深灰";else->"深蓝"}),
+            PicoXrDropdownRow("背景库 · 更多图案","›"),
+            PicoXrDropdownRow("重新生成图案",kind=PicoXrDropdownRow.ACTION),
+            PicoXrDropdownRow("背景亮度","$brightness%",PicoXrDropdownRow.SLIDER,sliderFraction=brightness/100f),
+            PicoXrDropdownRow("背景流动",if(backgroundFlow) "开启" else "关闭",PicoXrDropdownRow.TOGGLE),
+            PicoXrDropdownRow("返回主菜单",kind=PicoXrDropdownRow.ACTION)
+        )
+        spacePage->listOf(
+            PicoXrDropdownRow("跟随视角",if(followPending) "切换中…" else if(following) "开启" else "关闭",PicoXrDropdownRow.TOGGLE,enabled=!followPending),
+            PicoXrDropdownRow("固定窗口",kind=PicoXrDropdownRow.ACTION),
+            PicoXrDropdownRow("重置到当前视角",kind=PicoXrDropdownRow.ACTION),
+            PicoXrDropdownRow("缩小 XR 窗口（−6%）","保持比例",PicoXrDropdownRow.ACTION),
+            PicoXrDropdownRow("放大 XR 窗口（＋6%）","保持比例",PicoXrDropdownRow.ACTION),
+            PicoXrDropdownRow("焦点圆点",if(focusDots) "开启" else "关闭（默认）",PicoXrDropdownRow.TOGGLE),
+            PicoXrDropdownRow("主菜单位置",when(controllerHand) {0->"左手柄";1->"右手柄";else->"悬浮（推荐）"}),
+            PicoXrDropdownRow("窗口尺寸范围","宽度 ≥ 40 cm · 对角线 ≤ 100 英寸",enabled=false),
+            PicoXrDropdownRow("返回主菜单",kind=PicoXrDropdownRow.ACTION)
+        )
+        targetScreen!=null->screenSettingRows()
+        devicePage || screenPage->selectionRows()
+        else->streamSettingRows()
+    }
+
+    private fun screenSettingRows(): List<PicoXrDropdownRow> {
+        val direct=session() ?: return listOf(PicoXrDropdownRow("请先连接设备",enabled=false),PicoXrDropdownRow("返回",kind=PicoXrDropdownRow.ACTION))
+        val state=direct.settingsSnapshot(targetScreen)
+        val source=state.screens.firstOrNull {it.id==targetScreen} ?: return listOf(PicoXrDropdownRow("屏幕已移除",enabled=false),PicoXrDropdownRow("返回",kind=PicoXrDropdownRow.ACTION))
+        val c=state.current
+        return listOf(
+            PicoXrDropdownRow("帧率上限","${c.fps} FPS"),
+            PicoXrDropdownRow("画质",when(c.quality) {5->"自动（原画）";4->"原画";3->"超清";2->"高清";else->"${c.quality}"}),
+            PicoXrDropdownRow("视频码率","${c.bitrateMbps} / 500 Mbps",PicoXrDropdownRow.SLIDER,sliderFraction=c.bitrateMbps/500f),
+            PicoXrDropdownRow("编码偏好",when(c.codec) {1->"H.264";2->"H.265";5->"AV1";else->"自动"}),
+            PicoXrDropdownRow("串流尺寸","${c.maxWidth} × ${c.maxHeight}"),
+            PicoXrDropdownRow("屏幕分辨率",source.current?.toString() ?: "未知"),
+            PicoXrDropdownRow("DPI 缩放","${source.dpi}%"),
+            PicoXrDropdownRow("远端光标",if(c.cursor) "开启" else "关闭",PicoXrDropdownRow.TOGGLE),
+            PicoXrDropdownRow("创建虚拟屏",kind=PicoXrDropdownRow.ACTION,enabled=state.captureLevel>=5),
+            PicoXrDropdownRow("屏幕信息","${source.name} · ${source.current ?: "?"} · ${source.dpi}%"),
+            PicoXrDropdownRow("收起屏幕设置",kind=PicoXrDropdownRow.ACTION)
+        )
+    }
+
+    private fun streamSettingRows(): List<PicoXrDropdownRow> = listOf(
+        PicoXrDropdownRow("跟随视角",if(followPending) "切换中…" else if(following) "开启" else "关闭",PicoXrDropdownRow.TOGGLE,enabled=!followPending),
+        PicoXrDropdownRow("重置空间布局",kind=PicoXrDropdownRow.ACTION),
+        PicoXrDropdownRow("切换屏幕","›"),
+        PicoXrDropdownRow("创建虚拟屏",kind=PicoXrDropdownRow.ACTION),
+        PicoXrDropdownRow("MR 透视",if(mr) "开启" else "关闭",PicoXrDropdownRow.TOGGLE),
+        PicoXrDropdownRow("环境与背景","›"),
+        PicoXrDropdownRow("主页面",kind=PicoXrDropdownRow.ACTION),
+        PicoXrDropdownRow("键盘与输入","›"),
+        PicoXrDropdownRow("应用与 VR 游戏","›"),
+        PicoXrDropdownRow("输入模式",if(usingTouch) "触摸" else "鼠标"),
+        PicoXrDropdownRow("断开全部连接",kind=PicoXrDropdownRow.ACTION,danger=true)
+    )
+
+    /** Slider drag: while pressed over a slider row, the knob follows the pointer. */
+    fun dragSlider(u: Float,v: Float) {
+        if(sliderDrag<0) return
+        val rows=dropdownRowsForDrag() ?: return
+        val fraction=PicoXrDropdownLayout.sliderFraction(u,v,sliderDrag,rows.size,dropdownOffset) ?: return
+        applySlider(sliderDrag,fraction,rows)
+    }
+    fun endSliderDrag() {sliderDrag=-1;draw()}
+    private fun dropdownRowsForDrag()=when {
+        optionTitle!=null->if(optionTitle=="自定义码率") optionRows() else null
+        qualityPage()->qualityRows()
+        devicePage || screenPage->selectionRows()
+        else->dropdownRows()
+    }
+    private fun applySlider(index: Int,fraction: Float,rows: List<PicoXrDropdownRow>) {
+        val row=rows.getOrNull(index) ?: return
+        when {
+            optionTitle=="自定义码率" && index==0 -> bitrateDraft=PicoXrDropdownLayout.sliderValue(fraction,1,500)
+            (qualityPage() || targetScreen!=null) && row.label=="视频码率" -> {
+                val direct=session() ?: return
+                val current=direct.settingsSnapshot(targetScreen).current
+                val value=PicoXrDropdownLayout.sliderValue(fraction,1,500)
+                if(value!=current.bitrateMbps) try {
+                    check(direct.applySettings(current.copy(quality=current.quality,bitrateMbps=value),targetScreen=targetScreen)) {"控制通道未就绪"}
+                } catch(e: Exception) {notice=e.message ?: "设置未完成"}
+            }
+            environmentPage && row.label=="透视可见度" -> {mrVisibility=PicoXrDropdownLayout.sliderValue(fraction,0,100);appearance(mr,selectedColor,mrVisibility)}
+            environmentPage && row.label=="背景亮度" -> {brightness=PicoXrDropdownLayout.sliderValue(fraction,0,100);backgroundAction("brightness:$brightness")}
+        }
+        draw()
+    }
+
+    /** One click handler for every dropdown page (device/screen/quality/space/environment/...). */
+    private fun dropdownClick(u: Float,v: Float,rows: List<PicoXrDropdownRow>) {
+        try {
+            if(sliderDrag>=0) return // hover() owns the active slider drag; release already ended it.
+            val hit=PicoXrDropdownLayout.hit(u,v,rows.size,dropdownOffset)
+            if(hit==null) return
+            if(hit==-1) { // header: back/close
+                closeDropdownPage();draw();return
+            }
+            val row=rows.getOrNull(hit) ?: return
+            if(!row.enabled) return
+            dropdownAction(hit,row)
+        } catch(e: Exception) {notice=e.message ?: "操作未完成"}
+        draw()
+    }
+
+    private fun closeDropdownPage() {
+        when {
+            optionTitle!=null->{optionTitle=null;optionApply=null}
+            backgroundPage->{backgroundPage=false}
+            pendingTakeover!=null->{pendingTakeover=null;notice="已取消抢占"}
+            confirmingVirtual->confirmingVirtual=false
+            devicePage->{devicePage=false;deviceOffset=0;home()}
+            screenPage->{screenPage=false;screenOffset=0;closeScreenMenu();notice="已返回串流设置"}
+            qualityPage()->{advanced=false;if(targetScreen!=null) {targetScreen=null;targetPaneHint=null}}
+            targetScreen!=null->{targetScreen=null;targetPaneHint=null;closeScreenMenu();notice="串流设置请从各窗口顶部展开"}
+            environmentPage || spacePage->{environmentPage=false;spacePage=false;backgroundPage=false}
+            else->{}
+        }
+        dropdownOffset=0
+    }
+
+    private fun dropdownAction(index: Int,row: PicoXrDropdownRow) {
+        val label=row.label
+        when {
+            pendingTakeover!=null->{
+                val device=pendingTakeover
+                pendingTakeover=null
+                if(label.startsWith("确认") && device!=null) connectImmersive(device,true) else notice="已取消抢占"
+            }
+            confirmingVirtual->{
+                confirmingVirtual=false
+                if(label.startsWith("确认")) {
+                    val direct=session() ?: return
+                    check(direct.createVirtualDisplay()) {"控制通道未就绪"}
+                    notice="已请求创建；等待远端屏幕列表，不代表创建成功"
+                } else notice="已取消创建"
+            }
+            backgroundPage->{
+                if(label=="返回环境设置") {backgroundPage=false}
+                else PicoBackgroundPattern.presets.firstOrNull {it.label==label}?.let {backgroundAction(it.id);notice="正在准备 ${it.label}…"}
+            }
+            environmentPage->when(label) {
+                "MR 透视"->mr=!mr
+                "图片背景"->{customImage=!customImage;useImage(customImage)}
+                "选择图片 / 全景图…"->{pickBackground();notice="请在系统选择器中选择图片"}
+                "背景颜色"->{backgroundIndex=(backgroundIndex+1)%3;backgroundAction(PicoBackgroundPattern.presets.getOrNull(backgroundIndex)?.id ?: "black")}
+                "背景库 · 更多图案"->{backgroundPage=true;dropdownOffset=0}
+                "重新生成图案"->{backgroundAction("regenerate");return}
+                "背景流动"->{backgroundFlow=!backgroundFlow;backgroundAction("flow");return}
+                "返回主菜单"->{environmentPage=false;backgroundPage=false}
+            }
+            spacePage->when(label) {
+                "跟随视角"->{if(!followPending) {session()?.releaseInputs();followPending=true;followView(!following)};return}
+                "固定窗口"->setFollowing(false)
+                "重置到当前视角"->{reset();return}
+                "焦点圆点"->{focusDots=!focusDots;focusDotsChanged(focusDots);notice=if(focusDots) "焦点圆点已开启" else "焦点圆点已隐藏；射线与点击保持可用"}
+                "缩小 XR 窗口（−6%）"->notice=windowScale(null,-1)
+                "放大 XR 窗口（＋6%）"->notice=windowScale(null,1)
+                "主菜单位置"->{controllerHand=when(controllerHand) {2->0;0->1;else->2};previousLayout=-1}
+                "返回主菜单"->spacePage=false
+            }
+            qualityPage()->qualityAction(label)
+            devicePage->when {
+                label=="刷新设备列表"->{home();return}
+                label=="返回主菜单"->{devicePage=false;deviceOffset=0;return}
+                else->devices.firstOrNull {it.alias==label}?.let {device ->
+                    check(device.online && device.controllable) {"设备离线或未开放控制"}
+                    if(device.occupants>0) {pendingTakeover=device;notice="抢占 ${device.alias} 会断开现有会话，是否确认？"}
+                    else connectImmersive(device,false)
+                }
+            }
+            screenPage->when {
+                label=="刷新屏幕"->{menuScreens=session()?.screenSnapshot().orEmpty();screenOffset=0;return}
+                label=="返回串流设置"->{screenPage=false;closeScreenMenu();notice="已返回串流设置";return}
+                else->menuScreens.firstOrNull {it.name.ifBlank {"屏幕 ${it.id+1}"}==label}?.let {
+                    val direct=session() ?: return
+                    check(direct.switchScreen(it.id)) {"切屏未发送：屏幕已变化或通道未就绪"}
+                }
+            }
+            targetScreen!=null->screenSettingAction(label)
+            else->streamSettingAction(label)
+        }
+    }
+
+    /** Quality dropdown actions: direct apply or one submenu deep (lists stay single-level). */
+    private fun qualityAction(label: String) {
+        if(label=="缩小 XR 窗口（−6%）") {notice=windowScale(targetPaneHint,-1);return}
+        if(label=="放大 XR 窗口（＋6%）") {notice=windowScale(targetPaneHint,1);return}
+        val direct=session() ?: return
+        val current=direct.settingsSnapshot(targetScreen).current
+        fun set(next: org.openuuyc.pico.uu.UuCaptureSettings) {check(direct.applySettings(next,targetScreen=targetScreen)) {"控制通道未就绪"}}
+        when(label) {
+            "画质"->options("画质",listOf("高清","超清","原画","自动（原画）"),listOf(2,3,4,5).indexOf(current.quality).coerceAtLeast(0)) {set(current.copy(quality=listOf(2,3,4,5)[it]))}
+            "帧率上限"->{
+                val state=direct.settingsSnapshot(targetScreen)
+                val source=state.screens.firstOrNull {it.id==state.selected}
+                val ceiling=minOf(source?.fps ?: 0,state.profiles.filter {current.codec==0 || it.codec==current.codec}.maxOfOrNull {it.fps} ?: 0)
+                val values=listOf(30,60,90,120,144,165,240).filter {it<=ceiling}
+                options("帧率上限",values.map {"$it FPS"},values.indexOf(current.fps)) {set(current.copy(fps=values[it]))}
+            }
+            "编码偏好"->{
+                val values=direct.settingsSnapshot(targetScreen).selectableProfiles()
+                options("编码偏好",values.map {when(it.codec) {0->"自动";1->"H.264";2->"H.265";else->"编码 ${it.codec}"}},values.indexOfFirst {it.codec==current.codec}) {set(current.copy(codec=values[it].codec,fps=minOf(current.fps,values[it].fps),maxWidth=minOf(current.maxWidth,values[it].width),maxHeight=minOf(current.maxHeight,values[it].height)))}
+            }
+            "显示器分辨率与 DPI"->{
+                val state=direct.settingsSnapshot(targetScreen)
+                val source=state.screens.firstOrNull {it.id==state.selected} ?: return
+                options("显示器分辨率与 DPI",source.modes.map {it.toString()}+source.dpis.map {"DPI $it%"},-1) {choice ->
+                    if(choice<source.modes.size) check(direct.applySettings(current,physical=source.modes[choice],targetScreen=targetScreen)) {"控制通道未就绪"}
+                    else check(direct.applySettings(current,dpi=source.dpis[choice-source.modes.size],targetScreen=targetScreen)) {"控制通道未就绪"}
+                }
+            }
+            "高级设置"->{
+                val state=direct.settingsSnapshot(targetScreen)
+                val sizes=listOf(1280 to 720,1920 to 1080,2560 to 1440,3840 to 2160).filter {v->state.profiles.any {(current.codec==0 || current.codec==it.codec) && v.first<=it.width && v.second<=it.height}}
+                options("高级设置 · 串流尺寸",sizes.map {"${it.first} × ${it.second}"},sizes.indexOf(current.maxWidth to current.maxHeight)) {val next=sizes[it];set(current.copy(maxWidth=next.first,maxHeight=next.second))}
+            }
+            "返回串流设置"->{if(targetScreen!=null) {targetScreen=null;targetPaneHint=null};advanced=false}
+        }
+    }
+
+    private fun screenSettingAction(label: String) {
+        val direct=session() ?: return
+        val screen=targetScreen ?: return
+        val state=direct.settingsSnapshot(screen)
+        val source=state.screens.firstOrNull {it.id==screen} ?: return
+        val current=state.current
+        fun set(next: org.openuuyc.pico.uu.UuCaptureSettings) {check(direct.applySettings(next,targetScreen=screen)) {"控制通道未就绪"}}
+        when(label) {
+            "帧率上限"->{
+                val ceiling=minOf(source.fps,state.profiles.filter {current.codec==0 || it.codec==current.codec}.maxOfOrNull {it.fps} ?: 0)
+                val values=listOf(30,60,90,120,144,165,240).filter {it<=ceiling}
+                options("帧率上限",values.map {"$it FPS"},values.indexOf(current.fps).coerceAtLeast(0)) {set(current.copy(fps=values[it]))}
+            }
+            "画质"->options("画质",listOf("高清","超清","原画","自动（原画）"),listOf(2,3,4,5).indexOf(current.quality).coerceAtLeast(0)) {set(current.copy(quality=listOf(2,3,4,5)[it]))}
+            "编码偏好"->{
+                val values=state.selectableProfiles()
+                options("编码偏好",values.map {when(it.codec) {0->"自动";1->"H.264";2->"H.265";else->"编码 ${it.codec}"}},values.indexOfFirst {it.codec==current.codec}.coerceAtLeast(0)) {set(current.copy(codec=values[it].codec))}
+            }
+            "串流尺寸"->{
+                val values=listOf(1280 to 720,1920 to 1080,2560 to 1440,3840 to 2160).filter {v->state.profiles.any {(current.codec==0 || current.codec==it.codec) && v.first<=it.width && v.second<=it.height}}
+                options("串流尺寸",values.map {"${it.first} × ${it.second}"},values.indexOf(current.maxWidth to current.maxHeight).coerceAtLeast(0)) {val next=values[it];set(current.copy(maxWidth=next.first,maxHeight=next.second))}
+            }
+            "屏幕分辨率"->options("屏幕分辨率",source.modes.map {it.toString()},source.modes.indexOf(source.current)) {check(direct.applySettings(current,physical=source.modes[it],targetScreen=screen)) {"控制通道未就绪"}}
+            "DPI 缩放"->options("DPI 缩放",source.dpis.map {"$it%"},source.dpis.indexOf(source.dpi)) {check(direct.applySettings(current,dpi=source.dpis[it],targetScreen=screen)) {"控制通道未就绪"}}
+            "远端光标"->set(current.copy(cursor=!current.cursor))
+            "创建虚拟屏"->{confirmingVirtual=true;notice="确认创建 1920×1080 虚拟屏？"}
+            "收起屏幕设置"->{targetScreen=null;targetPaneHint=null;closeScreenMenu();notice="串流设置请从各窗口顶部展开"}
+        }
+    }
+
+    private fun streamSettingAction(label: String) {
+        when(label) {
+            "跟随视角"->{if(!followPending) {session()?.releaseInputs();followPending=true;followView(!following);notice="正在切换跟随模式…"}}
+            "重置空间布局"->{reset();notice="已重置六个桌面的空间布局"}
+            "切换屏幕"->openScreens()
+            "创建虚拟屏"->confirmVirtualScreen()
+            "MR 透视"->mr=!mr
+            "环境与背景"->{environmentPage=true;dropdownOffset=0;notice="环境 · MR 与背景";return}
+            "主页面"->{closeScreenMenu();home()}
+            "键盘与输入"->keyboardOptions()
+            "应用与 VR 游戏"->click(7)
+            "输入模式"->inputOptions()
+            "断开全部连接"->disconnect()
+        }
+    }
+
+
     fun click(cell: Int) {
         try {
             if(backgroundPage) {
@@ -381,8 +726,8 @@ internal class PicoXrToolbar(
                     2 -> setFollowing(true)
                     3 -> setFollowing(false)
                     7 -> options("主菜单位置",listOf("悬浮菜单（推荐）","左手柄","右手柄"),if(controllerHand==2) 0 else controllerHand+1) {controllerHand=if(it==0) 2 else it-1;previousLayout=-1}
-                    4 -> notice=windowScale(-1)
-                    5 -> notice=windowScale(1)
+                    4 -> notice=windowScale(null,-1)
+                    5 -> notice=windowScale(null,1)
                     6 -> {focusDots=!focusDots;focusDotsChanged(focusDots);notice=if(focusDots) "焦点圆点已开启" else "焦点圆点已隐藏；射线与点击保持可用"}
                     11 -> {spacePage=false;notice=if(targetScreen!=null) "已返回窗口设置" else "已返回主菜单"}
                 }
@@ -489,7 +834,7 @@ internal class PicoXrToolbar(
                     8 -> screenOffset=(screenOffset-8).coerceAtLeast(0)
                     9 -> if(screenOffset+8<menuScreens.size) screenOffset+=8
                     11 -> { screenPage=false;closeScreenMenu();notice="已返回串流设置" }
-                    10 -> { menuScreens=direct.screenSnapshot();screenOffset=screenOffset.coerceAtMost(PicoXrOptionLayout.pageOf((menuScreens.size-1).coerceAtLeast(0)));notice="选择远端屏幕 · 当前项显示勾选" }
+                    10 -> { menuScreens=direct.screenSnapshot();screenOffset=screenOffset.coerceAtMost(PicoXrDropdownLayout.pageOf((menuScreens.size-1).coerceAtLeast(0)));notice="选择远端屏幕 · 当前项显示勾选" }
                     else -> menuScreens.getOrNull(screenOffset+cell)?.let {
                         check(direct.switchScreen(it.id)) { "切屏未发送：屏幕已变化或通道未就绪" }
                     }
@@ -523,7 +868,7 @@ internal class PicoXrToolbar(
                     7 -> options("DPI 缩放",source.dpis.map {"$it%"},source.dpis.indexOf(source.dpi)) {check(direct.applySettings(current,dpi=source.dpis[it],targetScreen=screen)) {"控制通道未就绪"}}
                     8 -> {confirmingVirtual=true;notice="确认创建 1920×1080 虚拟屏？"}
                     10 -> notice="${source.name} · ${source.current} · DPI ${source.dpi}%"
-                    11 -> {targetScreen=null;closeScreenMenu();notice="串流设置请从各窗口顶部展开"}
+                    11 -> {targetScreen=null;targetPaneHint=null;closeScreenMenu();notice="串流设置请从各窗口顶部展开"}
                 }
                 draw();return
             }
@@ -571,47 +916,6 @@ internal class PicoXrToolbar(
         "", "", "",
         if(targetScreen!=null) "返回窗口设置" else "返回主菜单"
     )
-    private data class RingEntry(val label: String,val icon: android.graphics.Bitmap?=null,val run: ()->Unit)
-    private var ringPage=0
-    private var ringKey=""
-    private fun ringEntries(): List<RingEntry> {
-        fun legacy(label: String,u: Float,v: Float)=RingEntry(label) {activateLegacy(u,v)}
-        val entries=when {
-            optionTitle=="自定义码率" -> listOf(-10,-1,1,10).map {delta->RingEntry("${if(delta>0) "+" else ""}$delta Mbps") {bitrateDraft=(bitrateDraft+delta).coerceIn(1,500);draw()}}+
-                listOf(RingEntry("应用 $bitrateDraft Mbps") {val apply=optionApply;optionTitle=null;optionApply=null;apply?.invoke(bitrateDraft);draw()},RingEntry("取消") {optionTitle=null;draw()})
-            optionTitle!=null -> optionLabels.mapIndexed {index,label->RingEntry("${if(index==optionSelected) "✓ " else ""}$label",optionIcons.getOrNull(index)) {val apply=optionApply;optionTitle=null;optionApply=null;apply?.invoke(index);draw()}}
-            (devicePage || screenPage) && pendingTakeover==null -> {
-                val rows=if(devicePage) devices.mapIndexed {i,d->RingEntry("${if(d.id in connectedIds()) "✓ " else ""}${d.alias} · ${if(d.online) "在线" else "离线"}") {deviceOffset=i;click(0)}}
-                    else menuScreens.mapIndexed {i,d->RingEntry("${if(d.id==session()?.selectedScreen()) "✓ " else ""}${d.name}") {screenOffset=i;click(0)}}
-                rows+RingEntry("刷新") {click(10)}
-            }
-            qualityPage() -> listOf(RingEntry("音频 · ${session()?.nativeAudioStatus() ?: "未连接"}") {
-                options("音频播放模式 · 重连生效",listOf("音游 · 声音不等待画面","音画同步 · 兼顾观看"),if(session()?.nextRhythmAudio!=false) 0 else 1) {index->
-                    session()?.setRhythmAudioForNextConnection(index==0);notice="音频模式已保存，重连串流生效";draw()
-                };draw()
-            })+PicoXrQualityLayout.items.filter {it.action!=11}.map {item->
-                val label=when(item.action) {3->"编码偏好";105->"自动（原画）";104->"原画";103->"超清";102->"高清";2->"自定义码率";98->"分辨率与 DPI";99->"高级设置";else->"${item.action-200} FPS"}
-                legacy(label,(item.x+item.w/2)/600,(item.y+item.h/2)/1000)
-            }
-            backgroundPage -> PicoBackgroundPattern.presets.map {preset->RingEntry(preset.label) {backgroundAction(preset.id);draw()}}
-            else -> settingsLabels().mapIndexedNotNull {i,label->if(label.isBlank()) null else RingEntry(label) {click(i)}}
-        }
-        val key="${optionTitle}:${devicePage}:${screenPage}:${qualityPage()}:${environmentPage}:${spacePage}:${backgroundPage}:${pendingTakeover!=null}:${confirmingVirtual}:${targetScreen}:"+entries.map {it.label}.joinToString("|")
-        // The bitrate's draft is a changing value, not a navigation transition.
-        val stable=if(optionTitle=="自定义码率") "bitrate" else key
-        if(stable!=ringKey) {ringKey=stable;ringPage=0}
-        ringPage=PicoXrRingPage.clamp(ringPage,entries.size)
-        return entries
-    }
-    private fun ringTitle()=optionTitle ?: when {devicePage->"设备";screenPage->"显示器";backgroundPage->"背景库";environmentPage->"环境";spacePage->if(targetScreen!=null) "窗口大小" else "空间";qualityPage()->"画质";else->"串流设置"}
-    private fun ringBack() {
-        when {optionTitle!=null->{optionTitle=null;optionApply=null};backgroundPage->{backgroundPage=false;environmentPage=true};else->click(11)}
-        draw()
-    }
-    private fun ringHit(u: Float,v: Float): Int? {
-        val entries=ringEntries()
-        return PicoXrMenuHit.toolbar(u,v)?.takeIf {PicoXrRingPage.enabled(it,ringPage,entries.size)}
-    }
     fun draw() {
         val nextPortrait=false
         val layout=if(!menuVisible) 4 else if(nextPortrait) 2 else if(isRoot() && collapsed) 3 else if(!keyboardPage) 0 else if(keyboardMode==PicoKeyboardMode.FULL) 5 else 1
@@ -640,37 +944,19 @@ internal class PicoXrToolbar(
                 return
             }
             if(!keyboardPage) {
-                val entries=ringEntries()
-                val labels=(0..5).map {entries.getOrNull(ringPage*6+it)?.label ?: ""}+listOf(if(ringPage>0) "‹ 上一页" else "",if((ringPage+1)*6<entries.size) "下一页 ›" else "")
-                PicoXrControllerCanvas.draw(canvas,labels,false,false,controllerHand,hoverU,hoverV,notice,
-                    icons=false,title="${ringTitle()} · ${ringPage+1}/${PicoXrRingPage.pages(entries.size)}",
-                    previous=ringPage>0,next=(ringPage+1)*6<entries.size,appIcons=(0..5).map {entries.getOrNull(ringPage*6+it)?.icon})
+                // All sub pages are dropdown panels now (except keyboard pages).
+                val rows=when {
+                    optionTitle!=null->optionRows()
+                    (devicePage || screenPage) && pendingTakeover==null->selectionRows()
+                    qualityPage()->qualityRows()
+                    else->dropdownRows()
+                }
+                val title=if(optionTitle!=null) optionTitle!! else dropdownTitle()
+                PicoXrDropdownCanvas.draw(canvas,title,rows,if(optionTitle!=null) optionOffset else dropdownOffset,hoverU,hoverV,pressed,notice)
                 return
             }
-            if(optionTitle!=null) {
-                PicoXrOptionCanvas.draw(canvas,optionTitle!!,optionLabels,optionSelected,optionOffset,bitrateDraft,hoverU,hoverV,notice,pressed)
-                return
-            }
-            if((devicePage || screenPage) && pendingTakeover==null) {
-                val rows=if(devicePage) devices.drop(deviceOffset).take(8).map {PicoXrSelectionCanvas.Row(it.alias,if(it.online && it.controllable) "在线" else "不可连接",it.id in connectedIds(),it.online && it.controllable)}
-                    else menuScreens.drop(screenOffset).take(8).map {PicoXrSelectionCanvas.Row(it.toString(),it.current?.toString() ?: "",it.id==session()?.selectedScreen(),true)}
-                PicoXrSelectionCanvas.draw(canvas,if(devicePage) "切换设备  ▾  ·  连接到新空间窗口" else "显示器  ▾  ·  当前屏幕",rows,hoverU,hoverV);return
-            }
-            if(qualityPage()) {PicoXrQualityCanvas.draw(canvas,session()?.settingsSnapshot(targetScreen),hoverU,hoverV,pressed,notice);return}
-            PicoXrMaterial.panel(canvas,1200f,if(keyboardPage) PicoKeyboardLayout.height(keyboardMode) else 400f)
-            PicoXrMaterial.label(canvas,notice,24f,32f,1152f,24f,medium=true)
-            val state=session()?.settingsSnapshot(targetScreen); val c=state?.current
-            if(keyboardPage) PicoKeyboardCanvas.draw(canvas,keyboardMode,keyboardKeys,hoverU,hoverV,voiceActive)
-            val labels=settingsLabels()
-            labels.forEachIndexed { i,label ->
-                if(label.isBlank()) return@forEachIndexed
-                val box=PicoXrMenuHit.settingsRect(i)
-                val x=box[0];val y=box[1];val right=box[2];val bottom=box[3]
-                val hovered = hoverU*1200 in x..right && hoverV*400 in y..bottom
-                PicoXrMaterial.control(canvas,RectF(x,y,right,bottom),(i==0 && ((spacePage && following) || (environmentPage && mr))) || (i==6 && spacePage && focusDots),hovered,pressed)
-                PicoXrMaterial.label(canvas,label,x+16,(y+bottom)/2+9,right-x-32,24f)
-
-            }
+            // Keyboard pages keep their dedicated full-panel layout.
+            PicoKeyboardCanvas.draw(canvas,keyboardMode,keyboardKeys,hoverU,hoverV,voiceActive)
 
         } catch (_: IllegalArgumentException) { /* runtime has destroyed the swapchain */ }
         catch (_: IllegalStateException) { /* Activity teardown */ }
