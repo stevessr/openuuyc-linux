@@ -23,7 +23,10 @@ const OWNER: u64 = 0x5049_434f_5f56_5201;
 const MAX_FRAME: usize = 4 * 1024 * 1024;
 const MAX_CONTROL: usize = 4096;
 
-struct Packet { bytes: Bytes, keyframe: bool }
+struct Packet {
+    bytes: Bytes,
+    keyframe: bool,
+}
 
 struct Bridge {
     token: String,
@@ -32,6 +35,7 @@ struct Bridge {
     keyframe: Mutex<Option<Arc<Packet>>>,
     active: std::sync::atomic::AtomicBool,
     screen_id: std::sync::atomic::AtomicI32,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 static BRIDGE: OnceLock<Arc<Bridge>> = OnceLock::new();
@@ -53,8 +57,14 @@ fn accepted_token(want: &str, got: &str) -> bool {
 /// Called once per native playback session. No bridge exists unless explicitly
 /// opted into with OPENUUYC_PICO_BRIDGE_TOKEN (>= 32 printable ASCII chars).
 pub(super) fn attach(session: &NativeViewerSession) {
-    let Ok(token) = std::env::var("OPENUUYC_PICO_BRIDGE_TOKEN") else { return };
-    if token.len() < 32 || token.len() > 256 || !token.is_ascii() || token.bytes().any(|b| b.is_ascii_control()) {
+    let Ok(token) = std::env::var("OPENUUYC_PICO_BRIDGE_TOKEN") else {
+        return;
+    };
+    if token.len() < 32
+        || token.len() > 256
+        || !token.is_ascii()
+        || token.bytes().any(|b| b.is_ascii_control())
+    {
         tracing::error!("PICO bridge token must contain 32..256 printable ASCII characters");
         return;
     }
@@ -67,10 +77,13 @@ pub(super) fn attach(session: &NativeViewerSession) {
             keyframe: Mutex::new(None),
             active: std::sync::atomic::AtomicBool::new(false),
             screen_id: std::sync::atomic::AtomicI32::new(0),
+            generation: std::sync::atomic::AtomicU64::new(0),
         });
         let copy = Arc::clone(&bridge);
         std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
             if let Ok(runtime) = runtime {
                 if let Err(error) = runtime.block_on(serve(copy)) {
                     tracing::error!(error = %format_args!("{error:#}"), "PICO bridge stopped");
@@ -79,13 +92,22 @@ pub(super) fn attach(session: &NativeViewerSession) {
         });
         bridge
     });
-    *lock(&bridge.control) = Some(session.stream_control.clone());
-    bridge.screen_id.store(session.screen_id(), std::sync::atomic::Ordering::Release);
+    let mut control = lock(&bridge.control);
+    *control = Some(session.stream_control.clone());
+    *lock(&bridge.keyframe) = None;
+    bridge
+        .generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    bridge
+        .screen_id
+        .store(session.screen_id(), std::sync::atomic::Ordering::Release);
 }
 
 pub(super) fn select_screen(screen_id: i32) {
     if let Some(bridge) = BRIDGE.get() {
-        bridge.screen_id.store(screen_id, std::sync::atomic::Ordering::Release);
+        bridge
+            .screen_id
+            .store(screen_id, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -98,7 +120,10 @@ pub(super) fn publish(frame: &EncodedVideoFrame) {
     wire.push(1u8);
     wire.push(u8::from(frame.keyframe));
     wire.extend_from_slice(&frame.data);
-    let packet = Arc::new(Packet { bytes: Bytes::from(wire), keyframe: frame.keyframe });
+    let packet = Arc::new(Packet {
+        bytes: Bytes::from(wire),
+        keyframe: frame.keyframe,
+    });
     if packet.keyframe {
         *lock(&bridge.keyframe) = Some(Arc::clone(&packet));
     }
@@ -106,8 +131,12 @@ pub(super) fn publish(frame: &EncodedVideoFrame) {
 }
 
 async fn serve(bridge: Arc<Bridge>) -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:18765").await.context("bind PICO bridge loopback port 18765")?;
-    tracing::info!("PICO bridge ready on 127.0.0.1:18765 (ADB reverse required; TLS tunnel for wireless)");
+    let listener = TcpListener::bind("127.0.0.1:18765")
+        .await
+        .context("bind PICO bridge loopback port 18765")?;
+    tracing::info!(
+        "PICO bridge ready on 127.0.0.1:18765 (ADB reverse required; TLS tunnel for wireless)"
+    );
     loop {
         let (stream, _) = listener.accept().await?;
         let bridge = Arc::clone(&bridge);
@@ -120,7 +149,7 @@ async fn serve(bridge: Arc<Bridge>) -> Result<()> {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     Auth { token: String },
     Control { enabled: bool },
@@ -130,18 +159,25 @@ enum Request {
     Ping,
 }
 
-fn apply_request(bridge: &Bridge, request: Request, control_enabled: &mut bool, button: &mut bool) {
-    let target = lock(&bridge.control).clone();
-    let Some(target) = target else { return };
+fn apply_request(
+    bridge: &Bridge,
+    target: &StreamControlHandle,
+    request: Request,
+    control_enabled: &mut bool,
+    button: &mut bool,
+) {
     let input = target.mouse().clone();
     match request {
         Request::Control { enabled } => {
+            if enabled == *control_enabled {
+                return;
+            }
             if enabled {
                 if input.enable(MouseMode::Remote, false).is_ok() {
                     input.confirm_neutral(input.activation_generation());
                     *control_enabled = true;
                 }
-            } else {
+            } else if *control_enabled {
                 input.pause_owner(OWNER);
                 input.disable();
                 *control_enabled = false;
@@ -149,11 +185,26 @@ fn apply_request(bridge: &Bridge, request: Request, control_enabled: &mut bool, 
             *button = false;
         }
         Request::Pointer { u, v, down } if *control_enabled => {
-            if !u.is_finite() || !v.is_finite() || !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            if !u.is_finite()
+                || !v.is_finite()
+                || !(0.0..=1.0).contains(&u)
+                || !(0.0..=1.0).contains(&v)
+            {
+                // Ray loss may produce an invalid final position; button-up
+                // must still release the last valid drag.
+                if !down && *button {
+                    input.button(OWNER, 1, false);
+                    *button = false;
+                }
                 return;
             }
             let selected = bridge.screen_id.load(std::sync::atomic::Ordering::Acquire);
-            if let Some(screen) = target.snapshot().screens.iter().find(|s| s.id == selected && s.id >= 0) {
+            if let Some(screen) = target
+                .snapshot()
+                .screens
+                .iter()
+                .find(|s| s.id == selected && s.id >= 0)
+            {
                 input.absolute(OWNER, screen.id, u.min(0.999_999), v.min(0.999_999));
                 if *button != down {
                     input.button(OWNER, 1, down);
@@ -171,24 +222,37 @@ fn apply_request(bridge: &Bridge, request: Request, control_enabled: &mut bool, 
     }
 }
 
-struct ActiveClient(Arc<Bridge>);
+struct ActiveClient {
+    bridge: Arc<Bridge>,
+    control: StreamControlHandle,
+    enabled: bool,
+}
 impl Drop for ActiveClient {
     fn drop(&mut self) {
-        if let Some(control) = lock(&self.0.control).clone() {
-            control.mouse().pause_owner(OWNER);
-            control.mouse().disable();
+        if self.enabled {
+            self.control.mouse().pause_owner(OWNER);
+            self.control.mouse().disable();
         }
-        self.0.active.store(false, std::sync::atomic::Ordering::Release);
+        self.bridge
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
 async fn client(stream: TcpStream, bridge: Arc<Bridge>) -> Result<()> {
     let mut config = WebSocketConfig::default();
-    config.max_message_size = Some(MAX_FRAME + 2);
-    config.max_frame_size = Some(MAX_FRAME + 2);
-    let mut ws = tokio_tungstenite::accept_async_with_config(stream, Some(config)).await?;
+    config.max_message_size = Some(MAX_CONTROL);
+    config.max_frame_size = Some(MAX_CONTROL);
+    let mut ws = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio_tungstenite::accept_async_with_config(stream, Some(config)),
+    )
+    .await
+    .context("websocket handshake timeout")??;
     let auth = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
-        .await.context("auth timeout")?.context("client disconnected")??;
+        .await
+        .context("auth timeout")?
+        .context("client disconnected")??;
     if !auth.is_text() || auth.len() > MAX_CONTROL {
         anyhow::bail!("invalid authentication");
     }
@@ -196,22 +260,63 @@ async fn client(stream: TcpStream, bridge: Arc<Bridge>) -> Result<()> {
         Request::Auth { token } if accepted_token(&bridge.token, &token) => {}
         _ => anyhow::bail!("authentication failed"),
     }
-    if bridge.active.compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Relaxed).is_err()
+    if bridge
+        .active
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
     {
-        ws.send(Message::Text(json!({"type":"error","reason":"busy"}).to_string().into())).await?;
+        ws.send(Message::Text(
+            json!({"type":"error","reason":"busy"}).to_string().into(),
+        ))
+        .await?;
         anyhow::bail!("another headset is connected");
     }
-    let _guard = ActiveClient(Arc::clone(&bridge));
-    ws.send(Message::Text(json!({"type":"hello","version":1,"codec":"h264"}).to_string().into())).await?;
+    // Capture the session under the same lock as attach(). Cleanup must release
+    // this session, never a newer viewer that replaced the bridge target.
+    let (target, generation) = {
+        let control = lock(&bridge.control);
+        (
+            control.clone(),
+            bridge.generation.load(std::sync::atomic::Ordering::Acquire),
+        )
+    };
+    let Some(target) = target else {
+        bridge
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
+        anyhow::bail!("no active playback session");
+    };
+    let mut guard = ActiveClient {
+        bridge: Arc::clone(&bridge),
+        control: target.clone(),
+        enabled: false,
+    };
+    ws.send(Message::Text(
+        json!({"type":"hello","version":1,"codec":"h264"})
+            .to_string()
+            .into(),
+    ))
+    .await?;
     let (mut sender, mut receiver) = ws.split();
-    let (responses, mut responses_rx) = mpsc::unbounded_channel::<Message>();
+    let (responses, mut responses_rx) = mpsc::channel::<Message>(8);
     let mut frames = bridge.frames.subscribe();
     let cached_keyframe = { lock(&bridge.keyframe).clone() };
+    let synced = cached_keyframe.is_some();
     if let Some(keyframe) = cached_keyframe {
-        sender.send(Message::Binary(keyframe.bytes.clone().to_vec().into())).await?;
+        sender
+            .send(Message::Binary(keyframe.bytes.clone().to_vec().into()))
+            .await?;
     }
+    let writer_bridge = Arc::clone(&bridge);
     let writer = tokio::spawn(async move {
+        let mut sync = VideoSync {
+            waiting_keyframe: !synced,
+        };
         loop {
             tokio::select! {
                 response = responses_rx.recv() => match response {
@@ -219,10 +324,14 @@ async fn client(stream: TcpStream, bridge: Arc<Bridge>) -> Result<()> {
                     None => break,
                 },
                 packet = frames.recv() => match packet {
-                    Ok(packet) => sender.send(Message::Binary(packet.bytes.clone().to_vec().into())).await?,
+                    Ok(packet) => {
+                        if writer_bridge.generation.load(std::sync::atomic::Ordering::Acquire) != generation { break; }
+                        if sync.accept(packet.keyframe) {
+                            sender.send(Message::Binary(packet.bytes.clone().to_vec().into())).await?;
+                        }
+                    },
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Resume at a keyframe after congestion to avoid sending
-                        // corrupted interframes.
+                        sync.lagged();
                         continue;
                     },
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -231,22 +340,67 @@ async fn client(stream: TcpStream, bridge: Arc<Bridge>) -> Result<()> {
         }
         Ok::<(), tokio_tungstenite::tungstenite::Error>(())
     });
+    // Abort even when decoding/reading returns early through ?.
+    struct AbortWriter(tokio::task::AbortHandle);
+    impl Drop for AbortWriter {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _writer_guard = AbortWriter(writer.abort_handle());
     let mut control_enabled = false;
     let mut button = false;
-    while let Some(message) = receiver.next().await {
-        match message? {
+    let mut screen = bridge.screen_id.load(std::sync::atomic::Ordering::Acquire);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        let message = tokio::select! {
+            _ = tick.tick() => {
+                if bridge.generation.load(std::sync::atomic::Ordering::Acquire) != generation
+                    || writer.is_finished() { break; }
+                let selected = bridge.screen_id.load(std::sync::atomic::Ordering::Acquire);
+                if selected != screen {
+                    target.mouse().pause_owner(OWNER);
+                    button = false;
+                    screen = selected;
+                }
+                continue;
+            }
+            message = receiver.next() => match message { Some(message) => message?, None => break },
+        };
+        if bridge.generation.load(std::sync::atomic::Ordering::Acquire) != generation {
+            break;
+        }
+        let selected = bridge.screen_id.load(std::sync::atomic::Ordering::Acquire);
+        if selected != screen {
+            target.mouse().pause_owner(OWNER);
+            button = false;
+            screen = selected;
+        }
+        match message {
             Message::Text(text) if text.len() <= MAX_CONTROL => {
                 if let Ok(command) = serde_json::from_str::<Request>(&text) {
-                    if matches!(command, Request::Auth { .. }) { break; }
+                    if matches!(command, Request::Auth { .. }) {
+                        break;
+                    }
                     if matches!(command, Request::Ping) {
-                        let _ = responses.send(Message::Text(json!({"type":"pong"}).to_string().into()));
+                        if responses
+                            .try_send(Message::Text(json!({"type":"pong"}).to_string().into()))
+                            .is_err()
+                        {
+                            break;
+                        }
                     } else {
-                        apply_request(&bridge, command, &mut control_enabled, &mut button);
+                        apply_request(&bridge, &target, command, &mut control_enabled, &mut button);
+                        guard.enabled = control_enabled;
                     }
                 }
             }
             Message::Close(_) => break,
-            Message::Ping(data) => { let _ = responses.send(Message::Pong(data)); }
+            Message::Ping(data) => {
+                if responses.try_send(Message::Pong(data)).is_err() {
+                    break;
+                }
+            }
             _ => {}
         }
     }
@@ -255,9 +409,37 @@ async fn client(stream: TcpStream, bridge: Arc<Bridge>) -> Result<()> {
     Ok(())
 }
 
+/// Never forward dependent frames after a gap until a new keyframe arrives.
+#[derive(Default)]
+struct VideoSync {
+    waiting_keyframe: bool,
+}
+impl VideoSync {
+    fn lagged(&mut self) {
+        self.waiting_keyframe = true;
+    }
+    fn accept(&mut self, keyframe: bool) -> bool {
+        if keyframe {
+            self.waiting_keyframe = false;
+        }
+        !self.waiting_keyframe
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn congestion_waits_for_a_fresh_keyframe() {
+        let mut sync = VideoSync::default();
+        assert!(sync.accept(false));
+        sync.lagged();
+        assert!(!sync.accept(false));
+        assert!(!sync.accept(false));
+        assert!(sync.accept(true));
+        assert!(sync.accept(false));
+    }
 
     #[test]
     fn token_comparison_rejects_length_and_value_changes() {
@@ -268,7 +450,17 @@ mod tests {
 
     #[test]
     fn input_packet_schema_rejects_non_finite_or_unknown_shapes() {
-        assert!(serde_json::from_str::<Request>(r#"{"type":"pointer","u":0.5,"v":0.25,"down":true}"#).is_ok());
-        assert!(serde_json::from_str::<Request>(r#"{"type":"pointer","u":"NaN","v":0.5,"down":false}"#).is_err());
+        assert!(
+            serde_json::from_str::<Request>(r#"{"type":"pointer","u":0.5,"v":0.25,"down":true}"#)
+                .is_ok()
+        );
+        assert!(
+            serde_json::from_str::<Request>(r#"{"type":"pointer","u":"NaN","v":0.5,"down":false}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Request>(r#"{"type":"key","vk":65,"down":true,"command":"sh"}"#)
+                .is_err()
+        );
     }
 }

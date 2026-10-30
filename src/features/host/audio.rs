@@ -15,7 +15,7 @@ use std::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-const MAX_QUEUED_BLOCKS:usize=4; // 10ms capture blocks, bounded 40ms backlog
+const MAX_QUEUED_BLOCKS: usize = 4; // 10ms capture blocks, bounded 40ms backlog
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -507,9 +507,14 @@ impl Retry {
 mod latency_tests {
     #[test]
     fn overloaded_loopback_retains_only_recent_four_blocks() {
-        let queue=crossbeam_queue::ArrayQueue::new(super::MAX_QUEUED_BLOCKS);
-        for block in 0..10 {queue.force_push(block);}
-        let mut retained=Vec::new();while let Some(block)=queue.pop(){retained.push(block);}
-        assert_eq!(retained,vec![6,7,8,9]);
+        let queue = crossbeam_queue::ArrayQueue::new(super::MAX_QUEUED_BLOCKS);
+        for block in 0..10 {
+            queue.force_push(block);
+        }
+        let mut retained = Vec::new();
+        while let Some(block) = queue.pop() {
+            retained.push(block);
+        }
+        assert_eq!(retained, vec![6, 7, 8, 9]);
     }
 }

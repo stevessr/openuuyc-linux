@@ -258,37 +258,66 @@ impl DeviceCenterApp {
         }
     }
     fn host_settings_controls(&mut self, ui: &mut egui::Ui) {
-        #[cfg(target_os="linux")]
+        #[cfg(target_os = "linux")]
+        super::mr_devices::show(ui);
+        #[cfg(target_os = "linux")]
         {
-            section(ui,"内置 PCVR · OpenXR 优先");
-            use crate::pcvr::runtime::{self,Preference};
-            let current=runtime::preference();
-            if let Err(error)=&current {ui.label(egui::RichText::new(error.to_string()).color(theme::AMBER));}
-            let old=current.unwrap_or_default();let mut selected=old;
-            egui::ComboBox::from_id_salt("pcvr-runtime-preference").selected_text(selected.label()).show_ui(ui,|ui| {
-                for preference in Preference::ALL {ui.selectable_value(&mut selected,preference,preference.label());}
-            });
-            if selected!=old {if let Err(error)=runtime::set_preference(selected) {self.status=StatusMessage::error(error.to_string());}}
+            section(ui, "内置 PCVR · OpenXR 优先");
+            use crate::pcvr::runtime::{self, Preference};
+            let current = runtime::preference();
+            if let Err(error) = &current {
+                ui.label(egui::RichText::new(error.to_string()).color(theme::AMBER));
+            }
+            let old = current.unwrap_or_default();
+            let mut selected = old;
+            egui::ComboBox::from_id_salt("pcvr-runtime-preference")
+                .selected_text(selected.label())
+                .show_ui(ui, |ui| {
+                    for preference in Preference::ALL {
+                        ui.selectable_value(&mut selected, preference, preference.label());
+                    }
+                });
+            if selected != old {
+                if let Err(error) = runtime::set_preference(selected) {
+                    self.status = StatusMessage::error(error.to_string());
+                }
+            }
             ui.label(runtime::status());
-            if ui.button("复制 VRChat / OpenVR 的 Steam 启动选项").clicked() {
-                match runtime::plan().and_then(|plan|plan.steam_options(runtime::Api::OpenVr)) {
-                    Ok(options)=>{ui.ctx().copy_text(options);self.status=StatusMessage::success("已复制；粘贴到该游戏的 Steam 启动选项，不会修改全局运行时");},
-                    Err(error)=>self.status=StatusMessage::error(error.to_string()),
+            if ui
+                .button("复制 VRChat / OpenVR 的 Steam 启动选项")
+                .clicked()
+            {
+                match runtime::plan().and_then(|plan| plan.steam_options(runtime::Api::OpenVr)) {
+                    Ok(options) => {
+                        ui.ctx().copy_text(options);
+                        self.status = StatusMessage::success(
+                            "已复制；粘贴到该游戏的 Steam 启动选项，不会修改全局运行时",
+                        );
+                    }
+                    Err(error) => self.status = StatusMessage::error(error.to_string()),
                 }
             }
 
             ui.small("仅为游戏进程选择 XR_RUNTIME_JSON / VR_OVERRIDE，不切换全局 OpenXR。Steam 已运行时需使用该游戏的启动选项，不能只给 steam -applaunch 设置环境。");
             ui.label("PICO OpenXR 设备/合成器还未接通；以下 SteamVR 组件仍仅是追踪诊断，不提供双眼游戏画面。");
             if ui.button("安装 / 更新 OpenUUYC 内置 OpenVR 驱动").clicked() {
-                self.status=match crate::pcvr::install_driver() {
-                    Ok(())=>StatusMessage::success("内置追踪驱动已安装；请自行重启 SteamVR 后，在 PICO 沉浸菜单启用追踪诊断"),
-                    Err(e)=>StatusMessage::error(e.to_string()),
+                self.status = match crate::pcvr::install_driver() {
+                    Ok(()) => StatusMessage::success(
+                        "内置追踪驱动已安装；请自行重启 SteamVR 后，在 PICO 沉浸菜单启用追踪诊断",
+                    ),
+                    Err(e) => StatusMessage::error(e.to_string()),
                 };
             }
         }
         {
             let mut allowed = crate::features::host::quick_apps::launch_allowed();
-            if ui.checkbox(&mut allowed,"允许应用快捷启动（仅本次运行，不开放远程终端）").changed() {
+            if ui
+                .checkbox(
+                    &mut allowed,
+                    "允许应用快捷启动（仅本次运行，不开放远程终端）",
+                )
+                .changed()
+            {
                 crate::features::host::quick_apps::set_launch_allowed(allowed);
             }
             ui.small("仅当前已授权的非访客连接可启动主机列出的应用；关闭后立即撤销。");

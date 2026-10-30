@@ -195,7 +195,8 @@ open class PicoActivity : Activity() {
         appDirectorySessions.values.toList().forEach {it.close()};appDirectorySessions.clear()
     }
     private fun deviceAppSession(device: UuDevice): UuDirectSession? =
-        (if(device.id==xrDeviceId) session else xrExtraDeviceIds.entries.firstOrNull {it.value==device.id}?.key?.let {xrExtraSessions[it]}) ?: appDirectorySessions[device.id]
+        ((if(device.id==xrDeviceId) session else xrExtraDeviceIds.entries.firstOrNull {it.value==device.id}?.key?.let {xrExtraSessions[it]}) ?: appDirectorySessions[device.id])?.takeUnless {it.ended}
+
 
     private fun loadDeviceQuickApps(device: UuDevice,connect: Boolean,callback: (List<org.openuuyc.pico.uu.UuQuickApps.App>?,String?)->Unit,forFiles: Boolean=false,forTerminal: Boolean=false) {
         val direct=deviceAppSession(device)
@@ -204,18 +205,19 @@ open class PicoActivity : Activity() {
             val deadline=android.os.SystemClock.elapsedRealtime()+15000
             fun awaitCapabilities() {
                 if(isDestroyed || epoch!=appDirectoryEpoch || deviceAppSession(device)!==direct) {
-                    callback(null,"设备连接已结束，请重新连接应用目录");return
+                    callback(null,direct.lastFailure ?: "设备连接已结束，请重新连接");return
                 }
                 if(forTerminal && direct.terminal.ready) {callback(emptyList(),null);return}
                 if(forFiles && direct.filesReady) {callback(emptyList(),null);return}
                 if(!forFiles && !forTerminal && direct.quickApps.initialized) {direct.quickApps.list(callback);return}
                 if(android.os.SystemClock.elapsedRealtime()>=deadline) {
-                    callback(null,if(forFiles) "文件管理通道未就绪，请确认远端支持 UU 文件管理" else "该设备未完成快速应用能力握手；需要支持此扩展的 OpenUUYC 被控端，官方 UU 暂不支持此应用目录");return
+                    callback(null,if(forTerminal) "终端通道未就绪；当前设备可能不支持终端扩展" else if(forFiles) "文件管理控制握手未就绪，请确认远端支持 UU 文件管理" else "该设备未完成快速应用能力握手；需要支持此扩展的 OpenUUYC 被控端，官方 UU 暂不支持此应用目录");return
                 }
                 ui.postDelayed({awaitCapabilities()},250)
             }
             awaitCapabilities();return
         }
+        appDirectorySessions[device.id]?.takeIf {it.ended}?.let {appDirectorySessions.remove(device.id)}
         if(!connect) {callback(null,"点击添加应用或连接应用目录，无需打开桌面串流");return}
         if(!device.online || !device.controllable) {callback(null,"该设备离线或未允许控制");return}
         if(device.occupants>0) {callback(null,"该设备已被占用；请先使用连接设备并明确确认抢占");return}
@@ -239,13 +241,13 @@ open class PicoActivity : Activity() {
                                 connection.start(null)
                                 val deadline=android.os.SystemClock.elapsedRealtime()+30000
                                 fun poll() {
-                                    if(isDestroyed || epoch!=appDirectoryEpoch || appDirectorySessions[device.id]!==connection) {appDirectoryLoading.remove(device.id);callback(null,"应用连接已关闭");return}
+                                    if(isDestroyed || epoch!=appDirectoryEpoch || appDirectorySessions[device.id]!==connection) {appDirectoryLoading.remove(device.id);callback(null,connection.lastFailure ?: "数据连接已关闭");return}
                                     if(forTerminal && connection.terminal.ready) {appDirectoryLoading.remove(device.id);callback(emptyList(),null);return}
                                     if(forFiles && connection.filesReady) {appDirectoryLoading.remove(device.id);callback(emptyList(),null);return}
                                     if(!forFiles && !forTerminal && connection.quickApps.initialized) {appDirectoryLoading.remove(device.id);connection.quickApps.list(callback);return}
                                     if(android.os.SystemClock.elapsedRealtime()>=deadline) {
                                         appDirectoryLoading.remove(device.id);appDirectorySessions.remove(device.id);connection.close()
-                                        callback(null,"应用连接超时：远端可能不支持快速启动扩展或尚未授权");return
+                                        callback(null,connection.lastFailure ?: if(forTerminal) "终端连接超时；请确认远端支持并允许终端" else if(forFiles) "文件管理连接超时；请确认远端文件权限" else "应用目录连接超时：远端可能不支持快速启动扩展");return
                                     }
                                     ui.postDelayed({poll()},250)
                                 }

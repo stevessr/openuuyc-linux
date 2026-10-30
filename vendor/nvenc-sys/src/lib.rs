@@ -8,7 +8,10 @@
 //! LP64 with the same natural alignment as x86-64, so the layout carries over.
 #![allow(warnings)]
 #[cfg(not(any(
-    all(any(target_os = "windows", target_os = "linux"), target_arch = "x86_64"),
+    all(
+        any(target_os = "windows", target_os = "linux"),
+        target_arch = "x86_64"
+    ),
     all(target_os = "linux", target_arch = "aarch64")
 )))]
 compile_error!("OpenUUYC NVENC bindings require Windows or Linux on x86-64, or Linux on aarch64");

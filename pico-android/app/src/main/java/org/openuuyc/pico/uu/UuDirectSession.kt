@@ -55,6 +55,8 @@ internal class UuDirectSession(
     private val onWindowVisibility: (Int, Boolean) -> Unit = { _, _ -> },
     private val onUnexpectedDisconnect: () -> Unit = {}
 ) : AutoCloseable {
+    val ended: Boolean get()=closed.get()
+    @Volatile var lastFailure: String?=null;private set
     var applicationsOnly=false
     var terminalOnly=false
     val terminal=UuTerminal()
@@ -133,7 +135,7 @@ internal class UuDirectSession(
             !closed.get() && channel?.state()==DataChannel.State.OPEN && channel.bufferedAmount()<1024*1024 && channel.send(DataChannel.Buffer(ByteBuffer.wrap(packet),false))
         }
     })
-    val filesReady: Boolean get()=textChannel?.state()==DataChannel.State.OPEN
+    val filesReady: Boolean get()=!closed.get() && captureGate.pbConnected && textChannel?.state()==DataChannel.State.OPEN && controlChannel?.state()==DataChannel.State.OPEN
     val files=UuFileManager(
         next={synchronized(this) {nextRequestSeq++}},
         send={packet->synchronized(this) {!closed.get() && textChannel?.state()==DataChannel.State.OPEN && textChannel?.send(DataChannel.Buffer(ByteBuffer.wrap(packet),false))==true}})
@@ -314,8 +316,13 @@ internal class UuDirectSession(
                 if (text.length <= 1024 * 1024) synchronized(this@UuDirectSession) {
                     if (ws !== socket || closed.get()) return@synchronized
                     runCatching { parseMessage(text) }.onFailure {
-                        emit("UU 信令帧解析失败")
-                        ws.close(1002, "invalid UU protocol frame")
+                        if(it is UuWire.ControlRejected) {
+                            lastFailure="远端拒绝${if(terminalOnly) "终端" else if(applicationsOnly) "纯数据" else "桌面"}连接，错误码 ${it.code}"
+                            emit(lastFailure!!);ws.close(1000,"UU control rejected")
+                        } else {
+                            lastFailure="UU 信令应答无效（${it.javaClass.simpleName}）"
+                            emit(lastFailure!!);ws.close(1002,"invalid UU protocol frame")
+                        }
                     }
                 }
             }
@@ -393,13 +400,14 @@ internal class UuDirectSession(
             }
             is UuSocketIoWire.Packet.RoomAck -> {
                 if (!signalGate.roomAcknowledged()) return
-                val (header, bytes) = UuWire.controlEvent(identity.deviceId, appControlId, localProfiles,terminalOnly)
+                val (header, bytes) = UuWire.controlEvent(identity.deviceId, appControlId, localProfiles,terminalOnly,applicationsOnly)
                 socket?.send(header)
                 socket?.send(ByteString.of(*UuWire.attachment(bytes)))
                 emit("UU 房间已登录，发送原生控制握手")
             }
             is UuSocketIoWire.Packet.ControlAck -> {
                 if (signalGate.phase != UuSignalGate.Phase.WAIT_CONTROL_ACK) return
+                emit(UuWire.controlAckSummary(packet.data))
                 val verified = UuWire.parseControlAck(packet.data, appControlId)
                 if (!signalGate.controlAcknowledged()) return
                 controlInfo = verified
@@ -793,7 +801,7 @@ internal class UuDirectSession(
         connection.createOffer(sdpObserver(onCreated = offer@{ generated ->
             val desc=SessionDescription(generated.type,UuAudioOffer.lowLatency(generated.description))
             val mediaLines=generated.description.lineSequence().count {it.startsWith("m=audio ") || it.startsWith("m=video ")}
-            emit("连接用途：${if(applicationsOnly) "应用/文件纯数据" else "桌面串流"}，音视频 m-line=$mediaLines")
+            emit("连接用途：${if(terminalOnly) "终端纯数据(kind=8)" else if(applicationsOnly) "应用/文件纯数据(kind=5)" else "桌面串流(kind=1)"}，音视频 m-line=$mediaLines")
             if(applicationsOnly && mediaLines!=0) {emit("纯数据连接出现媒体轨道，已中止");terminateUnexpectedly();return@offer}
 
             connection.setLocalDescription(sdpObserver(onSuccess = {

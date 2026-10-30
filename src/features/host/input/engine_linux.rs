@@ -91,13 +91,19 @@ fn route_for(
     let Some(layout) = layout else {
         return Err("读不到合成器的输出布局".into());
     };
-    let screen = screens.iter().find(|screen| screen.id == current)
+    let screen = screens
+        .iter()
+        .find(|screen| screen.id == current)
         .ok_or_else(|| format!("当前触摸屏幕 {current} 已失效"))?;
     let is_niri = niri_output.is_some();
     let output = if is_niri {
-        let name = niri_output.map(str::to_owned).or_else(|| layout.outputs.first().and_then(|o| o.name.clone()))
+        let name = niri_output
+            .map(str::to_owned)
+            .or_else(|| layout.outputs.first().and_then(|o| o.name.clone()))
             .ok_or_else(|| "niri 没有可用输出".to_owned())?;
-        layout.output(&name).ok_or_else(|| format!("niri 触摸映射输出 {name} 不存在"))?
+        layout
+            .output(&name)
+            .ok_or_else(|| format!("niri 触摸映射输出 {name} 不存在"))?
     } else {
         let [output] = layout.outputs.as_slice() else {
             return Err(format!("合成器有 {} 块屏", layout.outputs.len()));
@@ -107,7 +113,9 @@ fn route_for(
         }
         output
     };
-    let logical = screen.logical.ok_or_else(|| "触摸屏与合成器输出未配对".to_owned())?;
+    let logical = screen
+        .logical
+        .ok_or_else(|| "触摸屏与合成器输出未配对".to_owned())?;
     if !is_niri && output.rotation != Rotation::Normal {
         return Err(format!("输出旋转为 {:?}", output.rotation));
     }
@@ -131,62 +139,128 @@ fn route_for(
 fn niri_config_root() -> Option<std::path::PathBuf> {
     let socket = std::env::var_os("NIRI_SOCKET")?;
     let socket_name = std::path::Path::new(&socket).file_name()?.to_string_lossy();
-    let pid = socket_name.strip_suffix(".sock")?.rsplit_once('.')?.1.parse::<u32>().ok()?;
+    let pid = socket_name
+        .strip_suffix(".sock")?
+        .rsplit_once('.')?
+        .1
+        .parse::<u32>()
+        .ok()?;
     let args = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let args = args.split(|b| *b == 0).map(|v| String::from_utf8_lossy(v).into_owned()).collect::<Vec<_>>();
-    let root = args.iter().position(|a| a == "--config").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from)
-        .or_else(|| args.iter().find_map(|a| a.strip_prefix("--config=").map(std::path::PathBuf::from)))
-        .or_else(|| Some(std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
-            .join("niri/config.kdl")))?;
+    let args = args
+        .split(|b| *b == 0)
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+        .collect::<Vec<_>>();
+    let root = args
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            args.iter()
+                .find_map(|a| a.strip_prefix("--config=").map(std::path::PathBuf::from))
+        })
+        .or_else(|| {
+            Some(
+                std::env::var_os("XDG_CONFIG_HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                            .join(".config")
+                    })
+                    .join("niri/config.kdl"),
+            )
+        })?;
     Some(root)
 }
 
 fn read_niri_touch_mapping(device: &str) -> Option<String> {
-    let root=niri_config_root()?;
+    let root = niri_config_root()?;
     let mut tokens = Vec::new();
     expand_niri_config(&root, &mut std::collections::HashSet::new(), &mut tokens, 0);
-    niri_mapping_from_tokens(&tokens,device)
+    niri_mapping_from_tokens(&tokens, device)
 }
 
-fn niri_mapping_from_tokens(tokens: &[String],device: &str) -> Option<String> {
-    let mut global=None;
-    let mut named=None;
-    let mut i=0;
-    while i+1<tokens.len() {
-        if tokens[i]=="input" && tokens[i+1]=="{" {
-            let end=kdl_block_end(tokens,i+1)?;
-            let mut child=i+2;
-            while child+1<end {
-                if tokens[child]=="touch" {
-                    let (name,open)=if tokens[child+1]=="{" { (None,child+1) }
-                        else if tokens.get(child+2).map(String::as_str)==Some("{") { (Some(tokens[child+1].as_str()),child+2) }
-                        else { child+=1;continue; };
-                    let close=kdl_block_end(tokens,open)?;
-                    let value=(open+1..close).find(|&p| tokens[p]=="map-to-output").and_then(|p| tokens.get(p+1)).cloned();
-                    match name { None=>global=value,Some(name) if name==device=>named=Some(value),_=>() }
-                    child=close+1;
-                } else if tokens[child]=="{" { child=kdl_block_end(tokens,child)?+1; }
-                else { child+=1; }
+fn niri_mapping_from_tokens(tokens: &[String], device: &str) -> Option<String> {
+    let mut global = None;
+    let mut named = None;
+    let mut i = 0;
+    while i + 1 < tokens.len() {
+        if tokens[i] == "input" && tokens[i + 1] == "{" {
+            let end = kdl_block_end(tokens, i + 1)?;
+            let mut child = i + 2;
+            while child + 1 < end {
+                if tokens[child] == "touch" {
+                    let (name, open) = if tokens[child + 1] == "{" {
+                        (None, child + 1)
+                    } else if tokens.get(child + 2).map(String::as_str) == Some("{") {
+                        (Some(tokens[child + 1].as_str()), child + 2)
+                    } else {
+                        child += 1;
+                        continue;
+                    };
+                    let close = kdl_block_end(tokens, open)?;
+                    let value = (open + 1..close)
+                        .find(|&p| tokens[p] == "map-to-output")
+                        .and_then(|p| tokens.get(p + 1))
+                        .cloned();
+                    match name {
+                        None => global = value,
+                        Some(name) if name == device => named = Some(value),
+                        _ => (),
+                    }
+                    child = close + 1;
+                } else if tokens[child] == "{" {
+                    child = kdl_block_end(tokens, child)? + 1;
+                } else {
+                    child += 1;
+                }
             }
-            i=end+1;
-        } else { i+=1; }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
     }
     named.unwrap_or(global)
 }
 
-fn expand_niri_config(path: &std::path::Path, seen: &mut std::collections::HashSet<std::path::PathBuf>, out: &mut Vec<String>, depth: usize) {
-    if depth > 16 { return; }
-    let Ok(path) = std::fs::canonicalize(path) else { return; };
-    if !seen.insert(path.clone()) { return; }
-    let Ok(source) = std::fs::read_to_string(&path) else { return; };
+fn expand_niri_config(
+    path: &std::path::Path,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    out: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > 16 {
+        return;
+    }
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return;
+    };
+    if !seen.insert(path.clone()) {
+        return;
+    }
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        return;
+    };
     let tokens = kdl_tokens(&source);
     let mut i = 0;
     while i < tokens.len() {
-        if tokens[i] == "include" && let Some(include) = tokens.get(i + 1) {
-            expand_niri_config(&path.parent().unwrap_or(std::path::Path::new(".")).join(include), seen, out, depth + 1);
+        if tokens[i] == "include"
+            && let Some(include) = tokens.get(i + 1)
+        {
+            expand_niri_config(
+                &path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(include),
+                seen,
+                out,
+                depth + 1,
+            );
             i += 2;
-        } else { out.push(tokens[i].clone()); i += 1; }
+        } else {
+            out.push(tokens[i].clone());
+            i += 1;
+        }
     }
 }
 
@@ -195,7 +269,12 @@ fn kdl_block_end(tokens: &[String], open: usize) -> Option<usize> {
     for (index, token) in tokens.iter().enumerate().skip(open) {
         match token.as_str() {
             "{" => depth += 1,
-            "}" => { depth = depth.checked_sub(1)?; if depth == 0 { return Some(index); } }
+            "}" => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
             _ => (),
         }
     }
@@ -207,19 +286,57 @@ fn kdl_tokens(source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() || bytes[i] == b';' { i += 1; continue; }
-        if bytes[i..].starts_with(b"//") { while i < bytes.len() && bytes[i] != b'\n' { i += 1; } continue; }
-        if bytes[i..].starts_with(b"/*") { i += 2; while i + 1 < bytes.len() && !bytes[i..].starts_with(b"*/") { i += 1; } i = (i + 2).min(bytes.len()); continue; }
-        if matches!(bytes[i], b'{' | b'}') { out.push((bytes[i] as char).to_string()); i += 1; continue; }
+        if bytes[i].is_ascii_whitespace() || bytes[i] == b';' {
+            i += 1;
+            continue;
+        }
+        if bytes[i..].starts_with(b"//") {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            i += 2;
+            while i + 1 < bytes.len() && !bytes[i..].starts_with(b"*/") {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if matches!(bytes[i], b'{' | b'}') {
+            out.push((bytes[i] as char).to_string());
+            i += 1;
+            continue;
+        }
         if bytes[i] == b'"' {
-            i += 1; let mut value = Vec::new();
-            while i < bytes.len() && bytes[i] != b'"' { if bytes[i] == b'\\' && i + 1 < bytes.len() { i += 1; } value.push(bytes[i]); i += 1; }
-            if i < bytes.len() { i += 1; }
-            out.push(String::from_utf8_lossy(&value).into_owned()); continue;
+            i += 1;
+            let mut value = Vec::new();
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                }
+                value.push(bytes[i]);
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+            out.push(String::from_utf8_lossy(&value).into_owned());
+            continue;
         }
         let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'{' | b'}' | b';') { i += 1; }
-        if start < i { out.push(String::from_utf8_lossy(&bytes[start..i]).into_owned()); } else { i += 1; }
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && !matches!(bytes[i], b'{' | b'}' | b';')
+        {
+            i += 1;
+        }
+        if start < i {
+            out.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+        } else {
+            i += 1;
+        }
     }
     out
 }
@@ -402,9 +519,11 @@ impl Engine {
     }
     fn absolute(&mut self, screen: Option<i32>, x: f64, y: f64) -> Result<()> {
         let selected = self.geometry.screen(screen)?;
-        let id=selected.id;
+        let id = selected.id;
         let (logical, rect) = (selected.logical, selected.rect());
-        if screen.is_some() && self.touch_route.is_none() { self.touch_screen_hint=Some(id); }
+        if screen.is_some() && self.touch_route.is_none() {
+            self.touch_screen_hint = Some(id);
+        }
         // Every screen in the compositor's space, or every screen in X's:
         // a position named in one and resolved in the other lands off by the
         // output's scale.
@@ -496,33 +615,77 @@ impl Engine {
     /// 选这一串触摸走哪条路，判定变化时记一条日志（和 `aim_space` 一样只记一次）。
     fn choose_route(&mut self) -> Route {
         let decision = if self.injector.has_touchscreen() {
-            let layout=crate::platform::display::compositor_layout();
-            let current=self.touch_screen_hint.unwrap_or(self.geometry.current);
-            let target=self.geometry.screens.iter().find(|s|s.id==current)
+            let layout = crate::platform::display::compositor_layout();
+            let current = self.touch_screen_hint.unwrap_or(self.geometry.current);
+            let target = self
+                .geometry
+                .screens
+                .iter()
+                .find(|s| s.id == current)
                 .and_then(|screen| screen.logical)
-                .and_then(|rect|layout.as_ref()?.outputs.iter().find(|o|rect==Rect {left:o.left,top:o.top,right:o.left.saturating_add(o.width as i32),bottom:o.top.saturating_add(o.height as i32)}))
-                .and_then(|o|o.name.clone());
-            let is_niri=std::env::var_os("NIRI_SOCKET").is_some();
+                .and_then(|rect| {
+                    layout.as_ref()?.outputs.iter().find(|o| {
+                        rect == Rect {
+                            left: o.left,
+                            top: o.top,
+                            right: o.left.saturating_add(o.width as i32),
+                            bottom: o.top.saturating_add(o.height as i32),
+                        }
+                    })
+                })
+                .and_then(|o| o.name.clone());
+            let is_niri = std::env::var_os("NIRI_SOCKET").is_some();
             // Read/configure only when a new touch sequence needs another output.
             // Selecting a screen or moving the mouse alone never changes mapping.
-            let already_mapped=target.as_ref().is_some_and(|output|self.touch_lease.as_ref().is_some_and(|lease|lease.maps_to(output)));
-            let mut mapping=if already_mapped {target.clone()} else if is_niri { target.as_ref().and_then(|name|read_niri_touch_mapping(&native::touch_output_device_name(name))) } else {None};
-            if is_niri && std::env::var("OPENUUYC_NIRI_TEMP_TOUCH_MAP").as_deref()==Ok("1") {
-                if let Some(output)=target.as_ref() {
-                    if !already_mapped && (self.touch_lease.is_some() || mapping.as_ref()!=Some(output)) {
-                        let lease_result=(|| -> Result<()> {
-                            if self.touch_lease.is_none() {self.touch_lease=Some(niri_touch_lease::Lease::new(niri_config_root().ok_or_else(||anyhow::anyhow!("找不到 Niri 配置"))?)?);}
+            let already_mapped = target.as_ref().is_some_and(|output| {
+                self.touch_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.maps_to(output))
+            });
+            let mut mapping = if already_mapped {
+                target.clone()
+            } else if is_niri {
+                target.as_ref().and_then(|name| {
+                    read_niri_touch_mapping(&native::touch_output_device_name(name))
+                })
+            } else {
+                None
+            };
+            if is_niri && std::env::var("OPENUUYC_NIRI_TEMP_TOUCH_MAP").as_deref() == Ok("1") {
+                if let Some(output) = target.as_ref() {
+                    if !already_mapped
+                        && (self.touch_lease.is_some() || mapping.as_ref() != Some(output))
+                    {
+                        let lease_result = (|| -> Result<()> {
+                            if self.touch_lease.is_none() {
+                                self.touch_lease = Some(niri_touch_lease::Lease::new(
+                                    niri_config_root()
+                                        .ok_or_else(|| anyhow::anyhow!("找不到 Niri 配置"))?,
+                                )?);
+                            }
                             self.touch_lease.as_mut().unwrap().map_to(output)
                         })();
-                        if let Err(error)=lease_result {tracing::warn!(%error,"未能临时映射触摸输出");return Route::Simulated}
-                        mapping=Some(output.clone());
+                        if let Err(error) = lease_result {
+                            tracing::warn!(%error,"未能临时映射触摸输出");
+                            return Route::Simulated;
+                        }
+                        mapping = Some(output.clone());
                     }
                 }
             }
-            let decision=route_for(layout.as_deref(),&self.geometry.screens,current,mapping.as_deref());
-            match (decision,is_niri,target) {
-                (Ok(route),true,Some(output))=>self.injector.select_touch_output(&output).map(|_|route).map_err(|e|e.to_string()),
-                (decision,_,_)=>decision,
+            let decision = route_for(
+                layout.as_deref(),
+                &self.geometry.screens,
+                current,
+                mapping.as_deref(),
+            );
+            match (decision, is_niri, target) {
+                (Ok(route), true, Some(output)) => self
+                    .injector
+                    .select_touch_output(&output)
+                    .map(|_| route)
+                    .map_err(|e| e.to_string()),
+                (decision, _, _) => decision,
             }
         } else {
             Err("没有虚拟触摸屏".into())
@@ -874,15 +1037,24 @@ mod tests {
         };
         let one = vec![screen(0, (0, 0, 1920, 1080), single.outputs.first())];
         assert!(route_for(None, &one, 0, None).is_err(), "没有布局");
-        assert!(route_for(Some(&scaled()), &one, 0, None).is_err(), "合成器两块屏");
+        assert!(
+            route_for(Some(&scaled()), &one, 0, None).is_err(),
+            "合成器两块屏"
+        );
 
         let mut two = one.clone();
         two.push(screen(1, (0, 0, 1920, 1080), single.outputs.first()));
-        assert!(route_for(Some(&single), &two, 0, None).is_err(), "被控端两块屏");
+        assert!(
+            route_for(Some(&single), &two, 0, None).is_err(),
+            "被控端两块屏"
+        );
 
         let mut turned = single.clone();
         turned.outputs[0].rotation = Rotation::Rotate90;
-        assert!(route_for(Some(&turned), &one, 0, None).is_err(), "屏幕转过 90 度");
+        assert!(
+            route_for(Some(&turned), &one, 0, None).is_err(),
+            "屏幕转过 90 度"
+        );
     }
 
     /// 旋转只看合成器那块输出：屏幕的名字和 `wl_output` 的没配上时，屏幕这边看不出
@@ -901,28 +1073,46 @@ mod tests {
 
     #[test]
     fn named_touch_mapping_does_not_override_physical_touch_default() {
-        let tokens=kdl_tokens(r#"input {
+        let tokens = kdl_tokens(
+            r#"input {
             touch { map-to-output "DP-1" }
             touch "OpenUUYC touch HDMI-A-1" { map-to-output "HDMI-A-1" }
-        }"#);
-        assert_eq!(niri_mapping_from_tokens(&tokens,"OpenUUYC touch HDMI-A-1").as_deref(),Some("HDMI-A-1"));
-        assert_eq!(niri_mapping_from_tokens(&tokens,"physical touchscreen").as_deref(),Some("DP-1"));
+        }"#,
+        );
+        assert_eq!(
+            niri_mapping_from_tokens(&tokens, "OpenUUYC touch HDMI-A-1").as_deref(),
+            Some("HDMI-A-1")
+        );
+        assert_eq!(
+            niri_mapping_from_tokens(&tokens, "physical touchscreen").as_deref(),
+            Some("DP-1")
+        );
     }
 
     #[test]
     fn named_touch_mapping_wins_even_when_default_is_later() {
-        let tokens=kdl_tokens(r#"input { touch "OpenUUYC touch DP-1" { map-to-output "DP-1" } }
-            input { touch { map-to-output "eDP-1" } }"#);
-        assert_eq!(niri_mapping_from_tokens(&tokens,"OpenUUYC touch DP-1").as_deref(),Some("DP-1"));
+        let tokens = kdl_tokens(
+            r#"input { touch "OpenUUYC touch DP-1" { map-to-output "DP-1" } }
+            input { touch { map-to-output "eDP-1" } }"#,
+        );
+        assert_eq!(
+            niri_mapping_from_tokens(&tokens, "OpenUUYC touch DP-1").as_deref(),
+            Some("DP-1")
+        );
     }
 
     #[test]
     fn other_named_touch_devices_never_select_our_output() {
-        let tokens=kdl_tokens(r#"input {
+        let tokens = kdl_tokens(
+            r#"input {
             touch { map-to-output "eDP-1" }
             touch "physical tablet" { map-to-output "DP-1" }
-        }"#);
-        assert_eq!(niri_mapping_from_tokens(&tokens,"OpenUUYC touch DP-1").as_deref(),Some("eDP-1"));
+        }"#,
+        );
+        assert_eq!(
+            niri_mapping_from_tokens(&tokens, "OpenUUYC touch DP-1").as_deref(),
+            Some("eDP-1")
+        );
     }
 
     #[test]
@@ -935,7 +1125,10 @@ mod tests {
         ];
         assert_eq!(
             route_for(Some(&layout), &screens, 2, Some("DP-1")),
-            Ok(Route::Touchscreen { rotation: Rotation::Rotate90, width: 5120.0 })
+            Ok(Route::Touchscreen {
+                rotation: Rotation::Rotate90,
+                width: 5120.0
+            })
         );
         assert!(route_for(Some(&layout), &screens, 1, Some("DP-1")).is_err());
     }

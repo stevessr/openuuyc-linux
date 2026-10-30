@@ -316,7 +316,7 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-OpenUUYC built-in PCVR bridge includes the OpenVR driver SDK header (ValveSoftware/openvr v2.12.14):
+OpenUUYC built-in PCVR bridge includes the OpenVR driver and client SDK headers (ValveSoftware/openvr v2.12.14):
 
 Copyright (c) 2015, Valve Corporation
 All rights reserved.

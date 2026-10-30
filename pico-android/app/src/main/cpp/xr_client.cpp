@@ -432,7 +432,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
             menu_reset_requested.store(true);menu_host.store(-1);controller_menu_hand.store(2);menu_nav_hand=hand;menu_nav_until=timestamp+5000000000LL;quick_navigation_hand=hand;
             env->CallVoidMethod(activity,quick_method,jint(hand));
         }
-        if(hand==quick_navigation_hand && menu_host.load()<0 && controller_menu_layout.load()!=4 && !menu_grab && grabbed_pane<0 && navigation_method) {
+        if(hand==quick_navigation_hand && menu_host.load()<0 && controller_menu_layout.load()==0 && !menu_grab && grabbed_pane<0 && navigation_method) {
             query.action=actions.scroll;XrActionStateFloat y{XR_TYPE_ACTION_STATE_FLOAT};xrGetActionStateFloat(session,&query,&y);
             query.action=actions.nav_x;XrActionStateFloat x{XR_TYPE_ACTION_STATE_FLOAT};xrGetActionStateFloat(session,&query,&x);
             const bool released=menu_stick[hand].update(x.currentState,y.currentState,x.isActive && y.isActive,timestamp);
@@ -502,7 +502,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
         query.action=actions.grip;xrGetActionStateBoolean(session,&query,&grip);
         if(grip.isActive) controller_debug_mask|=1<<(hand+2);
         if(grip.isActive && grip.currentState) controller_debug_mask|=1<<(hand+4);
-        const bool nav_confirm=menu_host.load()<0 && controller_menu_layout.load()!=4 && menu_nav_hand==hand && timestamp<menu_nav_until && !menu_grab && grabbed_pane<0;
+        const bool nav_confirm=menu_host.load()<0 && controller_menu_layout.load()==0 && menu_nav_hand==hand && timestamp<menu_nav_until && !menu_grab && grabbed_pane<0;
         // A pending stick selection owns the trigger until release; do not
         // execute twice or leak a click into the remote desktop.
         if(nav_confirm && trigger.isActive && trigger.currentState) trigger_blocked[hand]=true;
@@ -828,7 +828,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeStop(JNIEnv *, jobject) {
 extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeSetControllerMenu(JNIEnv*,jobject,jint layout,jint hand) {
     const int old_hand=controller_menu_hand.exchange(std::clamp(int(hand),0,2));
-    const int old_layout=controller_menu_layout.exchange(std::clamp(int(layout),0,4));
+    const int old_layout=controller_menu_layout.exchange(std::clamp(int(layout),0,5));
     if((old_hand!=hand && hand==2) || (old_layout==4 && layout!=4)) menu_reset_requested.store(true);
 }
 
@@ -1135,11 +1135,11 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             const bool reset_menu=menu_reset_requested.exchange(false);
             const int menu_layout=controller_menu_layout.load();
             if(menu_host.load()<0) {
-                menu_panel.width=controller_menu_hand.load()==2?(menu_layout==3?.35f:menu_layout==2?.95f:menu_layout==0?1.3f:1.45f):(menu_layout==3?.15f:menu_layout==2?.30f:menu_layout==0?.42f:.50f);
-                menu_panel.aspect=menu_layout==0?2.f/3.f:menu_layout==2?1000.f/600.f:1.f/3.f;
+                menu_panel.width=controller_menu_hand.load()==2?(menu_layout==3?.35f:menu_layout==2?.95f:menu_layout==0?1.3f:menu_layout==5?1.6f:1.45f):(menu_layout==3?.15f:menu_layout==2?.30f:menu_layout==0?.42f:menu_layout==5?.55f:.50f);
+                menu_panel.aspect=menu_layout==0?2.f/3.f:menu_layout==5?.4f:menu_layout==2?1000.f/600.f:1.f/3.f;
             } else {
                 menu_panel.width=menu_portrait.load()?.48f:.80f;
-                menu_panel.aspect=menu_layout==0?2.f/3.f:menu_portrait.load()?1000.f/600.f:1.f/3.f;
+                menu_panel.aspect=menu_layout==0?2.f/3.f:menu_layout==5?.4f:menu_portrait.load()?1000.f/600.f:1.f/3.f;
             }
             for(int i=0;i<6;++i) {panels[i].aspect=panel_aspects[i].load();panels[i].width=std::min(panels[i].width,panel_max_width(panels[i].aspect));}
             const int host=menu_host.load();

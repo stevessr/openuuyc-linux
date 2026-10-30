@@ -5,6 +5,7 @@ class UuQuickAppsPolicyTest {
     @Test fun browsingDoesNotRequireShellExecution() {
         assertTrue(UuQuickAppsPolicy.permitted("list",true,false))
         assertTrue(UuQuickAppsPolicy.permitted("vr-runtime",true,false))
+        assertTrue(UuQuickAppsPolicy.permitted("vr-applications",true,false))
         for(op in listOf("launch","vr-runtime-set","unknown"))
             assertFalse(UuQuickAppsPolicy.permitted(op,true,false))
     }

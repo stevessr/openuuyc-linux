@@ -15,6 +15,8 @@ import java.util.concurrent.atomic.AtomicInteger
 internal class UuStereoDecoder(private val rendered: (UuStereoFrames.Frame)->Unit,private val lost: ()->Unit,private val error: (String)->Unit) {
     private val thread=HandlerThread("openuuyc-stereo-decoder").apply {start()}
     private val handler=Handler(thread.looper)
+    private val ready=java.util.concurrent.atomic.AtomicBoolean(false)
+    fun isReady()=ready.get()
     private var codec: MediaCodec?=null
     private var expectedWidth=0
     private var expectedHeight=0
@@ -60,7 +62,7 @@ internal class UuStereoDecoder(private val rendered: (UuStereoFrames.Frame)->Uni
                 val decoder=MediaCodec.createByCodecName(name)
                 codec=decoder
                 decoder.setOnFrameRenderedListener({_,pts,_->metadata.remove(pts)?.let(rendered)},handler)
-                decoder.configure(format,surface,null,0);decoder.start();handler.post(drain)
+                decoder.configure(format,surface,null,0);decoder.start();ready.set(true);handler.post(drain)
             }.onFailure {fail(it)}
             done.countDown()
         }
@@ -86,7 +88,7 @@ internal class UuStereoDecoder(private val rendered: (UuStereoFrames.Frame)->Uni
         }
     }
     private fun fail(value: Throwable) {release();lost();error(value.message ?: "双眼解码失败")}
-    private fun release() {handler.removeCallbacks(drain);val old=codec;codec=null;runCatching {old?.stop()};runCatching {old?.release()};metadata.clear();waitingKeyframe=true}
+    private fun release() {ready.set(false);handler.removeCallbacks(drain);val old=codec;codec=null;runCatching {old?.stop()};runCatching {old?.release()};metadata.clear();waitingKeyframe=true}
     fun close() {
         if(closed) return
         surface(null,0,0,"");closed=true;handler.post {release();thread.quitSafely()}

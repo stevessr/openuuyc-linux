@@ -36,6 +36,15 @@ jobs:
             --runtime "$RUNNER_TEMP/openuuyc-openxr-components/openxr/openxr_openuuyc.json" \
             --smoke "$RUNNER_TEMP/device-smoke" \
             --probe "$RUNNER_TEMP/openuuyc-openxr-components/bin/openuuyc-openxr-probe"
+      - name: Attach an existing OpenXR session without restarting it
+        run: |
+          python3 drivers/openxr/tests/device_reattach_fixture.py \
+            --runtime "$RUNNER_TEMP/openuuyc-openxr-components/openxr/openxr_openuuyc.json" \
+            --smoke "$RUNNER_TEMP/device-smoke"
+          cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+            drivers/openxr/stereo_capture.c drivers/openxr/tests/stereo_reattach_test.c \
+            -o "$RUNNER_TEMP/stereo-reattach"
+          "$RUNNER_TEMP/stereo-reattach"
       - name: Preserve executable modes in the distributable
         run: tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/openuuyc-openxr-components-linux-x86_64.tar.gz" openuuyc-openxr-components
       - uses: actions/upload-artifact@v4

@@ -202,7 +202,10 @@ impl NativePeer {
         }
 
         let mut local_channels = Vec::with_capacity(DATA_CHANNEL_LABELS.len());
-        for label in DATA_CHANNEL_LABELS.into_iter().chain([crate::features::remote_terminal::CHANNEL]) {
+        for label in DATA_CHANNEL_LABELS
+            .into_iter()
+            .chain([crate::features::remote_terminal::CHANNEL])
+        {
             let channel = connection
                 .create_data_channel(label, Some(official_data_channel_init(label)))
                 .await

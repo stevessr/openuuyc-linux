@@ -51,3 +51,37 @@ cargo +1.95.0 test --lib features::host::quick_apps --offline -- --include-ignor
 2026-10-30 本机验证：应用专项 10 项通过（包含两个显式启用的本机测试），
 发现 133 个应用入口；GIO 临时 touch 入口创建文件成功，缺失程序入口正确返回失败。
 PTY 专项 10 项通过，连续 5 轮复测通过。尚未验证跨设备应用列表展示和真实窗口激活。
+
+## MR 双向控制入口
+
+Linux 设置页增加「本地 MR / Android 设备 · ADB」：
+手动刷新已连接设备，只允许 ADB 状态为 device 的设备打开窗口；
+可选择只读观看或观看并控制、指定显示 ID。
+依赖本机 adb 和 scrcpy，不自动打开无线调试、连接地址、修改头显设置或接管未授权设备。
+每台设备最多一个独立窗口，关闭窗口停止；默认关闭音频和自动剪贴板同步。
+这是明确标注的本地 ADB/scrcpy 路径，不是新增 UU 被控信令或原生 MR 合成器。
+
+PICO 观看远端的 localhost 桥接路径补充了有界响应队列、握手超时、
+拥塞后关键帧恢复、异常退出的 writer 清理、会话替换及切屏输入释放。
+只读连接关闭时不应禁用本机控制；射线失效的松键仍需释放拖动。
+
+2026-10-30，已授权 PICO A9210 / Android 14 本机验证：
+scrcpy 查询到显示 ID 0、2、23；
+只读显示 0 实际投屏五秒，VA-API 解码 1600×800，日志 59–60 FPS。
+未写入录制文件、未注入输入、未同步剪贴板。
+尚未验证 UI 点击到独立窗口的完整路径、实际键鼠输入和真人佩戴的 MR 交互质量。
+
+scrcpy 参数依据：
+https://github.com/Genymobile/scrcpy/blob/master/doc/connection.md
+https://github.com/Genymobile/scrcpy/blob/master/doc/control.md
+
+### 应用列表空白的实机修复
+
+2026-10-30：将当前已授权、非访客设备的只读应用目录与终端执行权限分离。
+启动应用和更改 VR 后端仍须终端权限；目录无权限不会静默显示空页，XR 菜单给出明确错误和重试。
+新增 Steam manifest 和附加库扫描，桌面快捷方式之外也列出 SteamVR、VRChat 等已安装项目。
+Linux 新二进制已替换旧运行进程，PICO 修复 APK 已覆盖安装。
+实际从 PICO 设备页建立纯数据连接：日志记录 allowed=false、catalog_allowed=true，返回 count=138；
+头显 UI 层级确认显示「138 个可用应用」及 SteamVR、Alacritty、Antigravity 等按钮。
+Android 目录/启动权限策略测试 2 项通过；Steam 清单解析测试 2 项通过。
+本次未开启终端权限，未启动任何远端应用，也未宣称 PCVR 游戏串流已完成。

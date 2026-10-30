@@ -29,10 +29,15 @@ internal class UuPcvrSession {
     @Volatile private var stereoCodec=0
     private var stereoNative: ((Int,Int,Int)->Unit)?=null
     private var stereoRendered: ((Int,Long,FloatArray)->Unit)?=null
+    private val decodedFrames=java.util.concurrent.atomic.AtomicLong(0)
+    private val lastDecoded=java.util.concurrent.atomic.AtomicLong(0)
     private var lastKeyframeRequest=0L
     fun setStereoCallbacks(format: (Int,Int,Int)->Unit,frame: (Int,Long,FloatArray)->Unit) {stereoNative=format;stereoRendered=frame}
     fun stereoSurface(surface: android.view.Surface?,width: Int,height: Int) {
         stereoDecoder?.surface(surface,width,height,if(stereoCodec==1) "video/avc" else "video/hevc")
+        synchronized(this) {
+            if(surface!=null && stereoDecoder?.isReady()==true) {acknowledgeStereo();requestKeyframe()}
+        }
     }
     private fun requestKeyframe() {
         synchronized(stereoFrames) {stereoFrames.lost()}
@@ -52,6 +57,7 @@ internal class UuPcvrSession {
         }
     }
     private fun stopStereo() {
+        decodedFrames.set(0);lastDecoded.set(0)
         val hadStereo=stereoGeneration!=0
         stereoGeneration=0;if(hadStereo && owner.get()===this) stereoNative?.invoke(0,0,0)
         val old=stereoDecoder;stereoDecoder=null
@@ -61,13 +67,27 @@ internal class UuPcvrSession {
     }
     private fun configureStereo(value: JSONObject) {
         require(value.getInt("version")==1)
-        check(active && owner.get()===this && stereoNative!=null) {"未授权沉浸式双眼会话"}
+        if(!active || owner.get()!==this || stereoNative==null) return
         val generation=value.getInt("generation");val width=value.getInt("width");val height=value.getInt("height");val codec=value.getInt("codec")
+        if(generation==stereoGeneration && width==stereoWidth && height==stereoHeight && codec==stereoCodec) {
+            acknowledgeStereo();return
+        }
         require(generation>stereoGeneration && width in 128..8192 && width%4==0 && height in 64..4096 && height%2==0 && codec in 1..2)
         stopStereo();stereoGeneration=generation;stereoWidth=width;stereoHeight=height;stereoCodec=codec
-        stereoDecoder=UuStereoDecoder({frame->stereoRendered?.invoke(frame.generation,frame.id,frame.views)},{main.post {requestKeyframe()}},{message->status=message;stereoNative?.invoke(0,0,0)})
+        stereoDecoder=UuStereoDecoder({frame->
+            if(frame.generation==stereoGeneration) {
+                decodedFrames.incrementAndGet();lastDecoded.set(android.os.SystemClock.elapsedRealtime())
+                stereoRendered?.invoke(frame.generation,frame.id,frame.views)
+            }
+        },{main.post {requestKeyframe()}},{message->status=message;stereoNative?.invoke(0,0,0)})
         stereoNative?.invoke(generation,width,height)
         status="双眼接收器已配置，等待真实编码首帧（不是可玩状态）"
+        acknowledgeStereo()
+    }
+    private fun acknowledgeStereo() {
+        if(stereoDecoder?.isReady()!=true) return
+        control?.takeIf {it.state()==DataChannel.State.OPEN}?.send(DataChannel.Buffer(ByteBuffer.wrap(
+            JSONObject().put("id",0).put("op","video-configured").put("generation",stereoGeneration).toString().toByteArray()),false))
     }
     private val state=UuPcvrControlState()
     private val main=Handler(Looper.getMainLooper())
@@ -77,6 +97,28 @@ internal class UuPcvrSession {
     @Volatile var status="内置 VR 追踪诊断：未开启";private set
     @Synchronized fun bind(channel: DataChannel) {
         when(channel.label()) {CONTROL->control=channel;TRACKING->poses=channel}
+    }
+    fun prepareStereo(callback: (Boolean,String)->Unit) {
+        synchronized(this) {
+            if(stereoNative==null || eyeCalibration==null) {
+                main.post {callback(false,"请进入沉浸式串流并唤醒头显，等待真实眼位/FOV 校准后重试")};return
+            }
+            if(active) {main.post {callback(true,status)};return}
+            if(!request(true)) {main.post {callback(false,status)};return}
+        }
+        val deadline=android.os.SystemClock.elapsedRealtime()+8500
+        fun poll() {
+            val outcome=synchronized(this) {
+                when {
+                    active && owner.get()===this -> true to status
+                    !state.desired || android.os.SystemClock.elapsedRealtime()>=deadline -> false to status
+                    else -> null
+                }
+            }
+            if(outcome!=null) {callback(outcome.first,outcome.second);return}
+            main.postDelayed({poll()},100)
+        }
+        main.post {poll()}
     }
     @Synchronized fun request(start: Boolean): Boolean {
         val c=control
@@ -118,7 +160,7 @@ internal class UuPcvrSession {
             if(!active) stopStereo()
             if(!state.desired) owner.compareAndSet(this,null)
             status=if(!value.isNull("error")) value.optString("error") else
-                if(active) "${value.optString("backend","追踪")} · 已转发 ${value.optLong("frames")} 帧 · ${if(value.optBoolean("fresh")) "近期发送" else "等待头显"} · 无远端双眼画面" else "内置 VR 追踪已停止"
+                if(active) "${value.optString("backend","追踪")} · 已转发 ${value.optLong("frames")} 帧 · ${if(value.optBoolean("fresh")) "近期发送" else "等待头显"} · ${if(lastDecoded.get()>0 && android.os.SystemClock.elapsedRealtime()-lastDecoded.get()<1000) "双眼解码输出 ${decodedFrames.get()} 帧" else if(value.optBoolean("stereo")) "远端正在发送双眼视频，等待本机解码输出" else if(!value.isNull("video_error")) value.optString("video_error") else if(!value.optBoolean("fresh") || !value.optBoolean("head_valid",true)) "等待有效头部追踪" else if(value.optLong("captured_frames")==0L) "等待合成器双眼画面" else if(value.optLong("encoded_frames")==0L) "等待双眼视频编码" else if(!value.optBoolean("decoder_ready")) "等待本机解码器就绪" else "等待双眼视频传输"}" else "内置 VR 追踪已停止"
         }.onFailure {revoke();status="VR 状态无效"}
     }
     @Synchronized fun frame(bytes: ByteArray) {

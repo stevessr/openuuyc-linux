@@ -46,7 +46,7 @@ internal object UuWire {
         integer(out, 9, 1) // qos_stat
     }
 
-    fun connectOptions(controllerId: String, profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080)), terminal: Boolean=false): ByteArray {
+    fun connectOptions(controllerId: String, profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080)), terminal: Boolean=false,dataOnly: Boolean=false): ByteArray {
         require(controllerId.matches(Regex("[a-z0-9]{16}")))
         val capture = message { out ->
             integer(out, 1, 2) // 60fps tier
@@ -62,7 +62,7 @@ internal object UuWire {
             integer(out, 11, 60)
         }
         return message { out ->
-            integer(out, 1, if(terminal) 8 else 1) // CT_TERMINAL or viewing
+            integer(out, 1, if(terminal) 8 else if(dataOnly) 5 else 1) // native TERM / file-data / desktop
             integer(out, 2, -1) // auto screen
             bytes(out, 3, capture)
             profiles.forEach { profile -> bytes(out, 4, message { decoder ->
@@ -81,7 +81,7 @@ internal object UuWire {
     }
 
     fun controlEvent(controllerId: String, appControlId: String = UUID.randomUUID().toString(),
-                     profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080)),terminal: Boolean=false):
+                     profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080)),terminal: Boolean=false,dataOnly: Boolean=false):
         Pair<String, ByteArray> {
         val capability = JSONObject()
             .put("ice_id", "")
@@ -94,7 +94,7 @@ internal object UuWire {
         val streamer = JSONObject()
             .put("control_id", appControlId)
             .put("openuuyc_audio_only", false)
-            .put("openuuyc_audio_control", 1)
+            .put("openuuyc_audio_control", if(dataOnly || terminal) 0 else 1)
             .put("openuuyc_annotation", 0)
             .put("openuuyc_display_geometry", 0)
             .put("openuuyc_diagnostics", 0)
@@ -104,7 +104,7 @@ internal object UuWire {
             .put("app_control_id", appControlId)
             .put("app_data", JSONObject().put("_placeholder", true).put("num", 0))
             .put("streamer_data", streamer.toString())
-        return "451-2" + JSONArray().put("control").put(payload).toString() to connectOptions(controllerId, profiles,terminal)
+        return "451-2" + JSONArray().put("control").put(payload).toString() to connectOptions(controllerId, profiles,terminal,dataOnly)
     }
 
     /** Socket.IO binary attachment MUST start with an Engine.IO message byte. */
@@ -533,13 +533,21 @@ internal object UuWire {
         return lines.joinToString(separator, postfix = separator)
     }
 
+    class ControlRejected(val code: Int): IllegalArgumentException("UU 远端拒绝连接，错误码 $code")
+    /** Bounded metadata only: never log session IDs, SDP, credentials or peer text. */
+    fun controlAckSummary(frame: String): String = runCatching {
+        val a=JSONArray(frame.removePrefix("432"));val r=a.optJSONObject(1)
+        "控制应答：${if(a.optString(0)=="success") "success" else "rejected"} code=${r?.optInt("code",-1) ?: -1} clientId=${!r?.optString("client_id").isNullOrBlank()} iceId=${!r?.optString("ice_id").isNullOrBlank()} ICE=${r?.optJSONArray("iceServers")?.length() ?: 0}"
+    }.getOrDefault("控制应答：格式无效")
+
     /** Desktop-compatible Socket.IO control ACK: ["success", ControlSessionInfo]. */
     fun parseControlAck(frame: String, appControlId: String): ControlReply {
         require(frame.startsWith("432")) { "incorrect UU control ACK id" }
         val arr = JSONArray(frame.removePrefix("432"))
-        require(arr.length() >= 2 && arr.optString(0) == "success") { "UU controller was not accepted" }
+        if(arr.optString(0)!="success") throw ControlRejected(arr.optJSONObject(1)?.optInt("code",-1) ?: -1)
+        require(arr.length() >= 2) { "UU control config missing" }
         val response = arr.optJSONObject(1) ?: throw IllegalArgumentException("UU control config missing")
-        require(response.optInt("code", -1) == 0) { "UU control rejected" }
+        if(response.optInt("code",-1)!=0) throw ControlRejected(response.optInt("code",-1))
         val clientId = response.optString("client_id")
         val iceId = response.optString("ice_id")
         require(clientId.isNotBlank() && iceId.isNotBlank()) { "UU control IDs missing" }

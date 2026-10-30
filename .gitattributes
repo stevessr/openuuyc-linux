@@ -6,3 +6,6 @@
 # Catalog signatures cover exact file bytes, including INF line endings.
 /assets/drivers/** binary !eol
 /drivers/**/*.inf -text !eol whitespace=cr-at-eol
+
+# Preserve the checksum-pinned upstream header, including its original whitespace.
+/drivers/pcvr/vendor/openvr.h -text !eol -whitespace

@@ -278,6 +278,9 @@ mod tests {
         assert_eq!(FrameRateChoice::Fps165.value(display), 165);
         assert_eq!(FrameRateChoice::Auto.value(display), 165);
         assert!(FrameRateChoice::available(display).contains(&FrameRateChoice::Fps165));
-        assert_eq!("165fps".parse::<FrameRateChoice>().unwrap(), FrameRateChoice::Fps165);
+        assert_eq!(
+            "165fps".parse::<FrameRateChoice>().unwrap(),
+            FrameRateChoice::Fps165
+        );
     }
 }

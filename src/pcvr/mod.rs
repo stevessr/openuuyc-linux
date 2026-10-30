@@ -160,3 +160,14 @@ pub mod runtime_probe;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod device;
+
+#[cfg(target_os = "linux")]
+mod capture;
+#[cfg(target_os = "linux")]
+mod encode;
+
+#[cfg(target_os = "linux")]
+pub mod steamvr;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod applications;

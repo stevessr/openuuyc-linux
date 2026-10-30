@@ -30,7 +30,7 @@ class PicoPanelInstrumentation : Instrumentation() {
         } else if(phase=="pcvr-stereo" || phase=="xr-pointer") {
             try {verifyPcvrStereo()} catch(failure: Throwable) {error.set(failure)}
         } else runOnMainSync {
-            try { when (phase) { "rounded-video" -> verifyRoundedVideo(); "controller-menu" -> verifyControllerMenu(); "focus-dots" -> verifyFocusDotsSetting(); "xr-menu" -> verifyXrGlobalMenu(); "quality" -> verifyQualityCanvas(); "profile" -> { val p=org.openuuyc.pico.uu.UuAndroidDeviceProfile.read(targetContext); check(p.memoryMiB>0 && p.cpu.isNotBlank() && p.screen.contains("x")); sendStatus(0,Bundle().apply {putString("stream","Hardware profile: CPU=${p.cpu}; memory=${p.memoryMiB} MiB; GPU=${p.video}; display=${p.screen}\n")}) }; "runtime" -> { val info=PicoRuntimeProbe.extensions(targetContext); check(!info.startsWith("error:")) { info }; sendStatus(0, Bundle().apply { putString("stream", "PICO runtime extensions:\n$info\n") }) }; "network-denied" -> verifyMissingNetworkPermission(); "network" -> verifyRtcStartup(); null -> verifyPanel(); else -> verifyVaultPhase(phase!!) } } catch (failure: Throwable) { error.set(failure) }
+            try { when (phase) { "full-keyboard" -> verifyFullKeyboard(); "rounded-video" -> verifyRoundedVideo(); "controller-menu" -> verifyControllerMenu(); "focus-dots" -> verifyFocusDotsSetting(); "xr-menu" -> verifyXrGlobalMenu(); "quality" -> verifyQualityCanvas(); "profile" -> { val p=org.openuuyc.pico.uu.UuAndroidDeviceProfile.read(targetContext); check(p.memoryMiB>0 && p.cpu.isNotBlank() && p.screen.contains("x")); sendStatus(0,Bundle().apply {putString("stream","Hardware profile: CPU=${p.cpu}; memory=${p.memoryMiB} MiB; GPU=${p.video}; display=${p.screen}\n")}) }; "runtime" -> { val info=PicoRuntimeProbe.extensions(targetContext); check(!info.startsWith("error:")) { info }; sendStatus(0, Bundle().apply { putString("stream", "PICO runtime extensions:\n$info\n") }) }; "network-denied" -> verifyMissingNetworkPermission(); "network" -> verifyRtcStartup(); null -> verifyPanel(); else -> verifyVaultPhase(phase!!) } } catch (failure: Throwable) { error.set(failure) }
         }
         val result = Bundle()
         val failure = error.get()
@@ -83,6 +83,23 @@ class PicoPanelInstrumentation : Instrumentation() {
 
     private fun assertEquals(expected: Any?, actual: Any?) { check(expected == actual) { "expected=$expected actual=$actual" } }
     private fun assertTrue(value: Boolean) { check(value) }
+    private fun verifyFullKeyboard() {
+        val mode=PicoKeyboardMode.FULL
+        val keys=PicoKeyboardLayout.keys(mode)
+        check(keys.size==104)
+        keys.forEach {key->check(PicoKeyboardLayout.keyAt(mode,(key.x+key.width/2)/1200,(key.y+key.height/2)/480)==key.label)}
+        val events=mutableListOf<Pair<Int,Boolean>>()
+        val state=PicoKeyboardKeys {key,down->events.add(key to down);true}
+        state.pressed("RCtrl");check(state.codexVoice())
+        check(events==listOf(163 to true,163 to false,119 to true,119 to false))
+        val bitmap=Bitmap.createBitmap(1200,480,Bitmap.Config.ARGB_8888)
+        val canvas=Canvas(bitmap);PicoXrMaterial.panel(canvas,1200f,480f)
+        PicoKeyboardCanvas.draw(canvas,mode,state,.5f,70f/480)
+        val file=File(targetContext.cacheDir,"physical-keyboard-preview.png")
+        file.outputStream().use {check(bitmap.compress(Bitmap.CompressFormat.PNG,100,it))};bitmap.recycle()
+        sendStatus(0,Bundle().apply {putString("stream","104-key layout rendered; hit geometry, right modifier release and Codex F8 mapping passed; no remote keys or audio sent.\n")})
+    }
+
     private fun verifyNativeIme() {
         val monitor=addMonitor(PicoActivity::class.java.name,null,false)
         runOnMainSync {targetContext.startActivity(android.content.Intent(targetContext,PicoActivity::class.java)

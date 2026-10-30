@@ -23,8 +23,7 @@ fn find_executable(name: &str) -> Option<PathBuf> {
 
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    fs::metadata(path)
-        .is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
+    fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
 }
 
 /// Use the process's argv[0] rather than /proc/PID/comm, which truncates the
@@ -72,7 +71,9 @@ fn runtime_manifest() -> Option<PathBuf> {
         candidates.push(config.join("openxr/1/active_runtime.json"));
     }
     candidates.push(PathBuf::from("/etc/xdg/openxr/1/active_runtime.json"));
-    candidates.push(PathBuf::from("/usr/local/share/openxr/1/active_runtime.json"));
+    candidates.push(PathBuf::from(
+        "/usr/local/share/openxr/1/active_runtime.json",
+    ));
     candidates.push(PathBuf::from("/usr/share/openxr/1/active_runtime.json"));
     candidates.into_iter().find(|path| path.is_file())
 }
@@ -80,7 +81,9 @@ fn runtime_manifest() -> Option<PathBuf> {
 fn parse_runtime_name(contents: &[u8]) -> Result<String> {
     let value: serde_json::Value =
         serde_json::from_slice(contents).context("无效的 OpenXR runtime JSON")?;
-    let runtime = value.get("runtime").context("OpenXR manifest 缺少 runtime 字段")?;
+    let runtime = value
+        .get("runtime")
+        .context("OpenXR manifest 缺少 runtime 字段")?;
     let library = runtime
         .get("library_path")
         .and_then(serde_json::Value::as_str)
@@ -120,8 +123,16 @@ pub(crate) fn doctor() -> Result<()> {
     }
     println!(
         "WiVRn 管理器: {}；WayVR: {}",
-        if running_process(WIVRN_DASHBOARD) { "运行中" } else { "未检测到" },
-        if running_process(WAYVR) { "运行中" } else { "未检测到" }
+        if running_process(WIVRN_DASHBOARD) {
+            "运行中"
+        } else {
+            "未检测到"
+        },
+        if running_process(WAYVR) {
+            "运行中"
+        } else {
+            "未检测到"
+        }
     );
     println!("检查不表示头显已经连接；先在 PICO 上运行与 PC 端版本匹配的 WiVRn 客户端。");
     Ok(())
@@ -138,8 +149,9 @@ fn spawn_detached(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn setup() -> Result<()> {
-    let dashboard = find_executable(WIVRN_DASHBOARD)
-        .context("没有安装 wivrn-dashboard；请先安装 WiVRn，再在 PICO 头显中安装匹配版本的 WiVRn 客户端")?;
+    let dashboard = find_executable(WIVRN_DASHBOARD).context(
+        "没有安装 wivrn-dashboard；请先安装 WiVRn，再在 PICO 头显中安装匹配版本的 WiVRn 客户端",
+    )?;
     if !running_process(WIVRN_DASHBOARD) {
         spawn_detached(&dashboard)?;
     }

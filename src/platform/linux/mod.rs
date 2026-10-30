@@ -21,6 +21,7 @@ pub(crate) mod graphics;
 pub(crate) mod host_service;
 pub(crate) mod input;
 pub(crate) mod loopback;
+pub(crate) mod mr_device;
 pub(crate) mod notifications;
 pub(crate) mod nvenc;
 pub(crate) mod power_request;

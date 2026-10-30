@@ -9,7 +9,7 @@ use std::{
     },
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -24,17 +24,29 @@ struct ControlRequest {
     op: String,
     #[serde(default)]
     calibration: Option<super::device::Calibration>,
+    #[serde(default)]
+    generation: u32,
 }
+fn tracking_fresh(last: Option<Instant>) -> bool {
+    last.is_some_and(|time| time.elapsed() < Duration::from_millis(250))
+}
+static NEXT_GENERATION: AtomicU32 = AtomicU32::new(1);
 static OWNED: AtomicBool = AtomicBool::new(false);
 #[derive(Default)]
 struct State {
     socket: Option<UnixDatagram>,
     broker: Option<super::device::Broker>,
+    export: Option<super::capture::Export>,
+    generation: u32,
     publisher_lock: Option<std::fs::File>,
     sequence: u64,
     frames: u64,
     last: Option<Instant>,
     backend: Option<&'static str>,
+    head_valid: bool,
+    captured_frames: u64,
+    encoded_frames: u64,
+    producer_error: Option<&'static str>,
 }
 pub(crate) struct Session {
     lease: Lease,
@@ -42,25 +54,195 @@ pub(crate) struct Session {
     state: Mutex<State>,
     tracking_ready: AtomicBool,
     video: Mutex<Option<std::sync::Weak<RTCDataChannel>>>,
+    control: Mutex<Option<std::sync::Weak<RTCDataChannel>>>,
+    configured_video: Mutex<Option<(u32, u16, u16)>>,
+    video_ack: AtomicU32,
+
     keyframe_requested: AtomicBool,
     video_send: tokio::sync::Mutex<()>,
+    producer: tokio::sync::mpsc::Sender<super::stereo::Frame>,
+    sent_video_frames: AtomicU64,
+    last_video: Mutex<Option<Instant>>,
 }
 impl Session {
     pub(crate) fn new(lease: Lease, connected: Arc<AtomicBool>) -> Arc<Self> {
-        Arc::new(Self {
+        let (producer, mut frames) = tokio::sync::mpsc::channel::<super::stereo::Frame>(2);
+        let session = Arc::new(Self {
             lease,
             connected,
             state: Mutex::new(State::default()),
             tracking_ready: AtomicBool::new(false),
             video: Mutex::new(None),
+            control: Mutex::new(None),
+            configured_video: Mutex::new(None),
+            video_ack: AtomicU32::new(0),
             keyframe_requested: AtomicBool::new(true),
             video_send: tokio::sync::Mutex::new(()),
-        })
+            producer,
+            sent_video_frames: AtomicU64::new(0),
+            last_video: Mutex::new(None),
+        });
+        let weak = Arc::downgrade(&session);
+        tokio::spawn(async move {
+            while let Some(frame) = frames.recv().await {
+                let Some(session) = weak.upgrade() else { break };
+                if let Err(error) = session.send_stereo(&frame).await {
+                    session.keyframe_requested.store(true, Ordering::Release);
+                    tracing::debug!(%error,"stereo producer frame dropped");
+                }
+            }
+        });
+        let weak = Arc::downgrade(&session);
+        std::thread::spawn(move || {
+            let mut generation = 0;
+            let mut previous = 0;
+            let mut encoder: Option<super::encode::Encoder> = None;
+            while let Some(session) = weak.upgrade() {
+                let source = {
+                    let state = lock(&session.state);
+                    state
+                        .export
+                        .as_ref()
+                        .filter(|_| state.head_valid && tracking_fresh(state.last))
+                        .and_then(|export| export.file.try_clone().ok())
+                        .map(|f| (state.generation, f))
+                };
+                if session.allowed() {
+                    if let Some((epoch, file)) = source {
+                        if epoch != generation {
+                            generation = epoch;
+                            previous = 0;
+                            encoder = match super::encode::Encoder::new(epoch) {
+                                Ok(encoder) => Some(encoder),
+                                Err(error) => {
+                                    tracing::warn!(%error,"PCVR encoder initialization failed");
+                                    session.producer_status(
+                                        epoch,
+                                        Some("双眼编码器初始化失败"),
+                                        false,
+                                        false,
+                                    );
+                                    None
+                                }
+                            };
+                        }
+                        let raw = match super::capture::read_latest(&file, previous) {
+                            Ok(Some(raw)) if !super::capture::fresh(raw.predicted_time) => {
+                                previous = raw.sequence;
+                                session.keyframe_requested.store(true, Ordering::Release);
+                                session.producer_status(
+                                    epoch,
+                                    Some("合成器双眼帧已过期，等待新画面"),
+                                    false,
+                                    false,
+                                );
+                                None
+                            }
+                            Ok(raw) => raw,
+                            Err(error) => {
+                                session.producer_status(
+                                    epoch,
+                                    Some("合成器双眼帧读取或校验失败"),
+                                    false,
+                                    false,
+                                );
+                                tracing::debug!(%error,"PCVR compositor export rejected");
+                                None
+                            }
+                        };
+                        if let Some(raw) = raw {
+                            previous = raw.sequence;
+                            session.producer_status(epoch, None, true, false);
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            if let Some(encoder) = encoder.as_mut() {
+                                match encoder.encode(
+                                    raw,
+                                    session.stereo_keyframe_requested(),
+                                    &cancel,
+                                ) {
+                                    Ok(Some(frame)) => {
+                                        session.producer_status(epoch, None, false, true);
+                                        let _ = session.submit_stereo(frame);
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        session.keyframe_requested.store(true, Ordering::Release);
+                                        session.producer_status(
+                                            epoch,
+                                            Some("双眼视频编码失败"),
+                                            false,
+                                            false,
+                                        );
+                                        tracing::debug!(%error,"stereo encode failed");
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // The receiver may discard references while tracking is absent.
+                        session.keyframe_requested.store(true, Ordering::Release);
+                    }
+                } else {
+                    session.stop();
+                }
+                drop(session);
+                std::thread::sleep(Duration::from_millis(33));
+            }
+        });
+        session
+    }
+    fn producer_status(
+        &self,
+        generation: u32,
+        error: Option<&'static str>,
+        captured: bool,
+        encoded: bool,
+    ) {
+        let mut state = lock(&self.state);
+        if state.generation != generation {
+            return;
+        }
+        state.captured_frames += u64::from(captured);
+        state.encoded_frames += u64::from(encoded);
+        // A successful capture alone cannot clear a persistent encoder failure.
+        if error.is_some() || encoded {
+            state.producer_error = error;
+        }
+    }
+    /// Real compositor/encoder producers must never block the render thread.
+    /// Overflow invalidates interframes until the encoder supplies a new IDR.
+    pub(crate) fn submit_stereo(&self, frame: super::stereo::Frame) -> Result<()> {
+        frame.validate()?;
+        ensure!(self.allowed(), "stereo producer permission revoked");
+        ensure!(
+            lock(&self.state).generation == frame.generation,
+            "stale stereo producer generation"
+        );
+        if self.producer.try_send(frame).is_err() {
+            self.keyframe_requested.store(true, Ordering::Release);
+            anyhow::bail!("stereo producer queue is full or closed");
+        }
+        Ok(())
+    }
+    pub(crate) fn stereo_keyframe_requested(&self) -> bool {
+        self.keyframe_requested.load(Ordering::Acquire)
+    }
+    fn stereo_streaming(&self) -> bool {
+        self.allowed()
+            && {
+                let state = lock(&self.state);
+                state.head_valid && tracking_fresh(state.last)
+            }
+            && lock(&self.last_video).is_some_and(|t| t.elapsed() < Duration::from_millis(500))
     }
     fn allowed(&self) -> bool {
-        self.lease.terminal_allowed() && self.connected.load(Ordering::Acquire)
+        self.lease.app_launch_allowed() && self.connected.load(Ordering::Acquire)
     }
     fn stop(&self) {
+        *lock(&self.last_video) = None;
+        *lock(&self.configured_video) = None;
+        self.video_ack.store(0, Ordering::Release);
+        self.keyframe_requested.store(true, Ordering::Release);
         let mut state = lock(&self.state);
         if state.socket.take().is_some() || state.broker.take().is_some() {
             OWNED.store(false, Ordering::Release);
@@ -71,7 +253,7 @@ impl Session {
     fn start(&self, calibration: Option<&super::device::Calibration>) -> Result<()> {
         ensure!(
             self.allowed(),
-            "当前会话未获远程终端授权，不能启用 VR 追踪桥接"
+            "当前会话未获应用快捷启动授权，不能启用 VR 桥接"
         );
         ensure!(
             self.tracking_ready.load(Ordering::Acquire),
@@ -88,6 +270,10 @@ impl Session {
         if preference != super::runtime::Preference::SteamVr
             && super::runtime::device_component_available()?
         {
+            ensure!(
+                super::runtime::stereo_component_available()?,
+                "当前 OpenXR 组件没有双眼读回出口，请安装 stereo_cpu_v2 组件"
+            );
             let calibration = calibration.context("PICO 尚未上报真实眼位/FOV；请唤醒头显后重试")?;
             calibration.validate()?;
             ensure!(
@@ -98,6 +284,21 @@ impl Session {
             );
             match super::device::Broker::create(&root, calibration.clone()) {
                 Ok(broker) => {
+                    let generation = NEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
+                    let export = super::capture::Export::create(&root.join("openuuyc-pcvr/openxr"));
+                    match export {
+                        Ok(export) if generation > 0 && generation <= i32::MAX as u32 => {
+                            state.export = Some(export);
+                            state.generation = generation;
+                        }
+                        result => {
+                            drop(broker);
+                            OWNED.store(false, Ordering::Release);
+                            return Err(result.err().unwrap_or_else(|| {
+                                anyhow::anyhow!("stereo generation exhausted")
+                            }));
+                        }
+                    }
                     state.broker = Some(broker);
                     state.backend = Some("openxr-pico-device");
                     return Ok(());
@@ -181,6 +382,7 @@ impl Session {
                 state.sequence = sequence;
                 state.frames += 1;
                 state.last = Some(Instant::now());
+                state.head_valid = protocol::head_valid(data);
             }
             return;
         }
@@ -192,6 +394,7 @@ impl Session {
                 state.sequence = sequence;
                 state.frames += 1;
                 state.last = Some(Instant::now());
+                state.head_valid = protocol::head_valid(data);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             _ => {
@@ -201,15 +404,21 @@ impl Session {
             }
         }
     }
-    /// Frame producer entry point; not called until a real GPU backend owns the session.
+    /// Send a real compositor frame from the authorized CPU/GPU encoder.
     /// Never queues old access units behind a slow peer.
     pub(crate) async fn send_stereo(&self, frame: &super::stereo::Frame) -> Result<()> {
         ensure!(
             self.allowed() && {
                 let state = lock(&self.state);
-                state.socket.is_some() || state.broker.is_some()
+                (state.socket.is_some() || state.broker.is_some())
+                    && state.head_valid
+                    && tracking_fresh(state.last)
             },
             "stereo session is not authorized/started"
+        );
+        ensure!(
+            super::capture::fresh(frame.predicted_time),
+            "stereo frame expired before send"
         );
         let video = lock(&self.video)
             .as_ref()
@@ -228,6 +437,26 @@ impl Session {
             .video_send
             .try_lock()
             .context("stereo frame producer is already sending")?;
+        ensure!(
+            lock(&self.state).generation == frame.generation,
+            "stale stereo sender generation"
+        );
+        let config = (frame.generation, frame.width, frame.height);
+        let needs_config = *lock(&self.configured_video) != Some(config)
+            || self.video_ack.load(Ordering::Acquire) != frame.generation;
+        if needs_config {
+            let control = lock(&self.control)
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .context("VR control channel unavailable for decoder configuration")?;
+            control.send_text(serde_json::json!({"type":"video-config","version":1,
+                "generation":frame.generation,"width":frame.width,"height":frame.height,"codec":frame.codec}).to_string()).await?;
+            *lock(&self.configured_video) = Some(config);
+        }
+        ensure!(
+            self.video_ack.load(Ordering::Acquire) == frame.generation,
+            "waiting for headset decoder configuration acknowledgement"
+        );
         let packets = frame.fragments()?;
         if frame.keyframe {
             self.keyframe_requested.store(false, Ordering::Release);
@@ -236,9 +465,16 @@ impl Session {
         for packet in packets {
             let started = {
                 let state = lock(&self.state);
-                state.socket.is_some() || state.broker.is_some()
+                (state.socket.is_some() || state.broker.is_some())
+                    && state.head_valid
+                    && tracking_fresh(state.last)
             };
-            if !self.allowed() || !started || video.buffered_amount().await > 256 * 1024 {
+            if !self.allowed()
+                || !super::capture::fresh(frame.predicted_time)
+                || !started
+                || lock(&self.state).generation != frame.generation
+                || video.buffered_amount().await > 256 * 1024
+            {
                 self.keyframe_requested.store(true, Ordering::Release);
                 anyhow::bail!("stereo deadline/backpressure drop");
             }
@@ -250,6 +486,8 @@ impl Session {
                 }
             }
         }
+        self.sent_video_frames.fetch_add(1, Ordering::Relaxed);
+        *lock(&self.last_video) = Some(Instant::now());
         Ok(())
     }
     pub(crate) fn bind(self: &Arc<Self>, channel: Arc<RTCDataChannel>, parent: CancellationToken) {
@@ -281,6 +519,7 @@ impl Session {
             return;
         }
         let stop = parent.child_token();
+        *lock(&self.control) = Some(Arc::downgrade(&channel));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
         let invalid = stop.clone();
         channel.on_message(Box::new(move |m| {
@@ -336,6 +575,24 @@ impl Session {
                             )
                             .err()
                             .map(|e| e.to_string()),
+                        Some("video-configured") => {
+                            let generation = request
+                                .as_ref()
+                                .ok()
+                                .and_then(|r| r.as_ref())
+                                .map(|r| r.generation)
+                                .unwrap_or(0);
+                            let current = lock(&this.state).generation;
+                            let pending = lock(&this.configured_video).map(|c| c.0);
+                            if generation > 0
+                                && current == generation
+                                && pending == Some(generation)
+                            {
+                                this.video_ack.store(generation, Ordering::Release);
+                                this.keyframe_requested.store(true, Ordering::Release);
+                            }
+                            None
+                        }
                         Some("video-keyframe") => {
                             this.keyframe_requested.store(true, Ordering::Release);
                             None
@@ -348,9 +605,10 @@ impl Session {
                         _ => Some("未知 VR 控制请求".into()),
                     };
                 }
+                let streaming = this.stereo_streaming();
                 let status = {
                     let state = lock(&this.state);
-                    serde_json::json!({"version":1,"id":id,"tracking":(state.socket.is_some() || state.broker.is_some()),"backend":state.backend,"stereo":false,"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"message":"内置追踪诊断；双眼画面尚未实现，不启动 VRChat"})
+                    serde_json::json!({"version":1,"id":id,"tracking":(state.socket.is_some() || state.broker.is_some()),"backend":state.backend,"stereo":streaming,"video_frames":this.sent_video_frames.load(Ordering::Relaxed),"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"video_error":state.producer_error,"captured_frames":state.captured_frames,"encoded_frames":state.encoded_frames,"decoder_ready":this.video_ack.load(Ordering::Acquire)==state.generation && state.generation>0,"head_valid":state.head_valid,"message":if streaming {"双眼编码帧正在发送；仍需头显确认解码与显示"} else {"等待真实合成器双眼编码帧；当前不能宣称 PCVR 可用"}})
                 };
                 let Some(ch) = weak.upgrade() else { break };
                 if ch.ready_state()
@@ -372,7 +630,31 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod stereo_async_tests {
+    #[test]
+    fn decoder_acknowledgement_has_a_generation() {
+        let request: super::ControlRequest =
+            serde_json::from_str(r#"{"id":0,"op":"video-configured","generation":7}"#).unwrap();
+        assert_eq!(request.generation, 7);
+        let legacy: super::ControlRequest =
+            serde_json::from_str(r#"{"id":1,"op":"start"}"#).unwrap();
+        assert_eq!(legacy.generation, 0);
+        assert!(
+            serde_json::from_str::<super::ControlRequest>(
+                r#"{"id":0,"op":"video-configured","generation":-1}"#
+            )
+            .is_err()
+        );
+    }
+
     use super::*;
+    #[test]
+    fn tracking_timeout_never_treats_missing_or_old_samples_as_fresh() {
+        assert!(!tracking_fresh(None));
+        assert!(tracking_fresh(Some(Instant::now())));
+        assert!(!tracking_fresh(Some(
+            Instant::now() - Duration::from_millis(251)
+        )));
+    }
     #[test]
     fn stereo_sender_can_run_on_the_peer_executor() {
         fn prove(session: &Session, frame: &super::super::stereo::Frame) {

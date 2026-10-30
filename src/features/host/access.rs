@@ -1310,7 +1310,9 @@ impl Lease {
     }
     pub(crate) fn app_launch_allowed(&self) -> bool {
         let state = lock(&self.handle.ownership);
-        self.current(&state) && self.assistance.is_none() && !self.handle.guest
+        self.current(&state)
+            && self.assistance.is_none()
+            && !self.handle.guest
             && (state.terminal || super::quick_apps::launch_allowed())
     }
     /// Read-only installed-app inventory for the currently authorized owner.

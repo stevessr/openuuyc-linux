@@ -676,7 +676,9 @@ impl StreamControlHandle {
         &self.files
     }
 
-    pub(crate) fn terminal(&self)->&crate::features::remote_terminal::Terminal {&self.terminal}
+    pub(crate) fn terminal(&self) -> &crate::features::remote_terminal::Terminal {
+        &self.terminal
+    }
 
     pub(crate) fn diagnostics(&self) -> &crate::diagnostics::remote::Controller {
         &self.diagnostics

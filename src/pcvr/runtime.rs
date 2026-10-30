@@ -203,7 +203,7 @@ fn active_bundle() -> Result<Option<PathBuf>> {
     );
     Ok(Some(path))
 }
-fn steam_runtime() -> Result<Option<PathBuf>> {
+pub(super) fn steam_runtime() -> Result<Option<PathBuf>> {
     let path = config_root()?.join("openvr/openvrpaths.vrpath");
     let data = match std::fs::read(path) {
         Ok(v) => v,
@@ -249,6 +249,13 @@ pub(crate) fn device_component_available() -> Result<bool> {
     let (manifest, _) = bundle(&path)?;
     Ok(manifest.features.contains("pico_device_v1"))
 }
+pub(crate) fn stereo_component_available() -> Result<bool> {
+    let Some(path) = active_bundle()? else {
+        return Ok(false);
+    };
+    let (manifest, _) = bundle(&path)?;
+    Ok(manifest.features.contains("stereo_cpu_v2"))
+}
 pub fn plan() -> Result<Plan> {
     let preference = preference()?;
     if preference == Preference::SteamVr {
@@ -269,6 +276,15 @@ impl Plan {
         command.env("XR_RUNTIME_JSON", &self.manifest);
         if self.backend == Backend::OpenXr {
             if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR") {
+                let capture = PathBuf::from(&root).join("openuuyc-pcvr/openxr/stereo.shm");
+                command.env("OPENUUYC_STEREO_CAPTURE", &capture);
+                let mut writable =
+                    std::env::var_os("PRESSURE_VESSEL_FILESYSTEMS_RW").unwrap_or_default();
+                if !writable.is_empty() {
+                    writable.push(":");
+                }
+                writable.push(&capture);
+                command.env("PRESSURE_VESSEL_FILESYSTEMS_RW", writable);
                 let mut mounts =
                     std::env::var_os("PRESSURE_VESSEL_FILESYSTEMS_RO").unwrap_or_default();
                 if !mounts.is_empty() {
@@ -306,6 +322,23 @@ impl Plan {
                 text.push_str(&quote(
                     PathBuf::from(root).join("openuuyc-pcvr/openxr").as_os_str(),
                 ));
+                text.push(' ');
+            }
+        }
+        if self.backend == Backend::OpenXr {
+            if let Some(root) = std::env::var_os("XDG_RUNTIME_DIR") {
+                let capture = PathBuf::from(root).join("openuuyc-pcvr/openxr/stereo.shm");
+                text.push_str("OPENUUYC_STEREO_CAPTURE=");
+                text.push_str(&quote(capture.as_os_str()));
+                text.push(' ');
+                let mut writable =
+                    std::env::var_os("PRESSURE_VESSEL_FILESYSTEMS_RW").unwrap_or_default();
+                if !writable.is_empty() {
+                    writable.push(":");
+                }
+                writable.push(&capture);
+                text.push_str("PRESSURE_VESSEL_FILESYSTEMS_RW=");
+                text.push_str(&quote(&writable));
                 text.push(' ');
             }
         }

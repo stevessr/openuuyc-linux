@@ -27,6 +27,7 @@ struct State {
     channel: Option<std::sync::Weak<RTCDataChannel>>,
     cols: u16,
     rows: u16,
+    epoch: u64,
     handle: u32,
     active: bool,
     pending: bool,
@@ -43,6 +44,7 @@ impl Default for Terminal {
             channel: None,
             cols: 80,
             rows: 24,
+            epoch: 0,
             handle: 0,
             active: false,
             pending: false,
@@ -157,6 +159,8 @@ impl Terminal {
             }
             FrameType::Stdout if s.active => s.parser.process(&frame.payload),
             FrameType::Exit | FrameType::Error => {
+                s.epoch = s.epoch.wrapping_add(1);
+                s.input.clear();
                 s.active = false;
                 s.pending = false;
                 s.status = if frame.kind == FrameType::Exit {
@@ -176,6 +180,7 @@ impl Terminal {
     }
     pub(crate) fn close(&self) {
         let mut s = self.lock();
+        s.epoch = s.epoch.wrapping_add(1);
         if s.active || s.pending {
             Self::send(&s, FrameType::Close, &[]);
         }
@@ -187,6 +192,7 @@ impl Terminal {
     }
     pub(crate) fn disconnected(&self) {
         let mut s = self.lock();
+        s.epoch = s.epoch.wrapping_add(1);
         let was_connected = s.tx.is_some() || s.channel.is_some();
         s.tx = None;
         s.channel = None;
@@ -212,6 +218,7 @@ impl Terminal {
             s.status = "此设备不支持终端扩展，或通道尚未就绪".into();
             return;
         }
+        s.epoch = s.epoch.wrapping_add(1);
         s.handle = (uuid::Uuid::new_v4().as_u128() as u32 & 0x7fff_ffff).max(1);
         if Self::send(
             &s,
@@ -227,8 +234,23 @@ impl Terminal {
             s.status = "等待远端授权并创建 Shell…".into();
         }
     }
+    fn submit(&self, epoch: u64, input: String, send: Option<String>) {
+        let mut s = self.lock();
+        if s.epoch != epoch {
+            if send.is_some() {
+                s.status = "Shell 状态已变化，未发送旧输入".into();
+            }
+            return;
+        }
+        s.input = input;
+        if let Some(bytes) = send {
+            if !s.active || !Self::send(&s, FrameType::Stdin, bytes.as_bytes()) {
+                s.status = "终端输入未发送（通道拥塞、Shell 退出或断开）".into();
+            }
+        }
+    }
     pub(crate) fn ui(&self, ctx: &egui::Context) {
-        let (mut visible, status, contents, active, pending, mut input) = {
+        let (mut visible, status, contents, active, pending, mut input, epoch) = {
             let mut s = self.lock();
             if s.pending
                 && s.started
@@ -245,6 +267,7 @@ impl Terminal {
                 s.active,
                 s.pending,
                 s.input.clone(),
+                s.epoch,
             )
         };
         if !visible {
@@ -328,15 +351,7 @@ impl Terminal {
                     });
                 });
             });
-        {
-            let mut s = self.lock();
-            s.input = input;
-            if let Some(bytes) = send {
-                if !Self::send(&s, FrameType::Stdin, bytes.as_bytes()) {
-                    s.status = "终端输入未发送（通道拥塞或断开）".into();
-                }
-            }
-        }
+        self.submit(epoch, input, send);
         if !visible {
             self.close();
         } else if open {
@@ -348,6 +363,23 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exited_shell_cannot_receive_a_stale_ui_submission_or_restore_its_draft() {
+        let t = Terminal::default();
+        {
+            let mut s = t.lock();
+            s.handle = 7;
+            s.active = true;
+            s.input = "old draft".into();
+        }
+        let epoch = t.lock().epoch;
+        t.receive(&Frame::encode(FrameType::Exit, 7, b"{}"));
+        t.submit(epoch, "old draft".into(), Some("old command\r".into()));
+        let s = t.lock();
+        assert!(s.input.is_empty());
+        assert!(!s.active);
+        assert!(s.status.contains("未发送旧输入"));
+    }
     #[test]
     fn temporary_backpressure_waits_but_timeout_and_disconnect_stop() {
         use std::time::Duration;

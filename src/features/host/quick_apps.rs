@@ -2,9 +2,9 @@
 #[cfg(target_os = "linux")]
 mod desktop;
 #[cfg(target_os = "linux")]
-mod steam;
-#[cfg(target_os = "linux")]
 mod icons;
+#[cfg(target_os = "linux")]
+mod steam;
 
 use super::Lease;
 use anyhow::{Result, ensure};
@@ -23,8 +23,12 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use webrtc::data_channel::RTCDataChannel;
 static LAUNCH_ALLOWED: AtomicBool = AtomicBool::new(false);
-pub(crate) fn launch_allowed() -> bool { LAUNCH_ALLOWED.load(Ordering::Acquire) }
-pub(crate) fn set_launch_allowed(allowed: bool) { LAUNCH_ALLOWED.store(allowed,Ordering::Release); }
+pub(crate) fn launch_allowed() -> bool {
+    LAUNCH_ALLOWED.load(Ordering::Acquire)
+}
+pub(crate) fn set_launch_allowed(allowed: bool) {
+    LAUNCH_ALLOWED.store(allowed, Ordering::Release);
+}
 
 pub(crate) const CHANNEL: &str = "OPENUUYC_QUICK_APPS_V1";
 #[derive(Clone, Serialize)]
@@ -168,11 +172,29 @@ fn catalog() -> BTreeMap<String, (App, Target)> {
             }
         }
         if let Some(home) = home.as_deref() {
-            for (appid,name) in steam::installed(home) {
-                let id = if appid == 438100 { "vrchat-vr".to_owned() } else { format!("steam-{appid}") };
+            for (appid, name) in steam::installed(home) {
+                let id = if appid == 438100 {
+                    "vrchat-vr".to_owned()
+                } else {
+                    format!("steam-{appid}")
+                };
                 let lower = name.to_ascii_lowercase();
-                let vr = matches!(appid,438100|250820) || lower.contains("vrchat") || lower.contains("steamvr");
-                out.insert(id.clone(), (App {id,name,vr,enabled:true,icon:icons::png(&format!("steam_icon_{appid}"))},Target::Steam(appid)));
+                let vr = matches!(appid, 438100 | 250820)
+                    || lower.contains("vrchat")
+                    || lower.contains("steamvr");
+                out.insert(
+                    id.clone(),
+                    (
+                        App {
+                            id,
+                            name,
+                            vr,
+                            enabled: true,
+                            icon: icons::png(&format!("steam_icon_{appid}")),
+                        },
+                        Target::Steam(appid),
+                    ),
+                );
             }
         }
     }
@@ -261,10 +283,16 @@ pub(crate) fn bind(
             let id = request.id;
             let result:Result<()>=async {
                 ensure!(lease.app_catalog_allowed() && connected.load(Ordering::Acquire),"应用目录需要当前已授权的非访客设备连接");
-                if !matches!(request.op.as_str(),"list"|"vr-runtime") {
+                if !matches!(request.op.as_str(),"list"|"vr-runtime"|"vr-applications") {
                     ensure!(lease.app_launch_allowed(),"远端未授权应用启动：请在 Linux 被控设置允许应用快捷启动");
                 }
                 match request.op.as_str() {
+                    #[cfg(target_os="linux")]
+                    "vr-applications"=>{
+                        let entries=tokio::task::spawn_blocking(crate::pcvr::applications::running).await?;
+                        ensure!(lease.app_catalog_allowed() && connected.load(Ordering::Acquire),"权限已撤销");
+                        send(&ch,serde_json::json!({"id":id,"type":"vr-applications","applications":entries})).await?;
+                    },
                     #[cfg(target_os="linux")]
                     "vr-runtime"=>{
                         let info=tokio::task::spawn_blocking(|| -> Result<serde_json::Value> {

@@ -6,8 +6,9 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <unistd.h>
 #define OK(expr) do {XrResult r=(expr);if(XR_FAILED(r)) {std::fprintf(stderr,"%s: %d\n",#expr,int(r));return 2;}} while(0)
-int main() {
+int main(int argc,char **argv) {
     const char *extensions[]={"XR_MND_headless","XR_KHR_convert_timespec_time"};
     XrInstanceCreateInfo create{XR_TYPE_INSTANCE_CREATE_INFO};create.applicationInfo.apiVersion=XR_MAKE_VERSION(1,0,0);std::strcpy(create.applicationInfo.applicationName,"OpenUUYC fixture smoke");create.enabledExtensionCount=2;create.enabledExtensionNames=extensions;
     XrInstance instance;OK(xrCreateInstance(&create,&instance));
@@ -21,6 +22,26 @@ int main() {
     reference.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_VIEW;XrSpace view;OK(xrCreateReferenceSpace(session,&reference,&view));
     XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};OK(xrLocateSpace(view,space,time,&location));
     if(!(location.locationFlags&XR_SPACE_LOCATION_POSITION_VALID_BIT) || std::fabs(location.pose.position.x-1.f)>.001f || std::fabs(location.pose.position.y-2.f)>.001f || std::fabs(location.pose.position.z-3.f)>.001f) return 4;
+    if(argc>=2) {
+        FILE *marker=std::fopen(argv[1],"w");if(!marker) return 6;
+        std::fputs("ready",marker);std::fclose(marker);
+        bool attached=false,invalid=false;
+        const bool reject=argc>=3 && std::strcmp(argv[2],"reject")==0;
+        for(int retry=0;retry<200;retry++) {
+            clock_gettime(CLOCK_MONOTONIC,&now);OK(convert(instance,&now,&time));
+            location={XR_TYPE_SPACE_LOCATION};OK(xrLocateSpace(view,space,time,&location));
+            if(!(location.locationFlags&XR_SPACE_LOCATION_POSITION_VALID_BIT)) invalid=true;
+            else if(std::fabs(location.pose.position.x-4.f)<.001f &&
+                    std::fabs(location.pose.position.y-5.f)<.001f &&
+                    std::fabs(location.pose.position.z-6.f)<.001f) {
+                attached=true;break;
+            }
+            usleep(10000);
+        }
+        if(reject ? attached || !invalid : !attached) return 7;
+        std::printf("{\"same_session_reattached\":%s,\"incompatible_rejected\":%s}\n",
+            attached?"true":"false",reject&&invalid?"true":"false");
+    }
     std::printf("{\"system\":true,\"session\":true,\"head_x\":%.6f,\"head_y\":%.6f,\"head_z\":%.6f}\n",location.pose.position.x,location.pose.position.y,location.pose.position.z);
     xrDestroySpace(view);
     xrDestroySpace(space);xrDestroySession(session);xrDestroyInstance(instance);return 0;

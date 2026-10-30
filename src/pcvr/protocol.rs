@@ -34,6 +34,12 @@ pub(crate) fn sequence(frame: &[u8]) -> Result<u64> {
     }
     Ok(sequence)
 }
+/// Call only after sequence() validates the full packet. Lost head tracking is not a pose.
+pub(crate) fn head_valid(frame: &[u8]) -> bool {
+    frame
+        .get(32..36)
+        .is_some_and(|flags| u32::from_le_bytes(flags.try_into().unwrap()) & 3 == 3)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,6 +57,15 @@ mod tests {
         let mut f = frame();
         f[8] = 0;
         assert!(sequence(&f).is_err());
+    }
+    #[test]
+    fn head_requires_both_orientation_and_position() {
+        let mut f = frame();
+        for flags in 0..4 {
+            f[32] = flags;
+            assert_eq!(head_valid(&f), flags == 3);
+        }
+        assert!(!head_valid(&f[..32]));
     }
     #[test]
     fn rejects_nonfinite_and_invalid_quaternion() {

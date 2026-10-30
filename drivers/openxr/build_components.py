@@ -74,6 +74,8 @@ def main():
     if patched.exists():
         raise SystemExit('Use a fresh work directory (Monado overlay exists)')
     shutil.copytree(monado, patched, ignore=shutil.ignore_patterns('.git'))
+    from stereo_overlay import apply as apply_stereo_overlay
+    apply_stereo_overlay(patched)
     lists = patched / 'src/xrt/targets/common/target_lists.c'
     content = lists.read_text()
     marker = 'xrt_builder_create_func_t target_builder_list[] = {'
@@ -123,12 +125,12 @@ def main():
     run('git', '-C', monado, 'archive', '--format=tar.gz', '--prefix=monado/', '-o', sources / 'monado.tar.gz', LOCK['monado']['revision'])
     shutil.copy2(archive, sources / 'xrizer.tar.gz')
     with tarfile.open(sources / 'openuuyc-overlay.tar.gz', 'w:gz') as archive_out:
-        for name in ('build_components.py', 'components.lock.json', 'pico_builder.c', 'device_ipc.h', 'runtime_probe.cpp'):
+        for name in ('build_components.py', 'components.lock.json', 'pico_builder.c', 'device_ipc.h', 'runtime_probe.cpp', 'stereo_capture.c', 'stereo_capture.h', 'stereo_overlay.py'):
             archive_out.add(HERE / name, arcname='openuuyc-openxr/' + name)
     files = {str(p.relative_to(output)): digest(p) for p in output.rglob('*') if p.is_file()}
-    (output / 'bundle.json').write_text(json.dumps({'version': 1, 'features': ['pico_device_v1'], 'arch': arch, 'monado_revision': actual, 'xrizer_revision': LOCK['xrizer']['revision'], 'files': files}, indent=2)+'\n')
+    (output / 'bundle.json').write_text(json.dumps({'version': 1, 'features': ['pico_device_v1', 'stereo_cpu_v2', 'device_reattach_v1'], 'arch': arch, 'monado_revision': actual, 'xrizer_revision': LOCK['xrizer']['revision'], 'files': files}, indent=2)+'\n')
     print('Built component bundle:', output)
-    print('Runtime includes the PICO device builder; GPU compositor streaming remains unavailable.')
+    print('Runtime includes real stereo CPU readback; verify end-to-end before claiming PCVR readiness.')
 
 if __name__ == '__main__':
     main()

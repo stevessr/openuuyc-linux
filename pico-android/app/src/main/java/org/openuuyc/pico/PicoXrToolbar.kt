@@ -79,10 +79,23 @@ internal class PicoXrToolbar(
                     val app=apps[index]
                     if(!app.enabled) {status("此应用暂不可用");return@choose}
                     android.os.Handler(android.os.Looper.getMainLooper()).post {
-                        options("$name · ${if(app.vr) "仅启动，无双眼画面" else "确认启动"}",listOf("启动 ${app.name}","取消"),-1) {choice ->
-                            if(choice==0) direct.quickApps.launch(app,launchOnlyAck=app.vr) {ok,message->
-                                status("$name · $message")
-                                if(!ok) {options("启动未完成",listOf(message,"返回"),-1) {};draw()}
+                        options("$name · ${if(app.vr) "启动 PCVR 会话与游戏" else "确认启动"}",listOf("启动 ${app.name}","取消"),-1) {choice ->
+                            if(choice==0) {
+                                fun launch() {
+                                    direct.quickApps.launch(app,launchOnlyAck=app.vr) {ok,message->
+                                        status("$name · $message")
+                                        if(!ok) {options("启动未完成",listOf(message,"返回"),-1) {};draw()}
+                                    }
+                                }
+                                if(app.vr) {
+                                    status("正在准备真实 PCVR 会话…")
+                                    direct.vr.prepareStereo {ready,message->
+                                        if(ready) launch() else {
+                                            status(message)
+                                            options("PCVR 会话未就绪",listOf(message,"返回"),-1) {};draw()
+                                        }
+                                    }
+                                } else launch()
                             }
                         };draw()
                     }
@@ -147,7 +160,7 @@ internal class PicoXrToolbar(
     private var targetScreen: Int?=null
     private var advanced=false
     private var portrait=false
-    private fun qualityPage()=targetScreen!=null && !advanced && !confirmingVirtual && optionTitle==null
+    private fun qualityPage()=!keyboardPage && terminalTarget==null && targetScreen!=null && !advanced && !confirmingVirtual && optionTitle==null
 
     private var optionTitle: String?=null
     private var optionLabels=emptyList<String>()
@@ -312,10 +325,15 @@ internal class PicoXrToolbar(
             return
         }
         if(keyboardPage) {
-            if(v*400 in 48f..90f && u in 0f..<1f) {
-                keyboardKeys.release();voiceCancel()
-                if(u>.8f) {keyboardPage=false;keyboardModeChanged(PicoKeyboardMode.CUSTOM)} else keyboardOptions()
-            } else if(keyboardMode!=PicoKeyboardMode.VOICE) PicoKeyboardLayout.keyAt(keyboardMode,u,v)?.let {if(!keyboardKeys.pressed(it)) notice="键盘发送未完成，检查控制通道"}
+            when(PicoKeyboardLayout.headerAt(keyboardMode,u,v)) {
+                PicoKeyboardLayout.Header.MODE->{keyboardKeys.release();voiceCancel();keyboardOptions()}
+                PicoKeyboardLayout.Header.BACK->{keyboardKeys.release();voiceCancel();keyboardPage=false;keyboardModeChanged(PicoKeyboardMode.CUSTOM)}
+                PicoKeyboardLayout.Header.CODEX_VOICE->{
+                    voiceCancel()
+                    notice=if(keyboardKeys.codexVoice()) "已发送 Codex CLI F8 · 请先聚焦远端 Codex，麦克风回传需单独开启" else "Codex 语音键未发送，请检查控制通道"
+                }
+                null->if(keyboardMode!=PicoKeyboardMode.VOICE) PicoKeyboardLayout.keyAt(keyboardMode,u,v)?.let {if(!keyboardKeys.pressed(it)) notice="键盘发送未完成，检查控制通道"}
+            }
             draw();return
         }
         if(isRoot()) PicoXrMenuHit.toolbar(u,v)?.let {index ->
@@ -390,7 +408,7 @@ internal class PicoXrToolbar(
                     4,5 -> {environmentPage=true;notice="环境 · MR 与背景"}
                     6 -> {closeScreenMenu();home()}
                     7 -> {
-                        options("应用与 VR 游戏",listOf("远端快速应用","内置 VR 追踪诊断（无双眼画面）","本机 VR 应用 / 游戏","此连接的 VR 后端","远端终端"),-1) {entry ->
+                        options("应用与 VR 游戏",listOf("远端快速应用","附加已有 VR 应用（内置运行时）","本机 VR 应用 / 游戏","此连接的 VR 后端","远端终端"),-1) {entry ->
                             android.os.Handler(android.os.Looper.getMainLooper()).post {
                                 if(entry==2) {
                                     localVrApps {apps ->
@@ -425,9 +443,17 @@ internal class PicoXrToolbar(
                                 }
                                 if(entry==1 && direct==null) {status("请先连接 Linux OpenUUYC");return@post}
                                 if(entry==1 && direct!=null) {
-                                    options("内置 VR · 追踪诊断",listOf("开启追踪桥接","停止追踪桥接","刷新状态：${direct.vr.status}"),-1) {choice ->
-                                        if(choice<2) direct.vr.request(choice==0)
-                                        status(direct.vr.status)
+                                    options("附加已有 VR 应用",listOf("附加当前应用 · 不启动或重启游戏","停止连接 · 不关闭游戏","状态：${direct.vr.status}","SteamVR 已运行应用：独立适配中"),-1) {choice ->
+                                        if(choice==0) direct.quickApps.runningVr {apps,error->
+                                            if(apps.isNullOrEmpty()) {
+                                                val reason=error ?: "未检测到运行中的内置 OpenXR 应用；本操作不会自动启动游戏"
+                                                status(reason);options("没有可附加的应用",listOf(reason,"返回"),-1) {};draw()
+                                            } else direct.vr.prepareStereo {ready,message->
+                                                status(if(ready) "PCVR 会话已连接，等待已有应用的真实双眼帧：${apps.joinToString()}；未启动新游戏" else message)
+                                                draw()
+                                            }
+                                        } else if(choice==1) {direct.vr.request(false);status("已停止 PCVR 连接，未关闭游戏")}
+                                        else status(direct.vr.status)
                                     };draw()
                                 } else {
                                     val connections=quickAppConnections()
@@ -563,14 +589,14 @@ internal class PicoXrToolbar(
     }
     fun draw() {
         val nextPortrait=false
-        val layout=if(!menuVisible) 4 else if(nextPortrait) 2 else if(isRoot() && collapsed) 3 else if(!keyboardPage) 0 else 1
+        val layout=if(!menuVisible) 4 else if(nextPortrait) 2 else if(isRoot() && collapsed) 3 else if(!keyboardPage) 0 else if(keyboardMode==PicoKeyboardMode.FULL) 5 else 1
         if(previousLayout!=layout) {previousLayout=layout;controllerLayout(layout,controllerHand)}
         if(portrait!=nextPortrait) {portrait=nextPortrait;menuShape(portrait)}
         if (!surface.isValid) return
         var canvas: Canvas? = null
         try {
             canvas=surface.lockCanvas(null)
-            canvas.scale(1f,canvas.height/(if(!keyboardPage && !collapsed) 800f else 400f)) // Preserve logical hit coordinates on the high-resolution menu Surface.
+            canvas.scale(1f,canvas.height/(if(keyboardPage) PicoKeyboardLayout.height(keyboardMode) else if(!collapsed) 800f else 400f)) // Preserve logical hit coordinates on the high-resolution menu Surface.
             terminalTarget?.let {
                 PicoXrMaterial.panel(canvas,1200f,800f)
                 PicoXrMaterial.label(canvas,notice,24f,40f,1152f,24f)
@@ -606,7 +632,7 @@ internal class PicoXrToolbar(
                 PicoXrSelectionCanvas.draw(canvas,if(devicePage) "切换设备  ▾  ·  连接到新空间窗口" else "显示器  ▾  ·  当前屏幕",rows,hoverU,hoverV);return
             }
             if(qualityPage()) {PicoXrQualityCanvas.draw(canvas,session()?.settingsSnapshot(targetScreen),hoverU,hoverV,pressed,notice);return}
-            PicoXrMaterial.panel(canvas,1200f,400f)
+            PicoXrMaterial.panel(canvas,1200f,if(keyboardPage) PicoKeyboardLayout.height(keyboardMode) else 400f)
             PicoXrMaterial.label(canvas,notice,24f,32f,1152f,24f,medium=true)
             val state=session()?.settingsSnapshot(targetScreen); val c=state?.current
             if(keyboardPage) PicoKeyboardCanvas.draw(canvas,keyboardMode,keyboardKeys,hoverU,hoverV,voiceActive)

@@ -21,9 +21,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
 
 struct pico_map {int fd;const volatile struct ouxd_snapshot *data;};
-struct pico_hmd {struct xrt_device base;struct pico_map map;struct ouxd_snapshot calibration;};
+struct pico_hmd {struct xrt_device base;struct pico_map map;struct ouxd_snapshot calibration;pthread_mutex_t mutex;int64_t last_reopen;};
 static void close_map(struct pico_map *map) {if(map->data) munmap((void*)map->data,OUXD_MAP_BYTES);if(map->fd>=0) close(map->fd);map->fd=-1;map->data=NULL;}
 static int open_map(struct pico_map *map) {
     map->fd=-1;map->data=NULL;const char *root=getenv("XDG_RUNTIME_DIR");if(!root) return 0;
@@ -57,12 +58,43 @@ static int snapshot(struct pico_map *map,struct ouxd_snapshot *out) {
     for(int i=3;i<7;++i) {norm+=head[i]*head[i];}
     return norm>=.98f && norm<=1.02f;
 }
-static void destroy_hmd(struct xrt_device *device) {struct pico_hmd *h=(struct pico_hmd*)device;close_map(&h->map);u_device_free(device);}
+static int same_calibration(const struct ouxd_snapshot *a,const struct ouxd_snapshot *b) {
+    if(a->eye_width!=b->eye_width || a->eye_height!=b->eye_height ||
+       fabsf(a->refresh_hz-b->refresh_hz)>.1f) return 0;
+    for(int i=0;i<22;i++) if(fabsf(a->views[i]-b->views[i])>.0001f) return 0;
+    return 1;
+}
+/* Existing applications retain their XrInstance/XrSession. Reopen only a fresh,
+ * owner-validated publisher with identical optical parameters; never fabricate
+ * a new HMD or change a running application's projection configuration. */
+static int refresh_hmd(struct pico_hmd *h,struct ouxd_snapshot *frame) {
+    if(snapshot(&h->map,frame)) {
+        if(frame->generation==h->calibration.generation) return 1;
+        if(same_calibration(&h->calibration,frame)) {
+            h->calibration.generation=frame->generation;return 1;
+        }
+        return 0;
+    }
+    int64_t now=os_monotonic_get_ns();
+    if(now-h->last_reopen<100000000) return 0;
+    h->last_reopen=now;
+    struct pico_map next;
+    if(!open_map(&next)) return 0;
+    if(!snapshot(&next,frame) || !same_calibration(&h->calibration,frame)) {
+        close_map(&next);return 0;
+    }
+    close_map(&h->map);h->map=next;h->calibration.generation=frame->generation;
+    return 1;
+}
+static void destroy_hmd(struct xrt_device *device) {struct pico_hmd *h=(struct pico_hmd*)device;close_map(&h->map);pthread_mutex_destroy(&h->mutex);u_device_free(device);}
 static xrt_result_t tracked(struct xrt_device *device,enum xrt_input_name name,int64_t at,struct xrt_space_relation *out) {
     (void)at;memset(out,0,sizeof(*out));out->pose.orientation.w=1;
     if(name!=XRT_INPUT_GENERIC_HEAD_POSE) return XRT_ERROR_INPUT_UNSUPPORTED;
     struct pico_hmd *h=(struct pico_hmd*)device;struct ouxd_snapshot frame;
-    if(!snapshot(&h->map,&frame) || frame.generation!=h->calibration.generation) return XRT_SUCCESS;
+    pthread_mutex_lock(&h->mutex);
+    int available=refresh_hmd(h,&frame);
+    pthread_mutex_unlock(&h->mutex);
+    if(!available) return XRT_SUCCESS;
     float p[13];uint32_t flags;memcpy(&flags,frame.tracking+32,4);memcpy(p,frame.tracking+40,sizeof(p));
     out->pose.position=(struct xrt_vec3){p[0],p[1],p[2]};out->pose.orientation=(struct xrt_quat){p[3],p[4],p[5],p[6]};
     out->relation_flags=XRT_SPACE_RELATION_ORIENTATION_VALID_BIT|XRT_SPACE_RELATION_POSITION_VALID_BIT;
@@ -80,6 +112,8 @@ static xrt_result_t views(struct xrt_device *device,const struct xrt_vec3 *unuse
 static struct xrt_device *create_hmd(void) {
     struct pico_map map;struct ouxd_snapshot initial;if(!open_map(&map)) return NULL;if(!snapshot(&map,&initial)) {close_map(&map);return NULL;}
     struct pico_hmd *h=U_DEVICE_ALLOCATE(struct pico_hmd,U_DEVICE_ALLOC_HMD|U_DEVICE_ALLOC_TRACKING_NONE,1,0);
+    if(!h) {close_map(&map);return NULL;}
+    if(pthread_mutex_init(&h->mutex,NULL)) {close_map(&map);u_device_free(&h->base);return NULL;}
     h->map=map;h->calibration=initial;struct xrt_device *d=&h->base;
     u_device_populate_function_pointers(d,tracked,destroy_hmd);d->get_view_poses=views;
     d->name=XRT_DEVICE_GENERIC_HMD;d->device_type=XRT_DEVICE_TYPE_HMD;d->supported.orientation_tracking=true;d->supported.position_tracking=true;

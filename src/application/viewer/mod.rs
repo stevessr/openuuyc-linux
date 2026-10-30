@@ -28,9 +28,9 @@ mod annotation;
 mod display_transition;
 mod fullscreen_chrome;
 mod input_gate;
-mod polling_warning;
 #[cfg(target_os = "linux")]
 mod pico_bridge;
+mod polling_warning;
 
 #[cfg(windows)]
 mod windows_cursor;

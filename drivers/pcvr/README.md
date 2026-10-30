@@ -43,3 +43,27 @@ OpenVR ABI 依据 Valve 官方 SDK v2.12.14，来源与许可见 `vendor/`。下
 默认策略已改为内置 OpenXR 优先，SteamVR 仅作备用。Monado/xrizer 源码组件已经实际构建、安装，进程级运行时选择与原生 loader 探针详见 [OpenXR 组件](../openxr/README.md)。此目录的 OpenVR 驱动仅是备用追踪诊断，不再作为必须依赖的主路线。后续 OpenXR 设备驱动已通过私有共享快照接入，详见 OpenXR 文档的 device bridge follow-up；仍不能将设备可识别解释为双眼视频链路就绪。
 
 双眼接收基础：单路 SBS access unit 保持左右眼配对，携带每眼渲染 pose/FOV；最大 4 MiB、48 KB 分片、丢失/过期/乱序恢复要求 IDR。PICO 使用硬件 MediaCodec 向一个 Android Surface swapchain 输出，两份 ProjectionView 引用同一图像的左右区域；使用码流携带的渲染视图而不是把当前头姿误当渲染姿态。250 ms 无解码帧停止提交，保留工具栏/射线，禁止点击隐藏的桌面四边形。该路径尚未经过真实头显/游戏帧验证。
+
+### SteamVR 既有场景附加：开发状态
+
+已加入基于官方 OpenVR v2.12.14 客户端头文件的背景镜像读取器，源文件和 SHA-256
+记录于 vendor/openvr-client.lock.json，复用 Valve BSD-3-Clause 声明。
+不分发 SteamVR 客户端二进制，也不启动 SteamVR、游戏或切换全局运行时。
+
+已实现代码路径：
+- 动态加载本机已安装的 OpenVR API，以 VRApplication_Background 初始化；
+- 查询当前场景 PID/最后提交帧 PID，场景切换时终止当前附加；
+- 通过 GetMirrorTextureGL 与显式共享纹理锁读取两眼，使用隐藏 GL 上下文缩小回读；
+- 检查两眼之间的帧号/场景未改变，保留真实合成器时间、渲染头姿和眼位/FOV；
+- 将外部坐标空间明确标记为 origin=1，宿主目前拒绝未对齐的外部姿态，
+  防止直接当作 PICO LOCAL 投影而造成错误视点。
+
+可执行只读诊断：
+
+    OpenUUYC pico-vr steamvr-mirror-probe
+
+构建镜像辅助程序需要 SDL2/OpenGL 开发文件。缺少时基础客户端仍可构建，
+诊断命令明确报告未构建辅助程序，不静默退回桌面镜像。
+当前仅验证 SteamVR 未运行时的 Background 错误返回与不启动服务，以及姿态数学/
+外部坐标拒绝测试；尚未验证活动 SteamVR 场景的真实 GPU 取帧。
+外部坐标对齐、附加控制权/活动 HMD 校验、接入授权会话及 PICO 实机出图仍未完成。

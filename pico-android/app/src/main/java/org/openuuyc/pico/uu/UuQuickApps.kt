@@ -53,6 +53,17 @@ internal class UuQuickApps {
         }
         synchronized(this) {apps=result};callback(result,null)
     }
+    fun runningVr(callback: (List<String>?,String?)->Unit) = send(JSONObject().put("op","vr-applications")) {value,error->
+        if(value==null) {callback(null,error);return@send}
+        if(value.optString("type")!="vr-applications") {callback(null,"远端未返回有效的既有应用清单");return@send}
+        val entries=value.optJSONArray("applications")
+        callback((0 until (entries?.length() ?: 0)).mapNotNull {index->
+            entries?.optJSONObject(index)?.let {entry->
+                val pid=entry.optInt("pid");val name=entry.optString("name")
+                if(pid>0 && name.length in 1..80) "$name · PID $pid" else null
+            }
+        },null)
+    }
     fun runtime(callback: (JSONObject?,String?)->Unit) = send(JSONObject().put("op","vr-runtime")) {value,error->callback(value?.optJSONObject("runtime"),error)}
     fun setRuntime(preference: String,callback: (String)->Unit) = send(JSONObject().put("op","vr-runtime-set").put("backend",preference)) {value,error->callback(error ?: value?.optString("message") ?: "后端设置失败")}
     @Synchronized fun launchAllowed()=allowed
