@@ -304,7 +304,7 @@ impl Session {
         if filter.ready.is_empty() {
             let mut raw = [0u8; 8192];
             match self.read_raw(&mut raw)? {
-                None => return Ok(None),
+                None => filter.flush_idle(Instant::now()),
                 Some(0) => {
                     filter.finish();
                     eof = true;
@@ -621,6 +621,17 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_releases_lone_escape_while_child_is_still_running() {
+        let mut session = Session::open("/bin/sh", 80, 24).unwrap();
+        session
+            .write(b"stty -echo; printf '\\033'; sleep 5\n")
+            .unwrap();
+        let output = read_until(&mut session, b"\x1b", Duration::from_secs(3));
+        assert!(output.contains(&27), "lone ESC was held until EOF");
+        assert!(matches!(session.child.try_wait(), Ok(None)));
+    }
 
     #[test]
     fn pty_suppresses_context_markers() {
