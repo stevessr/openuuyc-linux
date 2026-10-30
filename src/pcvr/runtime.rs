@@ -263,6 +263,15 @@ pub(crate) fn controller_component_available() -> Result<bool> {
     let (manifest, _) = bundle(&path)?;
     Ok(manifest.features.contains("controller_input_v2"))
 }
+/// Whether a bundle can export real stereo frames. `stereo_cpu_v2` is the
+/// current readback/export feature; `pico_stereo_v1` was its first name and
+/// stays accepted for an older but still complete bundle.
+fn has_stereo_export(manifest: &Manifest) -> bool {
+    manifest
+        .features
+        .iter()
+        .any(|feature| feature == "stereo_cpu_v2" || feature == "pico_stereo_v1")
+}
 pub fn plan() -> Result<Plan> {
     let preference = preference()?;
     if preference == Preference::SteamVr {
@@ -431,7 +440,7 @@ pub fn run(api: Api, argv: &[OsString]) -> Result<()> {
         let source = active_bundle()?.context("缺少 OpenXR 组件")?;
         let (manifest, _) = bundle(&source)?;
         ensure!(
-            manifest.features.contains("pico_stereo_v1"),
+            has_stereo_export(&manifest),
             "OpenXR 设备已识别，但双眼编码合成器尚未接通；未启动游戏"
         );
     }
@@ -673,6 +682,28 @@ mod bundle_tests {
         save(&manifest);
         assert!(bundle(&root).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn a_launchable_bundle_must_advertise_a_real_stereo_export() {
+        let mut manifest = Manifest {
+            version: 1,
+            arch: std::env::consts::ARCH.into(),
+            monado_revision: "a".repeat(40),
+            xrizer_revision: "b".repeat(40),
+            files: BTreeMap::new(),
+            features: Default::default(),
+        };
+        assert!(!has_stereo_export(&manifest));
+        manifest.features.insert("pico_device_v1".into());
+        assert!(!has_stereo_export(&manifest), "a device is not an export");
+        manifest.features.insert("stereo_cpu_v2".into());
+        assert!(has_stereo_export(&manifest));
+        manifest.features.clear();
+        manifest.features.insert("pico_stereo_v1".into());
+        assert!(
+            has_stereo_export(&manifest),
+            "the first export name stays valid"
+        );
     }
     #[test]
     fn remote_setting_names_match_the_android_choices() {

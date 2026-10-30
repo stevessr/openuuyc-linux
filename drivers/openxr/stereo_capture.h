@@ -11,6 +11,9 @@
  * 32: eye width u32, 36: height u32, 40: RGBA format=1 u32,
  * 44: origin (0 owned Monado LOCAL, 1 external compositor; alignment required).
  * 48: rendering views, 22 floats (xyz, xyzw, FOV left/right/up/down per eye).
+ * 136: version 3 only, rendering head pose xyz+xyzw, 7 floats. An external
+ *      origin producer must set it in the same frame window as the eyes, the
+ *      host refuses to project external frames it cannot align to the headset.
  * Pixels: tightly packed left eye at 256, right at 256+OUST_EYE_BYTES. */
 int oust_copy_eye(unsigned char *map, size_t size, uint32_t eye,
                   uint64_t id,uint64_t timestamp,uint32_t width,uint32_t height,
@@ -22,3 +25,9 @@ void oust_set_views(const float views[22]);
 
 /* 0 = owned Monado LOCAL; 1 = external compositor origin, alignment required. */
 void oust_set_origin(uint32_t origin);
+
+/* Rendering head pose (xyz, xyzw) in the producer's own space. Never set by
+ * the owned Monado producer: its frames already are headset-relative. An
+ * external compositor must set it before every frame pair; the export then
+ * becomes version 3 and the host can register the external space. */
+void oust_set_head(const float head[7]);

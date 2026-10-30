@@ -1,6 +1,6 @@
 //! Read the private latest-frame export from the real Monado compositor.
 //! Pixels are CPU readback for now; never substitute desktop capture.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{fs::File, os::unix::fs::FileExt};
 const HEADER: usize = 256;
 const EYE_BYTES: usize = 1024 * 1024 * 4;
@@ -12,6 +12,12 @@ pub(crate) struct RawFrame {
     pub height: u16,
     pub views: [f32; 22],
     pub bgra: Vec<u8>,
+    /// 0 = owned Monado LOCAL space; 1 = external compositor, which the headset
+    /// could not place without [`ensure_aligned`].
+    pub origin: u32,
+    /// External producers only (export version 3): the rendering head pose in
+    /// the producer's own space, paired with these eyes.
+    pub head: Option<[f32; 7]>,
 }
 /// Both clocks are host CLOCK_MONOTONIC; PICO timestamps must not be compared here.
 pub(crate) fn fresh_at(predicted_time: i64, now: i64) -> bool {
@@ -44,13 +50,31 @@ pub(crate) fn read_latest(file: &File, previous: u64) -> Result<Option<RawFrame>
     if guard == 0 || guard & 1 != 0 {
         return Ok(None);
     }
+    let version = u32_at(12);
     ensure!(
-        &header[8..12] == b"OUST" && u32_at(12) == 2,
+        &header[8..12] == b"OUST" && matches!(version, 2 | 3),
         "invalid compositor export version"
     );
+    let origin = u32_at(44);
+    ensure!(origin <= 1, "invalid compositor coordinate space");
+    let head = if version == 3 {
+        let mut pose = [0f32; 7];
+        for (i, value) in pose.iter_mut().enumerate() {
+            *value = f32::from_le_bytes(header[136 + i * 4..140 + i * 4].try_into().unwrap());
+        }
+        ensure!(
+            pose.iter().all(|v| v.is_finite())
+                && pose[..3].iter().all(|v| v.abs() <= 1000.)
+                && (0.98..=1.02).contains(&pose[3..].iter().map(|v| v * v).sum::<f32>()),
+            "invalid compositor head pose"
+        );
+        Some(pose)
+    } else {
+        None
+    };
     ensure!(
-        u32_at(44) == 0,
-        "external compositor coordinate space requires alignment before PICO projection"
+        origin == 0 || head.is_some(),
+        "external compositor export lacks the rendering head pose"
     );
     // Producer frame IDs restart at one when an attached application restarts.
     // The export inode's seqlock serial persists across producer ownership, so
@@ -114,7 +138,24 @@ pub(crate) fn read_latest(file: &File, previous: u64) -> Result<Option<RawFrame>
         height: h as u16,
         views,
         bgra,
+        origin,
+        head,
     }))
+}
+
+/// The headset can only project views it can place in its own LOCAL space.
+/// Owned Monado frames already are in it; an external compositor frame must be
+/// carried across by a real registration first, never encoded as if it were.
+pub(crate) fn ensure_aligned(
+    mut raw: RawFrame,
+    align: Option<&super::align::Align>,
+) -> Result<RawFrame> {
+    if raw.origin == 0 {
+        return Ok(raw);
+    }
+    let align = align.context("external compositor frame has no coordinate alignment")?;
+    align.apply(&mut raw.views);
+    Ok(raw)
 }
 
 #[cfg(test)]
@@ -190,6 +231,7 @@ mod tests {
         assert_eq!(&frame.bgra[..4], &[3, 2, 1, 255]);
         assert_eq!(&frame.bgra[256..260], &[7, 6, 5, 255]);
         assert_eq!(frame.views[6], 1.);
+        assert_eq!((frame.origin, frame.head), (0, None));
         assert!(read_latest(&file, 1).unwrap().is_none());
     }
     #[test]
@@ -207,11 +249,50 @@ mod tests {
         assert_eq!(replacement.views, old.views);
         assert!(read_latest(&file, replacement.sequence).unwrap().is_none());
     }
+    fn head(file: &File, pose: &[f32; 7]) {
+        file.write_all_at(&3u32.to_le_bytes(), 12).unwrap();
+        for (i, v) in pose.iter().enumerate() {
+            file.write_all_at(&v.to_le_bytes(), (136 + i * 4) as u64)
+                .unwrap();
+        }
+    }
     #[test]
-    fn rejects_unaligned_external_compositor_space() {
+    fn external_frames_carry_their_rendering_head_pose_or_are_rejected() {
         let file = fixture();
         file.write_all_at(&1u32.to_le_bytes(), 44).unwrap();
-        assert!(read_latest(&file, 0).is_err());
+        assert!(
+            read_latest(&file, 0).is_err(),
+            "a v2 external frame has no pose to register"
+        );
+        head(&file, &[1., 2., 3., 0., 0., 0., 1.]);
+        let frame = read_latest(&file, 0).unwrap().unwrap();
+        assert_eq!(frame.origin, 1);
+        assert_eq!(frame.head, Some([1., 2., 3., 0., 0., 0., 1.]));
+        file.write_all_at(&2u32.to_le_bytes(), 44).unwrap();
+        assert!(read_latest(&file, 0).is_err(), "unknown coordinate space");
+        file.write_all_at(&0u32.to_le_bytes(), 44).unwrap();
+        file.write_all_at(&0f32.to_le_bytes(), 160).unwrap();
+        assert!(read_latest(&file, 0).is_err(), "zero quaternion pose");
+    }
+    #[test]
+    fn external_frames_are_never_encoded_before_alignment() {
+        let file = fixture();
+        head(&file, &[1., 0., 0., 0., 0., 0., 1.]);
+        file.write_all_at(&1u32.to_le_bytes(), 44).unwrap();
+        let frame = read_latest(&file, 0).unwrap().unwrap();
+        assert!(ensure_aligned(frame, None).is_err());
+        let frame = read_latest(&file, 0).unwrap().unwrap();
+        let align = super::super::align::Align::register(
+            &[5., 0., 0., 0., 0., 0., 1.],
+            &[1., 0., 0., 0., 0., 0., 1.],
+        )
+        .unwrap();
+        let aligned = ensure_aligned(frame, Some(&align)).unwrap();
+        assert_eq!(&aligned.views[..3], &[4., 0., 0.]);
+        // Owned Monado frames are already headset-relative and stay untouched.
+        file.write_all_at(&0u32.to_le_bytes(), 44).unwrap();
+        let frame = read_latest(&file, 0).unwrap().unwrap();
+        assert!(ensure_aligned(frame, None).is_ok());
     }
     #[test]
     fn skips_in_progress_and_rejects_invalid_headers() {
@@ -231,6 +312,9 @@ pub(crate) struct Export {
     path: std::path::PathBuf,
 }
 impl Export {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
     pub(crate) fn create(directory: &std::path::Path) -> Result<Self> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let meta = std::fs::symlink_metadata(directory)?;

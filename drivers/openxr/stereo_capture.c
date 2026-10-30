@@ -15,8 +15,11 @@ static uint32_t pending_width,pending_height;
 static int pending_left;
 static float render_views[22];
 static uint32_t render_origin;
+static float render_head[7];
+static int render_head_valid;
 void oust_set_origin(uint32_t origin) {render_origin=origin;}
 void oust_set_views(const float views[22]) {memcpy(render_views,views,sizeof(render_views));}
+void oust_set_head(const float head[7]) {memcpy(render_head,head,sizeof(render_head));render_head_valid=1;}
 int oust_copy_eye(unsigned char *m,size_t size,uint32_t eye,uint64_t id,uint64_t ts,
                   uint32_t w,uint32_t h,uint32_t stride,const unsigned char *pixels)
 {
@@ -32,9 +35,10 @@ int oust_copy_eye(unsigned char *m,size_t size,uint32_t eye,uint64_t id,uint64_t
     unsigned char *out=m+256+eye*OUST_EYE_BYTES;
     for(uint32_t y=0;y<h;y++) memcpy(out+y*w*4,pixels+y*stride,w*4);
     if(eye) {
-        uint32_t version=2,format=1;
+        uint32_t version=render_head_valid?3:2,format=1;
         memcpy(m+8,"OUST",4);memcpy(m+12,&version,4);memcpy(m+16,&id,8);memcpy(m+24,&ts,8);
         memcpy(m+44,&render_origin,4);memcpy(m+48,render_views,sizeof(render_views));
+        if(render_head_valid) memcpy(m+136,render_head,sizeof(render_head));
         memcpy(m+32,&w,4);memcpy(m+36,&h,4);memcpy(m+40,&format,4);
         uint64_t s=__atomic_load_n(seq,__ATOMIC_RELAXED);
         __atomic_store_n(seq,(s|1)+1,__ATOMIC_RELEASE);

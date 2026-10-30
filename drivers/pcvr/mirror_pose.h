@@ -9,7 +9,10 @@ inline vr::HmdMatrix34_t mirror_product(const vr::HmdMatrix34_t &a,const vr::Hmd
     }
     return out;
 }
-inline bool mirror_view(const vr::HmdMatrix34_t &pose,float left,float right,float down,float up,float out[11]) {
+/* Position plus xyzw orientation of a real rigid pose, rejecting anything that
+ * is not finite, orthonormal or right-handed. Shared by eye views and the
+ * exported rendering head pose. */
+inline bool mirror_conversion(const vr::HmdMatrix34_t &pose,float position[3],float orientation[4]) {
     for(const auto &row:pose.m) for(float v:row) if(!std::isfinite(v)) return false;
     for(int a=0;a<3;a++) for(int b=0;b<3;b++) {
         float dot=0;for(int k=0;k<3;k++) dot+=pose.m[k][a]*pose.m[k][b];
@@ -30,9 +33,20 @@ inline bool mirror_view(const vr::HmdMatrix34_t &pose,float left,float right,flo
     }
     float norm=0;for(float v:q) norm+=v*v;
     if(!std::isfinite(norm) || norm<.98f || norm>1.02f) return false;
-    for(int i=0;i<3;i++) out[i]=pose.m[i][3];
-    for(int i=0;i<4;i++) out[i+3]=q[i]/std::sqrt(norm);
+    for(int i=0;i<3;i++) position[i]=pose.m[i][3];
+    for(int i=0;i<4;i++) orientation[i]=q[i]/std::sqrt(norm);
+    return true;
+}
+inline bool mirror_view(const vr::HmdMatrix34_t &pose,float left,float right,float down,float up,float out[11]) {
+    if(!mirror_conversion(pose,out,out+3)) return false;
     out[7]=std::atan(left);out[8]=std::atan(right);out[9]=std::atan(up);out[10]=std::atan(down);
     for(int i=0;i<11;i++) if(!std::isfinite(out[i])) return false;
     return out[8]-out[7]>.05f && out[9]-out[10]>.05f;
+}
+/* The exported head pose pairs with the same frame's eyes and is transformed by
+ * the host into the headset's LOCAL space; FOV does not apply to it. */
+inline bool mirror_head(const vr::HmdMatrix34_t &pose,float out[7]) {
+    if(!mirror_conversion(pose,out,out+3)) return false;
+    for(int i=0;i<7;i++) if(!std::isfinite(out[i])) return false;
+    return true;
 }

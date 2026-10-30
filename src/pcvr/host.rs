@@ -26,6 +26,29 @@ struct ControlRequest {
     calibration: Option<super::device::Calibration>,
     #[serde(default)]
     generation: u32,
+    #[serde(default)]
+    backend: Option<String>,
+}
+/// What a `start` request asks for. The default keeps the configured backend
+/// policy; `steamvr` is an explicit attach to a running SteamVR scene and
+/// never degrades silently into the tracking-only fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Requested {
+    Default,
+    SteamVr,
+}
+impl Requested {
+    fn parse(request: Option<&ControlRequest>) -> Result<Self> {
+        match request.and_then(|r| r.backend.as_deref()) {
+            None => Ok(Self::Default),
+            Some("steamvr") => Ok(Self::SteamVr),
+            Some(other) => anyhow::bail!("不支持的后端请求 {other:?}"),
+        }
+    }
+}
+/// Whether this session currently owns a real VR producer of any backend.
+fn started(state: &State) -> bool {
+    state.socket.is_some() || state.broker.is_some() || state.attach.is_some()
 }
 fn tracking_fresh(last: Option<Instant>) -> bool {
     last.is_some_and(|time| time.elapsed() < Duration::from_millis(250))
@@ -43,6 +66,8 @@ struct State {
     socket: Option<UnixDatagram>,
     broker: Option<super::device::Broker>,
     export: Option<super::capture::Export>,
+    /// Live background attach to an existing SteamVR scene, if any.
+    attach: Option<super::steamvr::Attach>,
     generation: u32,
     publisher_lock: Option<std::fs::File>,
     sequence: u64,
@@ -50,6 +75,12 @@ struct State {
     last: Option<Instant>,
     backend: Option<&'static str>,
     head_valid: bool,
+    /// Tracked head pose in the headset's LOCAL space, with `last` freshness.
+    head: Option<[f32; 7]>,
+    /// Per-generation registration of an external compositor's space.
+    align: Option<(u32, super::align::Align)>,
+    /// The current generation's eyes come from an external compositor.
+    external: bool,
     video_rate: super::pacing::Rate,
     tracking_version: u32,
     captured_frames: u64,
@@ -107,16 +138,23 @@ impl Session {
             let mut encoder: Option<super::encode::Encoder> = None;
             while let Some(session) = weak.upgrade() {
                 let began = Instant::now();
-                let (rate, source) = {
-                    let state = lock(&session.state);
+                let (rate, source, attach_failure, epoch) = {
+                    let mut state = lock(&session.state);
+                    let attach_failure = state
+                        .attach
+                        .as_mut()
+                        .and_then(|attach| attach.observe_failure());
                     let source = state
                         .export
                         .as_ref()
                         .filter(|_| state.head_valid && tracking_fresh(state.last))
                         .and_then(|export| export.file.try_clone().ok())
                         .map(|f| (state.generation, f));
-                    (state.video_rate, source)
+                    (state.video_rate, source, attach_failure, state.generation)
                 };
+                if let Some(reason) = attach_failure {
+                    session.producer_status(epoch, Some(reason), false, false);
+                }
                 if session.allowed() {
                     if let Some((epoch, file)) = source {
                         if epoch != generation {
@@ -160,6 +198,7 @@ impl Session {
                                 None
                             }
                         };
+                        let raw = raw.and_then(|raw| session.aligned_frame(epoch, raw));
                         if let Some(raw) = raw {
                             previous = raw.sequence;
                             session.producer_status(epoch, None, true, false);
@@ -300,13 +339,25 @@ impl Session {
         self.video_ack.store(0, Ordering::Release);
         self.keyframe_requested.store(true, Ordering::Release);
         let mut state = lock(&self.state);
-        if state.socket.take().is_some() || state.broker.take().is_some() {
+        let socket = state.socket.take().is_some();
+        let broker = state.broker.take().is_some();
+        let attach = state.attach.take();
+        let attached = attach.is_some();
+        *state = State::default();
+        drop(state);
+        // Signal the helper outside the state lock: it may need a moment to
+        // release its GL shared textures and must not stall other threads.
+        drop(attach);
+        if socket || broker || attached {
             OWNED.store(false, Ordering::Release);
         }
-        *state = State::default();
         self.keyframe_requested.store(true, Ordering::Release);
     }
-    fn start(&self, calibration: Option<&super::device::Calibration>) -> Result<()> {
+    fn start(
+        &self,
+        calibration: Option<&super::device::Calibration>,
+        backend: Requested,
+    ) -> Result<()> {
         ensure!(
             self.allowed(),
             "当前会话未获应用快捷启动授权，不能启用 VR 桥接"
@@ -316,8 +367,18 @@ impl Session {
             "追踪数据通道尚未就绪"
         );
         let mut state = lock(&self.state);
-        if state.socket.is_some() || state.broker.is_some() {
+        if started(&state) {
+            ensure!(
+                backend != Requested::SteamVr || state.attach.is_some(),
+                "当前 VR 连接已在运行；请先停止再附加 SteamVR 场景"
+            );
             return Ok(());
+        }
+        if backend == Requested::SteamVr {
+            // The helper handshake runs outside the state lock: a slow or
+            // absent SteamVR must not stall tracking, status or the worker.
+            drop(state);
+            return self.start_mirror();
         }
         let root = std::path::PathBuf::from(
             std::env::var_os("XDG_RUNTIME_DIR").context("缺少 XDG_RUNTIME_DIR")?,
@@ -429,6 +490,60 @@ impl Session {
         state.last = None;
         Ok(())
     }
+    /// Attach the background mirror to a running SteamVR scene as this
+    /// session's stereo producer. The helper handshake and the cross-process
+    /// ownership lock are taken first, without the state lock; only a session
+    /// that is still live and tracked installs the attach.
+    fn start_mirror(&self) -> Result<()> {
+        ensure!(
+            super::runtime::preference()? != super::runtime::Preference::OpenXrOnly,
+            "当前策略为仅内置 OpenXR；先在「此连接的 VR 后端」选择 SteamVR 再来附加"
+        );
+        ensure!(
+            OWNED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "另一个会话正在使用内置 VR"
+        );
+        let setup = super::steamvr::open_export().and_then(|(export, ownership)| {
+            super::steamvr::Attach::start(export.path()).map(|attach| (export, ownership, attach))
+        });
+        let (export, ownership, attach) = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                OWNED.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        let mut state = lock(&self.state);
+        if !self.allowed()
+            || !self.tracking_ready.load(Ordering::Acquire)
+            || started(&state)
+            || !OWNED.load(Ordering::Acquire)
+        {
+            drop(state);
+            drop(attach);
+            OWNED.store(false, Ordering::Release);
+            anyhow::bail!("VR 会话已在附加期间停止；请重试");
+        }
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
+        if generation == 0 || generation > i32::MAX as u32 {
+            drop(state);
+            drop(attach);
+            OWNED.store(false, Ordering::Release);
+            anyhow::bail!("stereo generation exhausted");
+        }
+        state.generation = generation;
+        state.export = Some(export);
+        state.publisher_lock = Some(ownership);
+        state.attach = Some(attach);
+        // A mirror has no calibrated headset cadence: 90 Hz only budgets the
+        // latest-only reader, it is not a claim about the scene's own rate.
+        state.video_rate = super::pacing::Rate::new(90.0)?;
+        state.tracking_version = 2;
+        state.backend = Some("steamvr-mirror");
+        Ok(())
+    }
     fn frame(&self, data: &[u8]) {
         if !self.allowed() {
             self.stop();
@@ -452,39 +567,84 @@ impl Session {
         } else {
             data
         };
-        if let Some(broker) = state.broker.as_mut() {
-            if broker.publish(data, true).is_ok() {
-                state.sequence = sequence;
-                state.frames += 1;
-                state.last = Some(Instant::now());
-                state.head_valid = protocol::head_valid(data);
+        // A mirror session has no downstream sink and never injects devices
+        // into SteamVR, but still needs the fresh head pose for frame gating
+        // and external-space alignment.
+        let accepted = if let Some(broker) = state.broker.as_mut() {
+            broker.publish(data, true).is_ok()
+        } else if let Some(socket) = state.socket.as_ref() {
+            // The legacy SteamVR tracker protocol remains v1, never send its v2 tail.
+            let mut legacy = [0u8; protocol::FRAME_BYTES];
+            legacy.copy_from_slice(&data[..protocol::FRAME_BYTES]);
+            legacy[4..8].copy_from_slice(&1u32.to_le_bytes());
+            for offset in [32, 96, 160] {
+                legacy[offset] &= 15;
             }
-            return;
-        }
-        let Some(socket) = state.socket.as_ref() else {
-            return;
+            match socket.send(&legacy) {
+                Ok(protocol::FRAME_BYTES) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                _ => {
+                    state.socket = None;
+                    state.publisher_lock = None;
+                    OWNED.store(false, Ordering::Release);
+                    false
+                }
+            }
+        } else {
+            state.attach.is_some()
         };
-        // The legacy SteamVR tracker protocol remains v1, never send its v2 tail.
-        let mut legacy = [0u8; protocol::FRAME_BYTES];
-        legacy.copy_from_slice(&data[..protocol::FRAME_BYTES]);
-        legacy[4..8].copy_from_slice(&1u32.to_le_bytes());
-        for offset in [32, 96, 160] {
-            legacy[offset] &= 15;
+        if accepted {
+            state.sequence = sequence;
+            state.frames += 1;
+            state.last = Some(Instant::now());
+            state.head_valid = protocol::head_valid(data);
+            state.head = protocol::head_pose(data);
         }
-        match socket.send(&legacy) {
-            Ok(protocol::FRAME_BYTES) => {
-                state.sequence = sequence;
-                state.frames += 1;
-                state.last = Some(Instant::now());
-                state.head_valid = protocol::head_valid(data);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            _ => {
-                state.socket = None;
-                state.publisher_lock = None;
-                OWNED.store(false, Ordering::Release);
-            }
+    }
+    /// Register an external compositor's space once per generation from a
+    /// fresh headset head pose, then carry this frame's eye views into LOCAL.
+    /// A frame that cannot be placed is dropped with a visible producer error,
+    /// never encoded as if it were already headset-relative.
+    fn aligned_frame(
+        &self,
+        epoch: u32,
+        raw: super::capture::RawFrame,
+    ) -> Option<super::capture::RawFrame> {
+        if raw.origin == 0 {
+            return Some(raw);
         }
+        let mut state = lock(&self.state);
+        if state.generation != epoch {
+            return None;
+        }
+        let align = match state.align.filter(|(generation, _)| *generation == epoch) {
+            Some((_, align)) => align,
+            None => {
+                let head = state
+                    .head
+                    .filter(|_| state.head_valid && tracking_fresh(state.last));
+                let Some(head) = head else {
+                    state.producer_error = Some("外部合成器坐标对齐需要有效的头显追踪");
+                    return None;
+                };
+                let Some(external) = raw.head else {
+                    state.producer_error = Some("外部合成器双眼帧缺少渲染头姿，无法对齐");
+                    return None;
+                };
+                let Some(align) = super::align::Align::register(&head, &external) else {
+                    state.producer_error = Some("外部合成器头姿无法完成坐标对齐");
+                    return None;
+                };
+                state.align = Some((epoch, align));
+                align
+            }
+        };
+        let Ok(raw) = super::capture::ensure_aligned(raw, Some(&align)) else {
+            state.producer_error = Some("外部合成器坐标对齐失败");
+            return None;
+        };
+        state.external = true;
+        Some(raw)
     }
     /// Send a real compositor frame from the authorized CPU/GPU encoder.
     /// Never queues old access units behind a slow peer.
@@ -492,9 +652,7 @@ impl Session {
         ensure!(
             self.allowed() && {
                 let state = lock(&self.state);
-                (state.socket.is_some() || state.broker.is_some())
-                    && state.head_valid
-                    && tracking_fresh(state.last)
+                started(&state) && state.head_valid && tracking_fresh(state.last)
             },
             "stereo session is not authorized/started"
         );
@@ -545,15 +703,13 @@ impl Session {
         }
         let deadline = tokio::time::Instant::now() + Duration::from_millis(16);
         for packet in packets {
-            let started = {
+            let live = {
                 let state = lock(&self.state);
-                (state.socket.is_some() || state.broker.is_some())
-                    && state.head_valid
-                    && tracking_fresh(state.last)
+                started(&state) && state.head_valid && tracking_fresh(state.last)
             };
             if !self.allowed()
                 || !super::capture::fresh(frame.predicted_time)
-                || !started
+                || !live
                 || lock(&self.state).generation != frame.generation
                 || video.buffered_amount().await > 256 * 1024
             {
@@ -659,16 +815,27 @@ impl Session {
                 }
                 if op.is_some() {
                     last_error = match op {
-                        Some("start") => this
-                            .start(
-                                request
-                                    .as_ref()
-                                    .ok()
-                                    .and_then(|r| r.as_ref())
-                                    .and_then(|r| r.calibration.as_ref()),
-                            )
-                            .err()
-                            .map(|e| e.to_string()),
+                        Some("start") => {
+                            let parsed = request.as_ref().ok().and_then(|r| r.as_ref());
+                            match Requested::parse(parsed) {
+                                Ok(backend) => {
+                                    let calibration = parsed.and_then(|r| r.calibration.clone());
+                                    let this = this.clone();
+                                    // The SteamVR attach handshake is blocking;
+                                    // never run it on the async control task.
+                                    match tokio::task::spawn_blocking(move || {
+                                        this.start(calibration.as_ref(), backend)
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(())) => None,
+                                        Ok(Err(error)) => Some(error.to_string()),
+                                        Err(_) => Some("VR 启动任务未能完成".into()),
+                                    }
+                                }
+                                Err(error) => Some(error.to_string()),
+                            }
+                        }
                         Some("video-configured") => {
                             let generation = request
                                 .as_ref()
@@ -707,7 +874,10 @@ impl Session {
                         Instant::now(),
                         this.sent_video_frames.load(Ordering::Relaxed),
                     );
-                    serde_json::json!({"version":1,"id":id,"send_fps":observed,"tracking":(state.socket.is_some() || state.broker.is_some()),"tracking_version":state.tracking_version.max(1),"stage":state.broker.as_ref().is_some_and(|b|b.has_stage()),"generation":state.generation,"backend":state.backend,"stereo":streaming,"video_frames":this.sent_video_frames.load(Ordering::Relaxed),"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"video_error":state.producer_error,"target_fps":state.video_rate.refresh_hz,"captured_frames":state.captured_frames,"encoded_frames":state.encoded_frames,"decoder_ready":this.video_ack.load(Ordering::Acquire)==state.generation && state.generation>0,"head_valid":state.head_valid,"message":if streaming {"双眼编码帧正在发送；仍需头显确认解码与显示"} else {"等待真实合成器双眼编码帧；当前不能宣称 PCVR 可用"}})
+                    // `stage` is a demand of the OpenXR device bridge only
+                    // (xrizer needs a floor); the mirror backend never asks.
+                    let stage = state.broker.as_ref().map_or(true, |b| b.has_stage());
+                    serde_json::json!({"version":1,"id":id,"send_fps":observed,"tracking":started(&state),"tracking_version":state.tracking_version.max(1),"stage":stage,"generation":state.generation,"backend":state.backend,"stereo":streaming,"video_frames":this.sent_video_frames.load(Ordering::Relaxed),"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"video_error":state.producer_error,"target_fps":state.video_rate.refresh_hz,"captured_frames":state.captured_frames,"encoded_frames":state.encoded_frames,"external":state.external,"scene_pid":state.attach.as_ref().map_or(0,|a|a.scene_pid()),"decoder_ready":this.video_ack.load(Ordering::Acquire)==state.generation && state.generation>0,"head_valid":state.head_valid,"message":if streaming {"双眼编码帧正在发送；仍需头显确认解码与显示"} else {"等待真实合成器双眼编码帧；当前不能宣称 PCVR 可用"}})
                 };
                 let Some(ch) = weak.upgrade() else { break };
                 if ch.ready_state()
@@ -773,5 +943,17 @@ mod stereo_async_tests {
             assert_send(session.send_stereo(frame));
         }
         let _ = prove;
+    }
+    #[test]
+    fn only_known_backends_are_accepted_for_a_start() {
+        let mirror: ControlRequest =
+            serde_json::from_str(r#"{"id":4,"op":"start","backend":"steamvr"}"#).unwrap();
+        assert_eq!(Requested::parse(Some(&mirror)).unwrap(), Requested::SteamVr);
+        let plain: ControlRequest = serde_json::from_str(r#"{"id":4,"op":"start"}"#).unwrap();
+        assert_eq!(Requested::parse(Some(&plain)).unwrap(), Requested::Default);
+        assert_eq!(Requested::parse(None).unwrap(), Requested::Default);
+        let unknown: ControlRequest =
+            serde_json::from_str(r#"{"id":4,"op":"start","backend":"wivrn"}"#).unwrap();
+        assert!(Requested::parse(Some(&unknown)).is_err());
     }
 }

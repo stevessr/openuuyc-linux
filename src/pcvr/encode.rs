@@ -123,6 +123,8 @@ mod tests {
             height: 64,
             views,
             bgra: pixels,
+            origin: 0,
+            head: None,
         };
         let mut encoder = Encoder::new(7, 72).unwrap();
         let frame = encoder
@@ -147,6 +149,8 @@ mod tests {
                 height: 64,
                 views,
                 bgra: vec![64; 128 * 64 * 4],
+                origin: 0,
+                head: None,
             };
             let next = encoder
                 .encode(raw, false, &Arc::new(AtomicBool::new(false)))

@@ -299,11 +299,12 @@ impl DeviceCenterApp {
             }
 
             ui.small("仅为游戏进程选择 XR_RUNTIME_JSON / VR_OVERRIDE，不切换全局 OpenXR。Steam 已运行时需使用该游戏的启动选项，不能只给 steam -applaunch 设置环境。");
-            ui.label("PICO OpenXR 设备/合成器还未接通；以下 SteamVR 组件仍仅是追踪诊断，不提供双眼游戏画面。");
+            ui.label("双眼链路已有代码与本地测试：内置 OpenXR 走受管设备与合成器导出，SteamVR 既有场景可在 PICO 沉浸菜单「附加已有 VR 应用 → 附加 SteamVR 运行中场景」请求只读双眼镜像（不会启动 SteamVR/游戏）。真实游戏/头显验收仍未完成。");
+            ui.small("SteamVR 镜像需要本机 SteamVR 已在运行且场景正在渲染；命令行诊断：OpenUUYC pico-vr steamvr-mirror-probe / steamvr-mirror-attach。");
             if ui.button("安装 / 更新 OpenUUYC 内置 OpenVR 驱动").clicked() {
                 self.status = match crate::pcvr::install_driver() {
                     Ok(()) => StatusMessage::success(
-                        "内置追踪驱动已安装；请自行重启 SteamVR 后，在 PICO 沉浸菜单启用追踪诊断",
+                        "内置追踪驱动已安装；请自行重启 SteamVR 后，在 PICO 沉浸菜单启用追踪诊断（追踪驱动不是双眼镜像）",
                     ),
                     Err(e) => StatusMessage::error(e.to_string()),
                 };

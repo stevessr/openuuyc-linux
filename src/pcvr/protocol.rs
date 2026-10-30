@@ -63,6 +63,30 @@ pub(crate) fn head_valid(frame: &[u8]) -> bool {
         .get(32..36)
         .is_some_and(|flags| u32::from_le_bytes(flags.try_into().unwrap()) & 3 == 3)
 }
+/// The head pose in the headset's LOCAL space (xyz, xyzw): its position and
+/// orientation together, never a partially tracked frame. Used to register the
+/// external compositor's coordinate space; a defaulted pose must not align.
+pub(crate) fn head_pose(frame: &[u8]) -> Option<[f32; 7]> {
+    let device = frame.get(32..96)?;
+    if u32::from_le_bytes(device[..4].try_into().ok()?) & 3 != 3 {
+        return None;
+    }
+    let mut pose = [0f32; 7];
+    for (i, bytes) in device[8..36].chunks_exact(4).enumerate() {
+        pose[i] = f32::from_le_bytes(bytes.try_into().ok()?);
+        if !pose[i].is_finite() {
+            return None;
+        }
+    }
+    if pose[..3].iter().any(|v| v.abs() > 1000.) {
+        return None;
+    }
+    let norm: f32 = pose[3..].iter().map(|v| v * v).sum();
+    if !(0.98..=1.02).contains(&norm) {
+        return None;
+    }
+    Some(pose)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +133,28 @@ mod tests {
             assert_eq!(head_valid(&f), flags == 3);
         }
         assert!(!head_valid(&f[..32]));
+    }
+    #[test]
+    fn head_pose_needs_both_tracked_position_and_orientation() {
+        let mut f = frame();
+        f[32] = 3;
+        assert_eq!(head_pose(&f), None, "zeroed devices are not a pose");
+        for (i, value) in [1f32, 2., 3.].into_iter().enumerate() {
+            f[40 + i * 4..44 + i * 4].copy_from_slice(&value.to_le_bytes());
+        }
+        f[52..56].copy_from_slice(&0f32.to_le_bytes());
+        f[56..60].copy_from_slice(&0f32.to_le_bytes());
+        f[60..64].copy_from_slice(&0f32.to_le_bytes());
+        f[64..68].copy_from_slice(&2f32.to_le_bytes());
+        assert!(sequence(&f).is_err(), "non-unit quaternion");
+        f[64..68].copy_from_slice(&1f32.to_le_bytes());
+        assert_eq!(head_pose(&f), Some([1., 2., 3., 0., 0., 0., 1.]));
+        f[32] = 1;
+        assert_eq!(head_pose(&f), None, "orientation alone cannot align");
+        f[32] = 2;
+        assert_eq!(head_pose(&f), None, "position alone cannot align");
+        f[32] = 3;
+        assert_eq!(head_pose(&f[..32]), None);
     }
     #[test]
     fn rejects_nonfinite_and_invalid_quaternion() {

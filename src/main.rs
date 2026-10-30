@@ -50,6 +50,8 @@ enum PicoVrCommand {
     RuntimeStatus,
     /// Inspect an existing SteamVR scene without starting the runtime or a game
     SteamvrMirrorProbe,
+    /// 手动附加到正在运行的 SteamVR 场景，写入本机私有双眼导出（Ctrl-C 结束）
+    SteamvrMirrorAttach,
     /// 选择后端：openxr-first（默认）、openxr-only、steamvr
     RuntimePreference { value: String },
     /// 从已构建目录安装 Monado/xrizer 组件；不切换系统运行时
@@ -434,6 +436,7 @@ fn main() -> Result<()> {
                 );
                 Ok(())
             }
+            PicoVrCommand::SteamvrMirrorAttach => openuuyc::pcvr::steamvr::attach_diagnostic(),
             PicoVrCommand::ComponentsInstall { directory } => {
                 println!(
                     "组件安装到 {}",

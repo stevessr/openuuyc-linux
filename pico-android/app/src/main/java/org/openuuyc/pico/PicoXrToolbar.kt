@@ -797,7 +797,7 @@ internal class PicoXrToolbar(
                                 }
                                 if(entry==1 && direct==null) {status("请先连接 Linux OpenUUYC");return@post}
                                 if(entry==1 && direct!=null) {
-                                    options("附加已有 VR 应用",listOf("附加当前应用 · 不启动或重启游戏","停止连接 · 不关闭游戏","状态：${direct.vr.status}","SteamVR 已运行应用：独立适配中"),-1) {choice ->
+                                    options("附加已有 VR 应用",listOf("附加当前应用 · 不启动或重启游戏","停止连接 · 不关闭游戏","状态：${direct.vr.status}","附加 SteamVR 运行中场景 · 双眼镜像"),-1) {choice ->
                                         if(choice==0) direct.quickApps.runningVr {apps,error->
                                             if(apps.isNullOrEmpty()) {
                                                 val reason=error ?: "未检测到运行中的内置 OpenXR 应用；本操作不会自动启动游戏"
@@ -807,6 +807,10 @@ internal class PicoXrToolbar(
                                                 draw()
                                             }
                                         } else if(choice==1) {direct.vr.request(false);status("已停止 PCVR 连接，未关闭游戏")}
+                                        else if(choice==3) direct.vr.prepareSteamVr {ready,message->
+                                            status(if(ready) "已附加 SteamVR 运行中场景；等待真实双眼帧，不会启动游戏" else message)
+                                            draw()
+                                        }
                                         else status(direct.vr.status)
                                     };draw()
                                 } else {

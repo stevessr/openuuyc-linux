@@ -304,7 +304,7 @@ and reachability still require headset validation.
 4. 拖动/跟随菜单和窗口，确认 LOCAL 空间追踪不跟随菜单变换。
 5. 关闭追踪、断连、撤销权限、头显失焦分别测试；驱动最多 250ms 后报告失联。重新连接后不得有遗留占用。
 6. 同时第二个会话/第二个 OpenUUYC 进程尝试开启，必须拒绝；驱动退出或崩溃重启应正常回收 socket。
-7. 双眼画面、输入绑定与 VRChat 游玩尚未实现，不可用桌面画面代替上述验收。
+7. 本节只验收 GenericTracker 追踪诊断，不把追踪设备当作 HMD，也不以它证明可玩；SteamVR 双眼镜像、OpenXR 输入/震动与真实头显的单独验收见下文，不因代码或模拟 fixture 通过而判定通过。
 
 ### 2026-10-29 file management completion checkpoint (local)
 
@@ -357,6 +357,19 @@ and reachability still require headset validation.
 - Application/file data connections previously sent desktop kind=1 despite omitting all media m-lines. They now send UU file/data kind=5; dedicated terminals retain native kind=8; desktop kind=1 stays unchanged. Pure data does not advertise the OpenUUYC audio-control extension. Both kinds remain zero-media SDP offers.
 - File UI waits for CONTROL PB ECHO + open CONTROL/TEXT, rather than treating TEXT alone as readiness. Ended cached sessions are not reused. Refusal ACKs preserve a numeric remote code and are not misclassified as malformed signaling; diagnostics contain only ACK status/code, identifier-presence booleans and ICE-server count, never identifier values/credentials/peer messages.
 - 247 JVM tests, APK and Lint passed; installed on the connected PICO. The saved prior failure ended before peer creation with generic signaling parse failure; a fresh per-device user attempt is needed to validate the corrected roles and obtain any actual refusal code. No remote permission is bypassed.
+
+### OpenVR（SteamVR 既有场景）双眼镜像验收（实现已合入，未实机验收）
+- 前置：本机 SteamVR 已运行且有一个聚焦、正在提交帧的 VR 场景；本功能不会启动
+  SteamVR 或游戏，也不会切换全局运行时。主机需已安装组件包（镜像 helper 内嵌在
+  OpenUUYC 可执行文件中，来源哈希记录于 `drivers/pcvr/vendor/openvr-client.lock.json`）。
+- 头显：沉浸菜单 → 应用与 VR 游戏 → 附加已有 VR 应用 → 「附加 SteamVR 运行中场景 · 双眼镜像」。
+- 通过条件：状态显示 `steamvr-mirror`；`captured_frames`、`encoded_frames`、`video_frames`
+  递增且 `video_error` 为空；头显看到左右眼画面与头动一致（附着眼睛相对头显的真实偏移，
+  不是把画面贴在脸上）；停止连接后 helper 退出、私有导出文件被删除、无残留进程与锁。
+- 负例：SteamVR 未运行、没有聚焦场景、场景中途切换时必须给出明确原因；不得自动启动
+  SteamVR/游戏，不得静默退化为仅追踪模式，也不得把桌面画面当作镜像。
+- 不包含：向 SteamVR 注入 PICO 头显/手柄（镜像只读）、配准精度/延迟/预测验收、
+  长时间稳定性；这些必须在真机上另行测量并记录。
 
 ### PCVR producer-stage diagnostics and stale-frame rejection
 - Host status separately reports `captured_frames`, `encoded_frames`, `video_frames`, `decoder_ready`, `head_valid`, and nonfatal `video_error`. A producer failure must remain visible without revoking the tracking session (which would prevent recovery).

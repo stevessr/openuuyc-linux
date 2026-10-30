@@ -109,19 +109,19 @@ internal class UuPcvrSession {
     @Synchronized fun bind(channel: DataChannel) {
         when(channel.label()) {CONTROL->control=channel;TRACKING->poses=channel}
     }
-    fun prepareStereo(callback: (Boolean,String)->Unit) {
-        synchronized(this) {
-            if(stereoNative==null || eyeCalibration==null) {
-                main.post {callback(false,"请进入沉浸式串流并唤醒头显，等待真实眼位/FOV 校准后重试")};return
-            }
-            if(active) {main.post {callback(true,status)};return}
-            if(!request(true)) {main.post {callback(false,status)};return}
-        }
-        val deadline=android.os.SystemClock.elapsedRealtime()+8500
+    /** Wait for the correlated acknowledgement of a start request we sent. */
+    private fun awaitStart(callback: (Boolean,String)->Unit,timeoutMs: Long,expectedBackend: String) {
+        val deadline=android.os.SystemClock.elapsedRealtime()+timeoutMs
         fun poll() {
             val outcome=synchronized(this) {
                 when {
-                    active && owner.get()===this -> true to status
+                    active && owner.get()===this -> {
+                        if(state.activeOn(expectedBackend)) true to status else {
+                            val actual=status
+                            request(false)
+                            false to "远端未确认请求的 VR 后端（$actual）；已请求停止"
+                        }
+                    }
                     !state.desired || android.os.SystemClock.elapsedRealtime()>=deadline -> false to status
                     else -> null
                 }
@@ -131,7 +131,35 @@ internal class UuPcvrSession {
         }
         main.post {poll()}
     }
-    @Synchronized fun request(start: Boolean): Boolean {
+    fun prepareStereo(callback: (Boolean,String)->Unit) {
+        synchronized(this) {
+            if(stereoNative==null || eyeCalibration==null) {
+                main.post {callback(false,"请进入沉浸式串流并唤醒头显，等待真实眼位/FOV 校准后重试")};return
+            }
+            if(active) {
+                val matches=state.activeOn("openxr-pico-device")
+                val message=if(matches) status else "当前 VR 会话不是双眼 PCVR 后端；请先停止它再启动双眼串流"
+                main.post {callback(matches,message)};return
+            }
+            if(!request(true)) {main.post {callback(false,status)};return}
+        }
+        awaitStart(callback,8500,"openxr-pico-device")
+    }
+    /** Attach to a running SteamVR scene on the host: one-sided stereo
+     * mirror. Needs no eye calibration (the host registers coordinates from
+     * the tracked head pose) and never starts or restarts SteamVR/games. */
+    fun prepareSteamVr(callback: (Boolean,String)->Unit) {
+        synchronized(this) {
+            if(active) {
+                val matches=state.activeOn("steamvr-mirror")
+                val message=if(matches) status else "当前 VR 会话使用其他后端；请先停止后再附加 SteamVR 场景"
+                main.post {callback(matches,message)};return
+            }
+            if(!request(true,UuPcvrRequests.BACKEND_STEAMVR)) {main.post {callback(false,status)};return}
+        }
+        awaitStart(callback,12000,"steamvr-mirror")
+    }
+    @Synchronized fun request(start: Boolean,backend: String?=null): Boolean {
         if(start)localFailure=null
         val c=control
         if(c?.state()!=DataChannel.State.OPEN || (start && poses?.state()!=DataChannel.State.OPEN)) {
@@ -143,8 +171,7 @@ internal class UuPcvrSession {
         active=false;stopStereo()
         val id=state.request(start)
         if(!start) owner.compareAndSet(this,null)
-        val request=JSONObject().put("id",id).put("op",if(start) "start" else "stop")
-        if(start) eyeCalibration?.let {request.put("calibration",it)}
+        val request=UuPcvrRequests.control(id,start,if(start) eyeCalibration else null,backend)
         val sent=c.send(DataChannel.Buffer(ByteBuffer.wrap(request.toString().toByteArray()),false))
         if(!sent) {revoke();status="VR 请求未发送";return false}
         status="等待远端确认（仅追踪，无远端双眼画面）"
@@ -172,7 +199,7 @@ internal class UuPcvrSession {
             if(value.optInt("version")!=1) {revoke();status="VR 协议不兼容";return}
             trackingVersion=if(value.optInt("tracking_version",1)>=2) 2 else 1
             val ready=value.optBoolean("tracking") && control?.state()==DataChannel.State.OPEN && poses?.state()==DataChannel.State.OPEN
-            if(!state.receive(value.optInt("id"),ready,!value.isNull("error"))) return
+            if(!state.receive(value.optInt("id"),ready,!value.isNull("error"),value.optString("backend").takeIf {it.isNotBlank()})) return
             active=state.active && owner.get()===this
             controlGeneration=if(active) value.optInt("generation",0).coerceAtLeast(0) else 0
             if(!active) stopStereo()

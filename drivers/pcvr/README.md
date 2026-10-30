@@ -13,9 +13,9 @@
 - 本机 Unix datagram IPC 位于 `$XDG_RUNTIME_DIR/openuuyc-pcvr/tracking.sock`，目录 0700、socket 0600；不监听额外公网端口。
 - 驱动暴露 **三个 GenericTracker 诊断设备**，不是 HMD，不抢占现有头显。250ms 无有效帧自动报告断开；驱动正常退出释放 socket，崩溃后通过排他锁回收旧 socket。
 
-## 尚未实现，不能据此游玩 VRChat
+## 完成边界：实现状态不等于 VRChat 可玩验收
 
-Linux 双眼 GPU 纹理导出/编码与端到端媒体同步、时钟校准/预测、真实眼位/FOV/IPD 协商、OpenVR 手柄输入/震动。SBS 分片接收、硬件解码和双眼投影已有代码与本地测试，但还没有真实游戏帧源接入。服务端仍报告 `stereo: false`；VRChat 快速入口仅可明确确认后在远端启动，不代表可玩 PCVR。
+OpenXR Monado 与现有 SteamVR 场景都已有受授权会话的 GPU 帧出口、主机校验/编码/传输到 PICO 的代码路径；Monado LOCAL 帧用 OUST v2，SteamVR 外部空间帧带渲染头姿、用 OUST v3 并在主机做坐标配准。PICO 侧分片、硬件解码与投影代码也已实现。上述实现与模拟/合成帧测试不等于真实游戏与头显的端到端验收。SteamVR 镜像只读，不向 SteamVR 注入 PICO 手柄输入或震动；尚需实测时钟/配准/延迟与预测表现。主机 `stereo:true` 只代表近期媒体帧发送，不证明头显解码/显示或 VRChat 可玩；快速入口仍需明确授权，不能将启动成功当作串流成功。
 
 ## 协议与检查
 
@@ -44,26 +44,42 @@ OpenVR ABI 依据 Valve 官方 SDK v2.12.14，来源与许可见 `vendor/`。下
 
 双眼接收基础：单路 SBS access unit 保持左右眼配对，携带每眼渲染 pose/FOV；最大 4 MiB、48 KB 分片、丢失/过期/乱序恢复要求 IDR。PICO 使用硬件 MediaCodec 向一个 Android Surface swapchain 输出，两份 ProjectionView 引用同一图像的左右区域；使用码流携带的渲染视图而不是把当前头姿误当渲染姿态。250 ms 无解码帧停止提交，保留工具栏/射线，禁止点击隐藏的桌面四边形。该路径尚未经过真实头显/游戏帧验证。
 
-### SteamVR 既有场景附加：开发状态
+### SteamVR 既有场景附加：双眼镜像
 
 已加入基于官方 OpenVR v2.12.14 客户端头文件的背景镜像读取器，源文件和 SHA-256
 记录于 vendor/openvr-client.lock.json，复用 Valve BSD-3-Clause 声明。
-不分发 SteamVR 客户端二进制，也不启动 SteamVR、游戏或切换全局运行时。
+不分发 SteamVR 客户端二进制，也不启动 SteamVR、游戏或切换全局运行时；附加期间
+不取得场景焦点，也不向 SteamVR 注入 PICO 设备。
 
 已实现代码路径：
 - 动态加载本机已安装的 OpenVR API，以 VRApplication_Background 初始化；
 - 查询当前场景 PID/最后提交帧 PID，场景切换时终止当前附加；
 - 通过 GetMirrorTextureGL 与显式共享纹理锁读取两眼，使用隐藏 GL 上下文缩小回读；
-- 检查两眼之间的帧号/场景未改变，保留真实合成器时间、渲染头姿和眼位/FOV；
-- 将外部坐标空间明确标记为 origin=1，宿主目前拒绝未对齐的外部姿态，
-  防止直接当作 PICO LOCAL 投影而造成错误视点。
+- 检查两眼之间的帧号/场景未改变，按合成器帧号等待新帧（不再固定 30ms 延迟，
+  上限是场景自身帧率）；每帧校验渲染头姿有效且 HMD 已连接；
+- 保留渲染头姿和眼位/FOV；导出 v3 在 136 处携带真实渲染头姿，并把
+  origin=1 明确标记为“外部合成器空间”；时间戳改用取帧完成时的宿主
+  CLOCK_MONOTONIC（相机门禁要求），不再假定 SteamVR 系统时钟与宿主同纪元。
 
-可执行只读诊断：
+接入授权会话（宿主侧）：
+- PICO 沉浸菜单「应用与 VR 游戏 → 附加已有 VR 应用 → 附加 SteamVR 运行中场景」
+  以 `backend:"steamvr"` 显式请求；该请求不会静默退化成仅追踪备用链路，
+  失败时返回原因（未运行 SteamVR / 没有聚焦场景等）；
+- 宿主在唯一 PCVR 所有权锁（跨进程 publisher.lock）下创建 0700 目录内的私有
+  导出、以内嵌 helper 做最长 10 秒握手（`attached` 行意味着两面 GL 镜像纹理
+  已就绪），会话停止/断连/撤销时终止 helper 并删除导出；
+- 外部坐标对齐：第一帧有效头显 LOCAL 头姿（<250ms）与该帧真实渲染头姿求刚体
+  配准（T = PICO ∘ 外部⁻¹，每代一次），把该帧双眼位姿变换到 LOCAL 后再编码；
+  缺追踪或头姿缺失时丢帧并报告 `video_error`，绝不猜测坐标。
 
-    OpenUUYC pico-vr steamvr-mirror-probe
+可执行诊断：
+
+    OpenUUYC pico-vr steamvr-mirror-probe    # 只读：场景/运行时可附加性
+    OpenUUYC pico-vr steamvr-mirror-attach   # 手动附加并把双眼写入本机私有导出（Ctrl-C 结束）
 
 构建镜像辅助程序需要 SDL2/OpenGL 开发文件。缺少时基础客户端仍可构建，
 诊断命令明确报告未构建辅助程序，不静默退回桌面镜像。
-当前仅验证 SteamVR 未运行时的 Background 错误返回与不启动服务，以及姿态数学/
-外部坐标拒绝测试；尚未验证活动 SteamVR 场景的真实 GPU 取帧。
-外部坐标对齐、附加控制权/活动 HMD 校验、接入授权会话及 PICO 实机出图仍未完成。
+已用真实安装验证：SteamVR 未运行时的 Background 错误返回、不启动服务、
+握手失败原因映射与 C/姿态数学测试。尚未验证活动场景的真实 GPU 取帧、配准
+观感、长时间稳定性与真实头显出图，也没有 STEAMVR 场景内的输入转发；
+镜像只读，不提供手柄输入或震动。

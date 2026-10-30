@@ -72,7 +72,7 @@ pub(crate) struct Broker {
 }
 // SAFETY: mapping/file descriptors are exclusively owned and all access is serialized by Session.state.
 unsafe impl Send for Broker {}
-fn private_dir(path: &Path) -> Result<()> {
+pub(crate) fn private_dir(path: &Path) -> Result<()> {
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}

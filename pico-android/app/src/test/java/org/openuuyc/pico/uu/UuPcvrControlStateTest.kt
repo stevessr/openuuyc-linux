@@ -34,4 +34,19 @@ class UuPcvrControlStateTest {
         val s=UuPcvrControlState();val id=s.request(true);s.reset()
         s.receive(id,true,false);assertFalse(s.active);assertFalse(s.desired)
     }
+    @Test fun repeatedStartMustMatchTheActiveBackend() {
+        val s=UuPcvrControlState();val id=s.request(true)
+        assertTrue(s.receive(id,true,false,"steamvr-mirror"))
+        assertTrue(s.activeOn("steamvr-mirror"))
+        assertFalse(s.activeOn("openxr-pico-device"))
+    }
+    @Test fun startingAgainClearsThePreviousBackend() {
+        val s=UuPcvrControlState();val first=s.request(true);s.receive(first,true,false,"steamvr-mirror")
+        val next=s.request(true)
+        assertFalse(s.activeOn("steamvr-mirror"))
+        s.receive(next,true,false,"openxr-pico-device")
+        assertTrue(s.activeOn("openxr-pico-device"))
+        s.receive(0,false,true)
+        assertFalse(s.activeOn("openxr-pico-device"))
+    }
 }

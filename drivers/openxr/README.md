@@ -54,7 +54,7 @@ OpenUUYC pico-vr components-init-openvr
 
 At the initial library-only checkpoint the real loader created an instance (`instance_result=0`) but found no system (`system_result=-6`). The follow-up below adds a calibrated PICO device builder; without live headset data it still deliberately reports no HMD.
 
-The preceding SBS transport/decoder/OpenXR projection work is a receiver foundation, not a complete host runtime. Still required: live PICO validation, input/clock/floor alignment, a Vulkan compositor target feeding the authenticated OpenUUYC encoder/media path, controller/haptics support, and end-to-end game/headset validation. Stock Monado plus xrizer alone does not complete these pieces. The SteamVR fallback bridge also remains tracking-only.
+The PICO SBS receiver and Monado producer now have a host-side OUST reader, H.264 encoder and authenticated stereo-media sender in code. Still required for the Monado/PICO path: real PICO/game validation and timing/alignment/prediction measurements. The owned device-bridge, controller and haptics pieces are described below; stock Monado plus xrizer alone does not complete these pieces. The separate SteamVR fallback bridge remains tracking-only; a read-only mirror of an already-running SteamVR scene is also implemented (compositor readback and one-sample external-space registration), not SteamVR device injection. See `drivers/pcvr/README.md` and the PICO menu's “附加 SteamVR 运行中场景”. Neither path is yet validated end-to-end with a real game and headset.
 
 The manual `Owned OpenXR components` GitHub Actions workflow builds a separate Linux component artifact from the lock file and checks actual loader initialization. It is not run/downloaded by ordinary application startup. The artifact is a tar archive so executable modes survive upload/download. This workflow has been added but has not been executed remotely during this change.
 
@@ -62,22 +62,22 @@ Local checks for this integration: 218 Android JVM tests plus APK/lint passed; 1
 
 ## Device bridge follow-up (after commit 82d34dc)
 
-The source build now overlays the owned `pico_builder.c` onto the pinned Monado tree and packages the overlay source, without editing the upstream checkout. Bundles advertise `pico_device_v1`, **not** `pico_stereo_v1`. The graphical launcher still refuses to start an OpenXR game without the stereo/compositor capability.
+The source build now overlays the owned `pico_builder.c` onto the pinned Monado tree and packages the overlay source, without editing the upstream checkout. Bundles advertise `pico_device_v1` and `stereo_cpu_v2` (not the historical `pico_stereo_v1` name). The graphical launcher only starts when a bundle advertises a real stereo/compositor export.
 
-PICO measures eye poses/FOV in OpenXR VIEW space, uses runtime-recommended image dimensions (uniformly capped to a 2048-pixel long edge) and the reported display period, and includes calibration in the explicit VR start request. The authenticated Linux session publishes accepted pose packets to a private 4096-byte seqlock snapshot at `$XDG_RUNTIME_DIR/openuuyc-pcvr/openxr/device.shm`. The Monado builder only creates an HMD from valid calibration and a fresh, valid head pose. No fixed IPD, floor height or fake tracking is supplied. STAGE/local-floor, controllers and clock-correct prediction are not implemented yet.
+PICO measures eye poses/FOV in OpenXR VIEW space, uses runtime-recommended image dimensions (uniformly capped to a 2048-pixel long edge) and the reported display period, and includes calibration in the explicit VR start request. The authenticated Linux session publishes accepted pose packets to a private 4096-byte seqlock snapshot at `$XDG_RUNTIME_DIR/openuuyc-pcvr/openxr/device.shm`. The Monado builder only creates an HMD from valid calibration and a fresh, valid head pose. The runtime's real STAGE-to-LOCAL transform is published only when available; no floor is synthesized. Reconnection can rebind the existing OpenXR session to a new publisher only when optical parameters are compatible. See the controller/haptics sections below for their implemented transport and remaining physical-hardware checks.
 
-The source is owner-only (0700 directory/0600 file), globally publisher-locked, stale after 250 ms, invalidated/unlinked on stop, and generation-bound. Reconnection currently requires restarting the OpenXR game/runtime instance, rather than reusing an old instance's eye calibration. Steam launch environments include a read-only mapping of the private IPC directory into Pressure Vessel, preserving preexisting mappings.
+The source is owner-only (0700 directory/0600 file), globally publisher-locked, stale after 250 ms, invalidated/unlinked on stop, and generation-bound. The Monado builder can rebind an existing OpenXR session to a new publisher only when its optical calibration is compatible; see the reattach fixture below. Steam launch environments include a read-only mapping of the private IPC directory into Pressure Vessel, preserving preexisting mappings.
 
 Monado's pinned in-process path previously always initialized a compositor even with `XR_MND_headless`; the explicit source overlay lets a headless device diagnostic avoid GPU/display initialization. Normal graphical applications are unchanged. The custom system provides Monado's required I/O cache, so a real OpenXR headless session can be created, not merely an instance.
 
 The synthetic fixture test in `tests/device_fixture.py` compiles against the real OpenXR loader and verifies that an actual Monado HMD session returns injected head position (1, 2, 3) through `xrLocateSpace`; after publication stops, a new session cannot acquire a stale HMD. The fixture uses a temporary XDG runtime/config directory, is never enabled in production, and is not headset or game-rendering acceptance evidence. Headless mode intentionally exposes no eye-image views; graphical view/compositor testing is still separate.
 
-The updated native Android library/APK and local Rust device tests build successfully. The device-overlay component bundle has been built and installed locally; real PICO-to-Monado verification is pending the user enabling tracking on the headset. The GPU compositor → encoder → stereo media path remains unconnected, so no full PCVR completion is claimed.
+The updated native Android library/APK and local Rust device tests build successfully. The device-overlay component bundle has been built and installed locally; real PICO-to-Monado/game verification is still pending. The Monado graphics producer is connected in code to the authenticated encoder/media path; the separate existing-SteamVR read-only mirror also has its own producer and host-side pose alignment. Neither path has real game/headset stereo, decoder and projection acceptance yet.
 
 ### 双眼生产链路开发状态
 
 `stereo_overlay.py` 将同帧左右眼 scratch readback 接入 Monado，并附带该帧实际
-`frame_params.poses/fovs`；`stereo_capture.[ch]` 定义私有、临时的 OUST v2 导出。
+`frame_params.poses/fovs`；`stereo_capture.[ch]` 定义私有临时导出格式：内置 Monado LOCAL 帧使用 OUST v2，外部 producer 提供同帧渲染头姿时使用 OUST v3。
 仅显式设置 `OPENUUYC_STEREO_CAPTURE` 且宿主预建了正确大小、当前 uid 独占的
 0600 文件时才导出；生产端使用 inode 级排他锁，帧未完整配对时不提交序列锁。
 这不是录屏文件，也不是桌面捕获。当前正确性基线每眼高 512 像素，CPU 回读。
@@ -113,8 +113,7 @@ LaunchOptions，不修改全局 OpenXR/OpenVR 选择；必须先关闭 Steam。
 `stereo_reattach_test.c` 验证已有双眼生产端改用新输出映射，带 ASan/UBSan 运行。
 
 该机制适用于加载新版内置运行时的既有应用，不会把已经绑定 SteamVR 或其他
-运行时的进程强制切换为 Monado。SteamVR 既有进程的独立合成器取帧仍需实现；
-未实现前不宣称任意现有 VR 应用都可附加，也不通过注入或桌面镜像冒充支持。
+运行时的进程强制切换为 Monado。SteamVR 既有进程由单独的只读 compositor mirror 路径读取并做外部空间配准；它不注入 PICO 设备或输入。该路径尚无真实游戏/头显端到端验收，见 `drivers/pcvr/README.md`。
 
 附加入口现在通过只读 vr-applications 扩展查询当前 uid 的 /proc 映射，只列出
 实际加载已安装内置 OpenXR 库的进程，不按 VRChat 进程名猜测，也不传输命令行。

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <csignal>
+#include <chrono>
 #include <stdexcept>
 #include <vector>
 #include <string>
@@ -115,6 +116,9 @@ int main(int argc,char **argv) {
         require(scene,"no running VR scene to attach");
         require(std::getenv("OPENUUYC_STEREO_CAPTURE"),"host stereo export must be explicitly supplied");
         GL gl;Mirror left(client.compositor,vr::Eye_Left),right(client.compositor,vr::Eye_Right);Readback readback;
+        // Announce a usable attach only after both GL mirror textures exist, so
+        // the host never reports a live stream that could not read an eye.
+        std::printf("{\"attached\":true,\"scene_pid\":%u,\"renderer_pid\":%u}\n",scene,client.compositor->GetLastFrameRenderer());std::fflush(stdout);
         std::vector<unsigned char> eyes[2];uint32_t width[2],height[2];uint32_t previous=0;
         std::signal(SIGINT,stop);std::signal(SIGTERM,stop);
         // Origin 1 must be aligned by the host before feeding a PICO LOCAL projection.
@@ -122,24 +126,30 @@ int main(int argc,char **argv) {
         while(!stopped) {
             require(client.compositor->GetCurrentSceneFocusProcess()==scene,"scene changed; explicit reattachment required");
             vr::Compositor_FrameTiming before{};before.m_nSize=sizeof(before);
+            // Wait for a newly presented frame instead of re-reading the same
+            // one on a fixed delay: the compositor's own cadence paces us.
             if(!client.compositor->GetFrameTiming(&before) || before.m_nFrameIndex==previous || (!before.m_HmdPose.bPoseIsValid || !before.m_HmdPose.bDeviceIsConnected) ||
-               client.compositor->GetLastFrameRenderer()!=scene) {SDL_Delay(10);continue;}
+               client.compositor->GetLastFrameRenderer()!=scene) {SDL_Delay(2);continue;}
             if(!readback.read(left,width[0],height[0],eyes[0]) || !readback.read(right,width[1],height[1],eyes[1])) throw std::runtime_error("SteamVR mirror GPU readback failed");
             vr::Compositor_FrameTiming after{};after.m_nSize=sizeof(after);
             if(!client.compositor->GetFrameTiming(&after) || after.m_nFrameIndex!=before.m_nFrameIndex ||
                client.compositor->GetCurrentSceneFocusProcess()!=scene || client.compositor->GetLastFrameRenderer()!=scene ||
                width[0]!=width[1] || height[0]!=height[1]) continue;
-            float views[22];bool valid=true;
+            float views[22],head[7];bool valid=mirror_head(before.m_HmdPose.mDeviceToAbsoluteTracking,head);
             for(int eye=0;eye<2;eye++) {
                 float l,r,down,up;client.system->GetProjectionRaw(vr::EVREye(eye),&l,&r,&down,&up);
                 auto pose=mirror_product(before.m_HmdPose.mDeviceToAbsoluteTracking,client.system->GetEyeToHeadTransform(vr::EVREye(eye)));
                 valid &= mirror_view(pose,l,r,down,up,views+eye*11);
             }
-            double ns=before.m_flSystemTimeInSeconds*1e9;
-            if(!valid || !std::isfinite(ns) || ns<=0 || ns>9e18) continue;
-            oust_set_views(views);
-            for(uint32_t eye=0;eye<2;eye++) oust_capture_eye(eye,uint64_t(before.m_nFrameIndex)+1,uint64_t(ns),width[eye],height[eye],width[eye]*4,eyes[eye].data());
-            previous=before.m_nFrameIndex;SDL_Delay(30);
+            // The host gates frame freshness on this machine's CLOCK_MONOTONIC
+            // (steady_clock here); SteamVR's own system clock epoch is not
+            // guaranteed to match it.
+            if(!valid) continue;
+            uint64_t ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            oust_set_views(views);oust_set_head(head);
+            for(uint32_t eye=0;eye<2;eye++) oust_capture_eye(eye,uint64_t(before.m_nFrameIndex)+1,ns,width[eye],height[eye],width[eye]*4,eyes[eye].data());
+            previous=before.m_nFrameIndex;
         }
         return 0;
     } catch(const std::exception &error) {std::fprintf(stderr,"SteamVR mirror: %s\n",error.what());return 2;}

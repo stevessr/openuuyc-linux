@@ -162,6 +162,8 @@ pub mod runtime_probe;
 pub(crate) mod device;
 
 #[cfg(target_os = "linux")]
+pub(crate) mod align;
+#[cfg(target_os = "linux")]
 mod capture;
 #[cfg(target_os = "linux")]
 mod encode;
