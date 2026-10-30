@@ -106,6 +106,9 @@ internal class UuPcvrSession {
     private var poses: DataChannel?=null
     @Volatile var active=false;private set
     @Volatile var status="内置 VR 追踪诊断：未开启";private set
+    /** Host-reported attach liveness ("running"/"ended"/"none"): decides
+     * between confirming a live SteamVR mirror and re-requesting a dead one. */
+    @Volatile private var mirror="none"
     @Synchronized fun bind(channel: DataChannel) {
         when(channel.label()) {CONTROL->control=channel;TRACKING->poses=channel}
     }
@@ -147,17 +150,21 @@ internal class UuPcvrSession {
     }
     /** Attach to a running SteamVR scene on the host: one-sided stereo
      * mirror. Needs no eye calibration (the host registers coordinates from
-     * the tracked head pose) and never starts or restarts SteamVR/games. */
+     * the tracked head pose) and never starts or restarts SteamVR/games.
+     * A live mirror is only confirmed; one whose helper ended is re-requested
+     * so the host replaces it, and another backend must be stopped first. */
     fun prepareSteamVr(callback: (Boolean,String)->Unit) {
         synchronized(this) {
-            if(active) {
-                val matches=state.activeOn("steamvr-mirror")
-                val message=if(matches) status else "当前 VR 会话使用其他后端；请先停止后再附加 SteamVR 场景"
-                main.post {callback(matches,message)};return
+            when(UuPcvrMirror.action(active,state.activeOn(UuPcvrMirror.BACKEND),mirror)) {
+                UuPcvrMirror.Action.CONFIRM -> {main.post {callback(true,status)};return}
+                UuPcvrMirror.Action.WRONG_BACKEND -> {
+                    main.post {callback(false,"当前 VR 会话使用其他后端；请先停止后再附加 SteamVR 场景")};return
+                }
+                UuPcvrMirror.Action.REQUEST -> {}
             }
             if(!request(true,UuPcvrRequests.BACKEND_STEAMVR)) {main.post {callback(false,status)};return}
         }
-        awaitStart(callback,12000,"steamvr-mirror")
+        awaitStart(callback,12000,UuPcvrMirror.BACKEND)
     }
     @Synchronized fun request(start: Boolean,backend: String?=null): Boolean {
         if(start)localFailure=null
@@ -198,6 +205,7 @@ internal class UuPcvrSession {
             if(value.optString("type")=="video-config") {configureStereo(value);return}
             if(value.optInt("version")!=1) {revoke();status="VR 协议不兼容";return}
             trackingVersion=if(value.optInt("tracking_version",1)>=2) 2 else 1
+            mirror=value.optString("mirror","none")
             val ready=value.optBoolean("tracking") && control?.state()==DataChannel.State.OPEN && poses?.state()==DataChannel.State.OPEN
             if(!state.receive(value.optInt("id"),ready,!value.isNull("error"),value.optString("backend").takeIf {it.isNotBlank()})) return
             active=state.active && owner.get()===this
@@ -216,6 +224,6 @@ internal class UuPcvrSession {
         val packet=UuPcvrTracking.packet(bytes,trackingVersion) ?: return
         c.send(DataChannel.Buffer(ByteBuffer.wrap(packet),true))
     }
-    private fun revoke() {if(owner.get()===this) for(hand in 0..1) hapticNative?.invoke(hand,0f,0f,0);controlGeneration=0;trackingVersion=1;stopStereo();active=false;state.reset();owner.compareAndSet(this,null)}
+    private fun revoke() {if(owner.get()===this) for(hand in 0..1) hapticNative?.invoke(hand,0f,0f,0);controlGeneration=0;trackingVersion=1;mirror="none";stopStereo();active=false;state.reset();owner.compareAndSet(this,null)}
     @Synchronized fun close() {revoke();eyeCalibration=null;control=null;poses=null;status="VR 会话已结束"}
 }
