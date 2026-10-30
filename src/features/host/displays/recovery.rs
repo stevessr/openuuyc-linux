@@ -157,6 +157,44 @@ fn plan_restore(
     (restore, restored)
 }
 
+#[cfg(not(windows))]
+fn plan_mode_resize(
+    current: &SavedTopology,
+    identity: &str,
+    width: u32,
+    height: u32,
+) -> Result<SavedTopology> {
+    let mut layout = current.clone();
+    let index = layout
+        .targets
+        .iter()
+        .position(|target| target.identity == identity)
+        .context("显示目标已断开")?;
+    let old = layout.targets[index].clone();
+    let (dx, dy) = (
+        i64::from(width) - i64::from(old.width),
+        i64::from(height) - i64::from(old.height),
+    );
+    let (old_right, old_bottom) = (
+        i64::from(old.left) + i64::from(old.width),
+        i64::from(old.top) + i64::from(old.height),
+    );
+    for (other_index, other) in layout.targets.iter_mut().enumerate() {
+        if other_index == index {
+            continue;
+        }
+        if i64::from(other.left) >= old_right {
+            other.left = i32::try_from(i64::from(other.left) + dx)?;
+        }
+        if i64::from(other.top) >= old_bottom {
+            other.top = i32::try_from(i64::from(other.top) + dy)?;
+        }
+    }
+    layout.targets[index].width = width;
+    layout.targets[index].height = height;
+    Ok(layout)
+}
+
 impl State {
     pub(super) fn restore_layout(
         &self,
@@ -364,36 +402,7 @@ impl State {
         height: u32,
     ) -> Result<SavedTopology> {
         let current = Topology::query(true)?.snapshot()?;
-        let mut layout = current.clone();
-        let index = layout
-            .targets
-            .iter()
-            .position(|target| target.identity == identity)
-            .context("显示目标已断开")?;
-        let old = layout.targets[index].clone();
-        let (dx, dy) = (
-            i64::from(width) - i64::from(old.width),
-            i64::from(height) - i64::from(old.height),
-        );
-        let (old_right, old_bottom) = (
-            i64::from(old.left) + i64::from(old.width),
-            i64::from(old.top) + i64::from(old.height),
-        );
-        for (other_index, other) in layout.targets.iter_mut().enumerate() {
-            if other_index == index {
-                continue;
-            }
-            if i64::from(other.left) >= old_right {
-                other.left = i32::try_from(i64::from(other.left) + dx)?;
-            }
-            if i64::from(other.top) >= old_bottom {
-                other.top = i32::try_from(i64::from(other.top) + dy)?;
-            }
-        }
-        layout.targets[index].width = width;
-        layout.targets[index].height = height;
-        // The intent includes the same adjacent-output movement as RandR apply,
-        // so the recovery guard can restore the complete transaction.
+        let layout = plan_mode_resize(&current, identity, width, height)?;
         self.save_layout_intent(&current, &layout)?;
         Ok(current)
     }
@@ -500,4 +509,114 @@ pub(crate) fn recover_abandoned() -> Result<()> {
         recover(&path)?;
     }
     Ok(())
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    fn target(identity: &str, left: i32, top: i32, width: u32, height: u32) -> SavedTarget {
+        SavedTarget {
+            identity: identity.to_owned(),
+            source_group: "x11".to_owned(),
+            left,
+            top,
+            width,
+            height,
+            rotation: 0,
+            refresh_numerator: 60,
+            refresh_denominator: 1,
+            scan_line_ordering: 0,
+        }
+    }
+
+    fn before_layout() -> SavedTopology {
+        SavedTopology {
+            targets: vec![
+                target("DP-1", 0, 0, 1920, 1080),
+                target("DP-2", 1920, 0, 1920, 1080),
+                target("DP-3", 0, 1080, 1920, 1080),
+                target("DP-4", 1920, 1080, 1920, 1080),
+                target("DP-5", 4000, 1000, 1920, 1080),
+            ],
+        }
+    }
+
+    fn journal(before: &SavedTopology, after: &SavedTopology) -> Journal {
+        let mut changes = Vec::new();
+        record_changes(&mut changes, before, after);
+        Journal {
+            mode_changes: Some(changes),
+            owner_pid: 0,
+            owner_birth: 0,
+            retired: false,
+            token: String::new(),
+            baseline: before.clone(),
+            dpi: Vec::new(),
+            owned: Vec::new(),
+            super_baseline: None,
+            super_dpi: Vec::new(),
+            applied: None,
+            desired: Some(after.clone()),
+            applied_dpi: Vec::new(),
+            desired_dpi: Vec::new(),
+        }
+    }
+
+    fn geometry(layout: &SavedTopology, identity: &str) -> (i32, i32, u32, u32) {
+        let target = layout
+            .targets
+            .iter()
+            .find(|target| target.identity == identity)
+            .unwrap();
+        (target.left, target.top, target.width, target.height)
+    }
+
+    #[test]
+    fn failed_resize_restores_every_adjacent_output() {
+        let before = before_layout();
+        let after = plan_mode_resize(&before, "DP-1", 2560, 1440).unwrap();
+        assert_eq!(geometry(&after, "DP-2"), (2560, 0, 1920, 1080));
+        assert_eq!(geometry(&after, "DP-3"), (0, 1440, 1920, 1080));
+        assert_eq!(geometry(&after, "DP-4"), (2560, 1440, 1920, 1080));
+        assert_eq!(geometry(&after, "DP-5"), (4640, 1000, 1920, 1080));
+
+        let (restore, restored) = plan_restore(&journal(&before, &after), &before, &after, false);
+        assert_eq!(restored.len(), before.targets.len());
+        for original in &before.targets {
+            assert_eq!(
+                geometry(&restore, &original.identity),
+                (original.left, original.top, original.width, original.height,)
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_a_neighbor_changed_by_another_owner() {
+        let before = before_layout();
+        let after = plan_mode_resize(&before, "DP-1", 2560, 1440).unwrap();
+        let mut external = after.clone();
+        let neighbor = external
+            .targets
+            .iter_mut()
+            .find(|target| target.identity == "DP-2")
+            .unwrap();
+        neighbor.width = 3440;
+
+        let (restore, restored) =
+            plan_restore(&journal(&before, &after), &before, &external, false);
+        assert_eq!(restored.len(), before.targets.len() - 1);
+        assert!(!restored.iter().any(|identity| identity == "DP-2"));
+        assert_eq!(geometry(&restore, "DP-2"), geometry(&external, "DP-2"));
+        for original in before
+            .targets
+            .iter()
+            .filter(|target| target.identity != "DP-2")
+        {
+            assert_eq!(
+                geometry(&restore, &original.identity),
+                (original.left, original.top, original.width, original.height,)
+            );
+        }
+    }
 }
