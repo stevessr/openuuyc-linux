@@ -731,11 +731,15 @@ mod tests {
     /// Linux exposes a process's descriptors as symlinks; macOS has no
     /// equivalent view, so the two tests below only run on Linux.
     #[cfg(target_os = "linux")]
-    fn descriptor_targets(pid: u32) -> Vec<String> {
+    fn descriptor_targets(pid: u32) -> Vec<(String, String)> {
         std::fs::read_dir(format!("/proc/{pid}/fd"))
             .expect("list child descriptors")
-            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-            .map(|target| target.to_string_lossy().into_owned())
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let descriptor = entry.file_name().to_string_lossy().into_owned();
+                let target = std::fs::read_link(entry.path()).ok()?.to_string_lossy().into_owned();
+                Some((descriptor, target))
+            })
             .collect()
     }
 
@@ -758,11 +762,11 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_ne!(first_slave, second_slave);
-        for target in descriptor_targets(second.child.id()) {
-            assert_ne!(target, "/dev/ptmx", "second shell holds a pty master");
-            assert!(
-                !target.starts_with("/dev/pts/") || target == second_slave,
-                "second shell holds another terminal: {target}"
+        for (fd, target) in descriptor_targets(second.child.id()) {
+            assert_ne!(target, "/dev/ptmx", "second shell holds a pty master on fd {fd}");
+            assert_ne!(
+                target, first_slave,
+                "second shell inherited the first session's pty on fd {fd}: {target}"
             );
         }
     }

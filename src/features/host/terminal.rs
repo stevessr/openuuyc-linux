@@ -603,6 +603,15 @@ impl Sessions {
     /// [`Sessions::sweep`]）。编号从 [`LOCAL_HANDLE_BASE`] 起，与手机端
     /// 常用的小编号分开。
     pub(crate) fn create_local(&mut self, name: Option<String>) -> Result<u32, SessionError> {
+        let shell = Sessions::default_shell();
+        self.create_local_with_shell(name, &shell)
+    }
+
+    fn create_local_with_shell(
+        &mut self,
+        name: Option<String>,
+        shell: &str,
+    ) -> Result<u32, SessionError> {
         if self.sessions.len() >= MAX_TOTAL {
             return Err(SessionError::TooMany);
         }
@@ -619,9 +628,8 @@ impl Sessions {
         let handle = (LOCAL_HANDLE_BASE..u32::MAX)
             .find(|handle| !self.sessions.contains_key(&key(LOCAL_OWNER, *handle)))
             .unwrap_or(LOCAL_HANDLE_BASE);
-        let shell = Sessions::default_shell();
         // 尺寸只是占位：接上本地终端时 `attach_local` 会按那端改。
-        let pty = crate::platform::terminal::Session::open(&shell, 80, 24)
+        let pty = crate::platform::terminal::Session::open(shell, 80, 24)
             .map_err(|_| SessionError::Gone)?;
         let stamp = now_ms();
         self.sessions.insert(
@@ -2622,7 +2630,9 @@ mod tests {
     #[cfg_attr(not(target_os = "linux"), ignore = "local attach is Linux-only")]
     fn a_local_session_is_created_listed_and_kept() {
         let mut sessions = Sessions::default();
-        let handle = sessions.create_local(Some("mine".into())).expect("create");
+        let handle = sessions
+            .create_local_with_shell(Some("mine".into()), shell())
+            .expect("create");
         assert!(
             handle >= LOCAL_HANDLE_BASE,
             "local handles stay out of the controller's small numbers"
@@ -2654,7 +2664,9 @@ mod tests {
         assert!(exited.sessions.is_empty());
         assert!(abandoned.sessions.is_empty(), "kept after a local detach");
         assert_eq!(
-            sessions.create_local(Some("mine".into())).err(),
+            sessions
+                .create_local_with_shell(Some("mine".into()), shell())
+                .err(),
             Some(SessionError::DuplicateName)
         );
         // Once its shell exits, the sweep takes it out of the list.
@@ -2685,7 +2697,7 @@ mod tests {
     fn the_controller_can_take_over_a_local_session() {
         let mut sessions = Sessions::default();
         let handle = sessions
-            .create_local(Some("shared".into()))
+            .create_local_with_shell(Some("shared".into()), shell())
             .expect("create local");
         // 获准接入的主控用同一个编号 open，接上的是本机开的那个 shell，不是新的。
         let allowed = Owner::new("acct", true);
@@ -2705,12 +2717,21 @@ mod tests {
             "controller input reaches the local shell"
         );
 
-        // 本机接上同一会话时，看到的是同一份输出。
-        sessions
+        let (_, replay) = sessions
             .attach_local(handle, 100, 80, 24)
             .expect("attach local");
-        let local = local_output_until(&mut sessions, 100, "MOBILE-TO-LOCAL");
-        assert!(local.contains("MOBILE-TO-LOCAL"));
+        assert!(
+            String::from_utf8_lossy(&replay).contains("MOBILE-TO-LOCAL"),
+            "the local attach receives the current screen replay"
+        );
+        sessions
+            .write(allowed, handle, &line("echo REMOTE-TO-LOCAL-LIVE"))
+            .expect("write live output");
+        let local = local_output_until(&mut sessions, 100, "REMOTE-TO-LOCAL-LIVE");
+        assert!(
+            local.contains("REMOTE-TO-LOCAL-LIVE"),
+            "the local consumer receives fresh output"
+        );
     }
 
     #[test]
