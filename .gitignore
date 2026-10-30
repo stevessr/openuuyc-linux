@@ -22,6 +22,7 @@ captures/
 !/drivers/audio/UPSTREAM.md
 !/packaging/aur/README.md
 !/devtools/probes/README.md
+!/devtools/uuway-adaptation.md
 !**/LICENSE*.md
 !**/COPYING*.md
 !**/NOTICE*.md
