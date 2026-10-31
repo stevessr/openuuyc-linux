@@ -164,21 +164,37 @@ impl Session {
             let mut generation = 0;
             let mut previous = 0;
             let mut encoder: Option<super::encode::Encoder> = None;
+            // When the last real export frame arrived, for stall diagnostics.
+            let mut last_export = Instant::now();
             while let Some(session) = weak.upgrade() {
                 let began = Instant::now();
-                let (rate, source, attach_failure, epoch) = {
+                let (rate, source, attach_failure, epoch, mirrored) = {
                     let mut state = lock(&session.state);
-                    let attach_failure = state
-                        .attach
-                        .as_mut()
-                        .and_then(|attach| attach.observe_failure());
+                    // A dead helper reports its real failure; a live one that
+                    // cannot produce frames yet reports why, instead of leaving
+                    // the headset waiting without a reason. Both clear as soon
+                    // as a frame is really encoded.
+                    let attach_failure = match state.attach.as_mut() {
+                        None => None,
+                        Some(attach) => match attach.observe_failure() {
+                            Some(reason) => Some(reason),
+                            None => attach.observe_wait(),
+                        },
+                    };
                     let source = state
                         .export
                         .as_ref()
                         .filter(|_| state.head_valid && tracking_fresh(state.last))
                         .and_then(|export| export.file.try_clone().ok())
                         .map(|f| (state.generation, f));
-                    (state.video_rate, source, attach_failure, state.generation)
+                    let mirrored = state.attach.is_some();
+                    (
+                        state.video_rate,
+                        source,
+                        attach_failure,
+                        state.generation,
+                        mirrored,
+                    )
                 };
                 if let Some(reason) = attach_failure {
                     session.producer_status(epoch, Some(reason), false, false);
@@ -188,6 +204,7 @@ impl Session {
                         if epoch != generation {
                             generation = epoch;
                             previous = 0;
+                            last_export = Instant::now();
                             encoder = match super::encode::Encoder::new(epoch, rate.fps) {
                                 Ok(encoder) => Some(encoder),
                                 Err(error) => {
@@ -202,6 +219,7 @@ impl Session {
                                 }
                             };
                         }
+                        let mut new_frame = false;
                         let raw = match super::capture::read_latest(&file, previous) {
                             Ok(Some(raw)) if !super::capture::fresh(raw.predicted_time) => {
                                 previous = raw.sequence;
@@ -214,7 +232,11 @@ impl Session {
                                 );
                                 None
                             }
-                            Ok(raw) => raw,
+                            Ok(Some(raw)) => {
+                                new_frame = true;
+                                Some(raw)
+                            }
+                            Ok(None) => None,
                             Err(error) => {
                                 session.producer_status(
                                     epoch,
@@ -226,6 +248,23 @@ impl Session {
                                 None
                             }
                         };
+                        if new_frame {
+                            last_export = Instant::now();
+                        } else if !mirrored
+                            && last_export.elapsed() > Duration::from_secs(5)
+                            && super::capture::never_published(&file)
+                        {
+                            // The owned compositor has not written a single
+                            // complete frame: say so instead of only "waiting",
+                            // because the application is probably not rendering
+                            // on this runtime at all.
+                            session.producer_status(
+                                epoch,
+                                Some("合成器尚未导出任何双眼帧：目标应用可能未运行在内置 OpenXR 组件上，或尚未提交画面"),
+                                false,
+                                false,
+                            );
+                        }
                         let raw = raw.and_then(|raw| session.aligned_frame(epoch, raw));
                         if let Some(raw) = raw {
                             previous = raw.sequence;

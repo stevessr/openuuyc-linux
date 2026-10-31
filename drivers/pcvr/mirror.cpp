@@ -123,13 +123,28 @@ int main(int argc,char **argv) {
         std::signal(SIGINT,stop);std::signal(SIGTERM,stop);
         // Origin 1 must be aligned by the host before feeding a PICO LOCAL projection.
         oust_set_origin(1);
+        // A stalled attach must say why: the host mirrors these lines into its
+        // status so the headset shows a reason instead of waiting in silence.
+        auto began=std::chrono::steady_clock::now();
+        const char *waiting=nullptr;auto announced=began;
+        auto notice=[&](const char *reason) {
+            auto now=std::chrono::steady_clock::now();
+            if(waiting && !std::strcmp(waiting,reason) && now-announced<std::chrono::seconds(5)) return;
+            waiting=reason;announced=now;
+            auto seconds=std::chrono::duration_cast<std::chrono::seconds>(now-began).count();
+            std::printf("{\"wait\":\"%s\",\"seconds\":%lld}\n",reason,(long long)seconds);std::fflush(stdout);
+        };
         while(!stopped) {
             require(client.compositor->GetCurrentSceneFocusProcess()==scene,"scene changed; explicit reattachment required");
             vr::Compositor_FrameTiming before{};before.m_nSize=sizeof(before);
             // Wait for a newly presented frame instead of re-reading the same
             // one on a fixed delay: the compositor's own cadence paces us.
-            if(!client.compositor->GetFrameTiming(&before) || before.m_nFrameIndex==previous || (!before.m_HmdPose.bPoseIsValid || !before.m_HmdPose.bDeviceIsConnected) ||
-               client.compositor->GetLastFrameRenderer()!=scene) {SDL_Delay(2);continue;}
+            const char *reason=nullptr;
+            if(!client.compositor->GetFrameTiming(&before)) reason="frame-timing-unavailable";
+            else if(before.m_nFrameIndex==previous) reason="waiting-new-frame";
+            else if(!before.m_HmdPose.bPoseIsValid || !before.m_HmdPose.bDeviceIsConnected) reason="headset-pose-invalid";
+            else if(client.compositor->GetLastFrameRenderer()!=scene) reason="scene-renderer-not-focused";
+            if(reason) {notice(reason);SDL_Delay(2);continue;}
             if(!readback.read(left,width[0],height[0],eyes[0]) || !readback.read(right,width[1],height[1],eyes[1])) throw std::runtime_error("SteamVR mirror GPU readback failed");
             vr::Compositor_FrameTiming after{};after.m_nSize=sizeof(after);
             if(!client.compositor->GetFrameTiming(&after) || after.m_nFrameIndex!=before.m_nFrameIndex ||

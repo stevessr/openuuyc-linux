@@ -123,6 +123,25 @@ pub fn probe() -> Result<Probe> {
         .find_map(|line| serde_json::from_str::<Probe>(line).ok())
         .context("SteamVR probe returned no valid result")
 }
+/// A rate-limited "why is no frame arriving yet" notice from a live helper.
+/// `deny_unknown_fields` keeps attach/probe lines from ever parsing as one.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitLine {
+    wait: String,
+    #[serde(default, rename = "seconds")]
+    _seconds: u64,
+}
+/// Map a helper wait code. Unknown codes must never turn into a claim.
+fn wait_text(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "frame-timing-unavailable" => "SteamVR 合成器尚未提供帧计时：场景可能没有在提交帧",
+        "waiting-new-frame" => "等待 SteamVR 场景提交新帧",
+        "headset-pose-invalid" => "SteamVR 未提供有效头显姿态（HMD 未连接或未启用），无法配准坐标",
+        "scene-renderer-not-focused" => "聚焦场景尚未提交新帧：渲染进程与场景不一致",
+        _ => return None,
+    })
+}
 /// The helper's attach announcement, printed only after both GL mirror
 /// textures exist and the focused scene was accepted.
 #[derive(serde::Deserialize)]
@@ -160,6 +179,8 @@ pub(crate) struct Attach {
     stderr: Option<std::process::ChildStderr>,
     scene_pid: u32,
     failure: Option<&'static str>,
+    /// Last "why no frame arrives yet" notice from the still-running helper.
+    wait: std::sync::Arc<std::sync::Mutex<Option<(String, Instant)>>>,
 }
 impl Attach {
     pub(crate) fn start(export: &std::path::Path) -> Result<Self> {
@@ -186,6 +207,8 @@ impl Attach {
             .context("无法启动 SteamVR 镜像辅助程序")?;
         let stdout = child.stdout.take().context("mirror stdout missing")?;
         let stderr = child.stderr.take();
+        let wait = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = std::sync::Arc::clone(&wait);
         let (sender, receiver) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             use std::io::BufRead;
@@ -195,6 +218,13 @@ impl Attach {
                 .lines()
                 .map_while(|l| l.ok())
             {
+                // Store before forwarding, so a notice is already visible to
+                // the handshake loop by the time the next line reaches it.
+                if let Ok(notice) = serde_json::from_str::<WaitLine>(&line) {
+                    if let Ok(mut slot) = slot.lock() {
+                        *slot = Some((notice.wait, Instant::now()));
+                    }
+                }
                 let _ = sender.send(line);
             }
         });
@@ -203,6 +233,7 @@ impl Attach {
             stderr,
             scene_pid: 0,
             failure: None,
+            wait,
         };
         let deadline = Instant::now() + handshake;
         loop {
@@ -256,6 +287,17 @@ impl Attach {
             }
         }
         self.failure
+    }
+    /// `Some(reason)` while the live helper reports that it cannot produce
+    /// frames yet. The notice expires, so a stale line never explains a
+    /// current stall; a real encoded frame clears the reported reason.
+    pub(crate) fn observe_wait(&self) -> Option<&'static str> {
+        let slot = self.wait.lock().ok()?;
+        let (code, at) = slot.as_ref()?;
+        if at.elapsed() > Duration::from_secs(6) {
+            return None;
+        }
+        wait_text(code)
     }
     /// Call only after the helper ended (or after [`Self::stop`]).
     fn failure_text(&mut self) -> &'static str {
@@ -356,6 +398,34 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("握手超时"), "{error}");
     }
+    #[test]
+    fn wait_codes_map_and_unknown_ones_stay_silent() {
+        assert_eq!(
+            wait_text("headset-pose-invalid"),
+            Some("SteamVR 未提供有效头显姿态（HMD 未连接或未启用），无法配准坐标")
+        );
+        assert!(wait_text("frame-timing-unavailable").is_some());
+        assert!(wait_text("waiting-new-frame").is_some());
+        assert!(wait_text("scene-renderer-not-focused").is_some());
+        // Attach/probe lines and unknown codes must never read as a reason.
+        assert!(wait_text("attached").is_none());
+        assert!(wait_text("").is_none());
+    }
+    #[test]
+    fn a_live_helper_can_explain_why_no_frame_arrives_yet() {
+        let mut attach = Attach::spawn(
+            script(
+                r#"printf '{"wait":"waiting-new-frame","seconds":2}\n{"attached":true,"scene_pid":11}\n'; exec sleep 30"#,
+            ),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        // The notice precedes the handshake line, so the reader stored it
+        // before start() returned, and the helper is still alive.
+        assert_eq!(attach.observe_wait(), Some("等待 SteamVR 场景提交新帧"));
+        assert!(attach.observe_failure().is_none());
+        attach.stop();
+    }
 }
 /// Take this machine's single PCVR ownership lock (the same `publisher.lock`
 /// every backend takes) and create the mirror's private export inside 0700
@@ -403,10 +473,20 @@ pub fn attach_diagnostic() -> Result<()> {
     let mut previous = 0;
     let mut frames = 0u64;
     let mut last = Instant::now();
+    let mut reported_wait: Option<&'static str> = None;
     loop {
         std::thread::sleep(Duration::from_millis(20));
         if let Some(reason) = attach.observe_failure() {
             bail!("{reason}");
+        }
+        // The session status shows these too; the CLI prints the same reason
+        // when it changes, so a stalled attach is never a silent tail.
+        let waiting = attach.observe_wait();
+        if waiting != reported_wait {
+            if let Some(reason) = waiting {
+                println!("{}", serde_json::json!({"waiting": reason}));
+            }
+            reported_wait = waiting;
         }
         if let Ok(Some(raw)) = super::capture::read_latest(&export.file, previous) {
             previous = raw.sequence;

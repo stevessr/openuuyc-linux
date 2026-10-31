@@ -41,6 +41,13 @@ pub(crate) fn fresh(predicted_time: i64) -> bool {
             .saturating_add(now.tv_nsec),
     )
 }
+/// An export whose seqlock guard is still zero has never been published:
+/// distinguishing "no new frame yet" from "no producer ever wrote here".
+/// Read errors answer `false`, so a claim is never made from a failed read.
+pub(crate) fn never_published(file: &File) -> bool {
+    let mut guard = [0u8; 8];
+    file.read_exact_at(&mut guard, 0).is_ok() && u64::from_le_bytes(guard) == 0
+}
 pub(crate) fn read_latest(file: &File, previous: u64) -> Result<Option<RawFrame>> {
     let mut header = [0u8; HEADER];
     file.read_exact_at(&mut header, 0)?;
@@ -214,6 +221,20 @@ mod tests {
             .unwrap();
         file.write_all(&[5, 6, 7, 8]).unwrap();
         file
+    }
+    #[test]
+    fn an_export_no_producer_ever_wrote_is_distinguishable() {
+        // A published fixture (guard = 2) is not "never written".
+        assert!(!never_published(&fixture()));
+        // A fresh, all-zero export has published nothing yet.
+        let mut blank = fixture();
+        blank.seek(SeekFrom::Start(0)).unwrap();
+        blank.write_all(&[0u8; 8]).unwrap();
+        assert!(never_published(&blank));
+        // A publication in progress (odd guard) must not read as "never".
+        blank.seek(SeekFrom::Start(0)).unwrap();
+        blank.write_all(&3u64.to_le_bytes()).unwrap();
+        assert!(!never_published(&blank));
     }
     #[test]
     fn reads_both_eyes_and_reorders_pixels() {
