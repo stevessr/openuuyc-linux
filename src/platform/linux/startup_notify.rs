@@ -103,7 +103,8 @@ pub(super) mod x11 {
     }
 
     pub(in super::super) fn raise(window: u32, token: &str, show: impl FnOnce()) -> Result<()> {
-        let (connection, screen) = crate::platform::linux::x11_connection::connect().context("连接 X 服务器失败")?;
+        let (connection, screen) =
+            crate::platform::linux::x11_connection::connect().context("连接 X 服务器失败")?;
         let root = connection.setup().roots[screen].root;
         let atoms = Atoms::new(&connection)?.reply()?;
         let mapped = announce(&connection, &atoms, window, token)?;

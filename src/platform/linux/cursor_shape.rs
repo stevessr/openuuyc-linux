@@ -100,7 +100,8 @@ static SAMPLER: Mutex<Option<Connection>> = Mutex::new(None);
 fn sample<T>(read: impl FnOnce(&GetCursorImageAndNameReply) -> T) -> Result<T> {
     let mut sampler = SAMPLER.lock().unwrap_or_else(|e| e.into_inner());
     if sampler.is_none() {
-        let (connection, _) = crate::platform::linux::x11_connection::connect().context("连接 X11 显示失败")?;
+        let (connection, _) =
+            crate::platform::linux::x11_connection::connect().context("连接 X11 显示失败")?;
         connection
             .xfixes_query_version(4, 0)?
             .reply()

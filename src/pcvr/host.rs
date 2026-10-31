@@ -265,10 +265,8 @@ impl Session {
                             // complete frame: say so instead of only "waiting",
                             // because the application is probably not rendering
                             // on this runtime at all.
-                            let reason = stall_reason(
-                                mirrored,
-                                !super::capture::never_published(&file),
-                            );
+                            let reason =
+                                stall_reason(mirrored, !super::capture::never_published(&file));
                             if let Some(reason) = reason {
                                 session.producer_status(epoch, Some(reason), false, false);
                             }
@@ -449,9 +447,9 @@ impl Session {
                 .map(|attach| attach.observe_failure().is_none());
             match running(backend, live) {
                 Running::Confirm => return Ok(()),
-                Running::Refuse => anyhow::bail!(
-                    "当前 VR 连接已在运行（仅追踪）；请先停止再附加 SteamVR 场景"
-                ),
+                Running::Refuse => {
+                    anyhow::bail!("当前 VR 连接已在运行（仅追踪）；请先停止再附加 SteamVR 场景")
+                }
                 Running::Replace => {
                     // The helper ended; a repeated request swaps in a new one.
                     drop(state);
@@ -989,7 +987,7 @@ impl Session {
                             } else {
                                 "ended"
                             }
-                        },
+                        }
                     };
                     let observed = send_rate.sample(
                         state.generation,
@@ -1087,7 +1085,9 @@ mod stereo_async_tests {
         assert_eq!(stall_reason(true, true), None);
         assert_eq!(
             stall_reason(false, false),
-            Some("合成器尚未导出任何双眼帧：目标应用可能未运行在内置 OpenXR 组件上，或尚未提交画面")
+            Some(
+                "合成器尚未导出任何双眼帧：目标应用可能未运行在内置 OpenXR 组件上，或尚未提交画面"
+            )
         );
     }
     #[test]

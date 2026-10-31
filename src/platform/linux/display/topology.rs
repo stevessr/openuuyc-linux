@@ -161,7 +161,8 @@ pub(crate) struct Topology {
 }
 
 fn connect() -> Result<(RustConnection, Window)> {
-    let (connection, screen) = crate::platform::linux::x11_connection::connect().context("连接 X11 显示失败")?;
+    let (connection, screen) =
+        crate::platform::linux::x11_connection::connect().context("连接 X11 显示失败")?;
     let root = connection.setup().roots[screen].root;
     let version = connection
         .randr_query_version(1, 5)?

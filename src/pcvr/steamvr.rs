@@ -394,8 +394,7 @@ mod tests {
     }
     #[test]
     fn a_silent_helper_times_out_and_is_stopped() {
-        let error = Attach::spawn(script("exec sleep 30"), Duration::from_millis(250))
-            .unwrap_err();
+        let error = Attach::spawn(script("exec sleep 30"), Duration::from_millis(250)).unwrap_err();
         assert!(error.to_string().contains("握手超时"), "{error}");
     }
     #[test]

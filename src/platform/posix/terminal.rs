@@ -737,7 +737,10 @@ mod tests {
             .filter_map(|entry| {
                 let entry = entry.ok()?;
                 let descriptor = entry.file_name().to_string_lossy().into_owned();
-                let target = std::fs::read_link(entry.path()).ok()?.to_string_lossy().into_owned();
+                let target = std::fs::read_link(entry.path())
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned();
                 Some((descriptor, target))
             })
             .collect()
@@ -763,7 +766,10 @@ mod tests {
             .into_owned();
         assert_ne!(first_slave, second_slave);
         for (fd, target) in descriptor_targets(second.child.id()) {
-            assert_ne!(target, "/dev/ptmx", "second shell holds a pty master on fd {fd}");
+            assert_ne!(
+                target, "/dev/ptmx",
+                "second shell holds a pty master on fd {fd}"
+            );
             assert_ne!(
                 target, first_slave,
                 "second shell inherited the first session's pty on fd {fd}: {target}"
