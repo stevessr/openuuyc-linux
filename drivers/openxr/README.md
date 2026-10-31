@@ -274,3 +274,15 @@ An earlier test destroyed D3D resources before OpenVR shutdown and hung in
 cleanup. With corrected test resource ordering, the existing xrizer shuts down
 normally; an evaluated cleanup modification was not included in the installed
 bundle. D3D11 diagnostics are not VRChat gameplay or PICO decode/display evidence.
+
+### Local VRChat/Proton compatibility probe
+
+`tests/vrchat_local_probe.py` runs the real game on this machine with a synthetic
+device: it publishes OUCD/OUVR v2 calibration, a 1.6 m floor and hand poses into the
+private PCVR runtime directory, launches the app through Steam so its saved launch
+options apply, and verifies that the game reports its VR SDK initialized, that xrizer
+reaches a focused OpenXR session, and that complete OUST v2 exports keep arriving -
+then stops only the instance it started and removes only its own files. A dark menu
+scene yields identical eye pixels: the probe does not prove distinct-eye content,
+audio, haptics, input behaviour, or headset decode/projection, and its synthetic
+device is not the PICO device bridge.

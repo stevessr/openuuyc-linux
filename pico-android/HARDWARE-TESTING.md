@@ -371,6 +371,27 @@ and reachability still require headset validation.
   附加替换与 never-published 判定）。这些都不替代真实 PICO 头显解码/投影、真实
   游戏帧、延迟与配准观感的实机验收。
 
+### VRChat 本地兼容性自测（2026-10-31，非头显验收）
+- 方法：`drivers/openxr/tests/vrchat_local_probe.py` 在真实私有运行目录写合成设备
+  （OUXD v2 + OUVR v2：眼位/FOV 校准、1.6 m 地面 STAGE、头 + 两组 grip/aim，200 Hz
+  心跳），经 Steam 启动真实 VRChat（沿用该游戏已保存的启动选项：`XR_RUNTIME_JSON`
+  →内置组件、`VR_OVERRIDE`→xrizer、`OPENUUYC_STEREO_CAPTURE`→私有导出），只读观察
+  导出，随后只停止它自己启动的实例并删除自己创建的两个文件；不碰 `publisher.lock`。
+- 结果：VRChat 记录 `Initializing VRSDK` → `StartVRSDK: OpenVRLoader` →
+  `[SteamVR] Initialized`（10-30 那次的 `Init_InterfaceNotFound` 未复现）；xrizer 记录
+  `Creating OpenXR session with graphics API ... Vulkan`、`New session created!`、
+  `Received game texture, restarted session with new data`，会话状态
+  `SYNCHRONIZED → VISIBLE → FOCUSED`，双手映射到 oculus/touch_controller；合成器持续
+  导出完整 OUST v2（642×512/眼；序列号按设备声明的 72 Hz 前进，观察窗内 252 个采样、
+  序列 46564→57351 无中断），游戏干净退出。
+- 已知边界：当时场景是暗色菜单/加载画面，两眼中位像素完全相同，**未证明双眼内容差异**；
+  未测音频、震动与输入行为；未做头显解码/投影/延迟验收。合成设备不等于 PICO 设备桥。
+- 附带事实：注入停止后合成器仍继续导出（序列号继续前进），导出推进不依赖追踪新鲜度；
+  追踪新鲜度由主机生产端把关（见上文 producer-stage 条目）。
+- 遗留观察：`console-linux.txt` 反复出现
+  `WARN [wait_fence] Waiting on client fence timed out > 100ms!`，仓库内无该字符串来源，
+  疑在 xrizer/Monado 上游，出现频率与负载相关，待后续定位。
+
 ### OpenVR（SteamVR 既有场景）双眼镜像验收（实现已合入，未实机验收）
 - 前置：本机 SteamVR 已运行且有一个聚焦、正在提交帧的 VR 场景；本功能不会启动
   SteamVR 或游戏，也不会切换全局运行时。主机需已安装组件包（镜像 helper 内嵌在
