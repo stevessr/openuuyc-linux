@@ -358,6 +358,19 @@ and reachability still require headset validation.
 - File UI waits for CONTROL PB ECHO + open CONTROL/TEXT, rather than treating TEXT alone as readiness. Ended cached sessions are not reused. Refusal ACKs preserve a numeric remote code and are not misclassified as malformed signaling; diagnostics contain only ACK status/code, identifier-presence booleans and ICE-server count, never identifier values/credentials/peer messages.
 - 247 JVM tests, APK and Lint passed; installed on the connected PICO. The saved prior failure ended before peer creation with generic signaling parse failure; a fresh per-device user attempt is needed to validate the corrected roles and obtain any actual refusal code. No remote permission is bypassed.
 
+### PCVR 本地回归（2026-10-31，非实机验收）
+- 真实图形合成器 fixture 通过：`drivers/openxr/tests/stereo_render_fixture.py` +
+  `stereo_render_smoke.cpp` 以当前 active 组件 bundle 创建真实 OpenGL OpenXR 会话，
+  90 帧红/绿双眼经合成器回读为 OUST v2（642×512/眼，左红右绿）；本机用
+  `DISPLAY=:0` 与 `__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia`。
+- `device_fixture.py`、`controller_fixture.py`、`device_reattach_fixture.py` 通过：
+  注入头姿 (1,2,3) 可经 `xrLocateSpace` 读到、失效发布端不能新建设备；双手 action
+  路径含独立 grip/aim 与模拟量、追踪丢失即释放、40 字节 OUHP 震动含时长上限；
+  兼容新 inode 同会话重连、光学参数不兼容被拒。
+- 主机 `cargo test --lib`：315 通过 0 失败；PCVR 子集 53 通过（含等待原因映射、
+  附加替换与 never-published 判定）。这些都不替代真实 PICO 头显解码/投影、真实
+  游戏帧、延迟与配准观感的实机验收。
+
 ### OpenVR（SteamVR 既有场景）双眼镜像验收（实现已合入，未实机验收）
 - 前置：本机 SteamVR 已运行且有一个聚焦、正在提交帧的 VR 场景；本功能不会启动
   SteamVR 或游戏，也不会切换全局运行时。主机需已安装组件包（镜像 helper 内嵌在

@@ -81,6 +81,16 @@ enum MirrorStart {
 fn tracking_fresh(last: Option<Instant>) -> bool {
     last.is_some_and(|time| time.elapsed() < Duration::from_millis(250))
 }
+/// Why an export that has not delivered a frame for a while should be
+/// explained. A mirror has its own, more precise wait reasons and is never
+/// spoken for here; a claimed reason always names a never-published export
+/// instead of guessing that a slow scene is a broken one.
+fn stall_reason(mirrored: bool, published: bool) -> Option<&'static str> {
+    if mirrored || published {
+        return None;
+    }
+    Some("合成器尚未导出任何双眼帧：目标应用可能未运行在内置 OpenXR 组件上，或尚未提交画面")
+}
 fn video_recent(last: Option<(u32, Instant)>, generation: u32) -> bool {
     generation > 0
         && last.is_some_and(|(epoch, time)| {
@@ -250,20 +260,18 @@ impl Session {
                         };
                         if new_frame {
                             last_export = Instant::now();
-                        } else if !mirrored
-                            && last_export.elapsed() > Duration::from_secs(5)
-                            && super::capture::never_published(&file)
-                        {
+                        } else if last_export.elapsed() > Duration::from_secs(5) {
                             // The owned compositor has not written a single
                             // complete frame: say so instead of only "waiting",
                             // because the application is probably not rendering
                             // on this runtime at all.
-                            session.producer_status(
-                                epoch,
-                                Some("合成器尚未导出任何双眼帧：目标应用可能未运行在内置 OpenXR 组件上，或尚未提交画面"),
-                                false,
-                                false,
+                            let reason = stall_reason(
+                                mirrored,
+                                !super::capture::never_published(&file),
                             );
+                            if let Some(reason) = reason {
+                                session.producer_status(epoch, Some(reason), false, false);
+                            }
                         }
                         let raw = raw.and_then(|raw| session.aligned_frame(epoch, raw));
                         if let Some(raw) = raw {
@@ -1069,6 +1077,18 @@ mod stereo_async_tests {
         let unknown: ControlRequest =
             serde_json::from_str(r#"{"id":4,"op":"start","backend":"wivrn"}"#).unwrap();
         assert!(Requested::parse(Some(&unknown)).is_err());
+    }
+    #[test]
+    fn only_a_never_published_export_is_named_as_stalled() {
+        // A mirror speaks for itself (its own wait reasons), and an export
+        // that published before is merely waiting for the next frame.
+        assert_eq!(stall_reason(false, true), None);
+        assert_eq!(stall_reason(true, false), None);
+        assert_eq!(stall_reason(true, true), None);
+        assert_eq!(
+            stall_reason(false, false),
+            Some("合成器尚未导出任何双眼帧：目标应用可能未运行在内置 OpenXR 组件上，或尚未提交画面")
+        );
     }
     #[test]
     fn a_repeated_start_confirms_replaces_or_refuses_never_stacks() {
