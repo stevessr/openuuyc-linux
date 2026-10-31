@@ -96,3 +96,10 @@ secrets.json
 !/assets/drivers/display/OpenUUYCDisplay.cat
 !/assets/drivers/audio/OpenUUYCAudio.sys
 !/assets/drivers/audio/OpenUUYCAudio.cat
+
+# Android app build output and machine-local SDK path; sources and the
+# committed native project files stay versioned.
+pico-android/.gradle/
+pico-android/local.properties
+pico-android/**/build/
+pico-android/**/.cxx/
