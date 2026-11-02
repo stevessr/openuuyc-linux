@@ -643,6 +643,27 @@ pub(crate) fn open_in_terminal(session: u32) -> Result<()> {
     Ok(())
 }
 
+/// Open the official UU controller-side terminal in a real terminal emulator.
+/// Pass the already validated device ID as an argv item, never through a shell:
+/// device aliases/IDs must not become executable terminal commands.
+pub(crate) fn open_remote_in_terminal(device_id: &str) -> Result<()> {
+    crate::account::api::validate_device_id(device_id)?;
+    let exe = std::env::current_exe().context("找不到 OpenUUYC 可执行文件")?;
+    let (program, args) = terminal_emulator().context("找不到可用的系统终端模拟器")?;
+    let mut child = std::process::Command::new(&program)
+        .args(args)
+        .arg(exe)
+        .arg("remote-terminal")
+        .arg(device_id)
+        .spawn()
+        .with_context(|| format!("启动系统终端 {program} 失败"))?;
+    std::thread::Builder::new()
+        .name("UU remote terminal emulator".into())
+        .spawn(move || { let _ = child.wait(); })
+        .context("无法等待远程终端模拟器退出")?;
+    Ok(())
+}
+
 /// 在系统终端里重新运行本程序本身，再接上会话。
 ///
 /// 用当前可执行文件的路径而不是写死 `OpenUUYC`：便携运行、`cargo run` 和
