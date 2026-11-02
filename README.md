@@ -6,6 +6,25 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 
 后续计划支持 Linux 等其他平台，移植工作请先通过 [Issue](https://github.com/djkcyl/openuuyc/issues) 沟通。
 
+## UU 官方远程终端（主控端，实验性）
+
+本仓库现在额外提供 **作为主控端** 访问已绑定 UU Windows/macOS/Linux 被控机 Shell 的终端协议入口。该入口与「本机终端会话」以及桌面画面串流相互独立，使用 UU 的连接类型 8 和 BINARY_DATA_CHANNEL 上的 TERM v1 帧，而不是在本机启动一个 Shell。被控设备必须已经登录、在线并在自身设置中允许远程终端；不会自动夺取另一位主控的连接。
+
+```bash
+# 列出绑定设备，复制精确的别名或设备 ID
+OpenUUYC devices
+# 查看对方已有的终端会话
+OpenUUYC remote-terminal '工作电脑' --list
+# 新开一个远程 Shell
+OpenUUYC remote-terminal '工作电脑'
+# 接回列表中编号 17 的会话
+OpenUUYC remote-terminal '工作电脑' --attach 17
+```
+
+Linux/macOS 的交互式入口使用系统 TTY 原始模式，支持 ANSI 输出、Ctrl+C（发送给远端）、终端尺寸变更；按 **Ctrl+]** 分离而不结束远端 Shell。Windows 控制端目前使用本地标准控制台的行输入模式。网络异常/终端输出队列溢出时客户端报错退出，不静默丢弃终端输出；命令输入和远端屏幕内容不会写入诊断日志。普通退出发送非破坏性的 DETACH 而不是会杀死 Shell 的 CLOSE。
+
+**状态限制：** 已实现帧编码、流式解析、会话列表、新建/接回、终端收发以及交互式输入；尚未通过真实官方 Windows/macOS 被控端的完整远程认证、会话、回显和断线恢复测试。不同 UU 客户端版本对 OPEN_RESP、会话编号及 TERM 的行为可能不同，不能把本地单测当作官方互通测试。此功能还没有集成到 GUI 的远程设备菜单。
+
 ## 下载与使用
 
 从 [Releases](https://github.com/djkcyl/openuuyc/releases) 下载 Windows x64 客户端，扫码或短信登录后连接设备，支持 UU 官方客户端；无需登录也可在登录页开启“接受远程协助”。
