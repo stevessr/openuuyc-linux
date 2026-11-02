@@ -358,6 +358,7 @@ pub struct StreamControlHandle {
     network: crate::features::network_control::NetworkControl,
     shared: Arc<Mutex<StreamControlState>>,
     outgoing: mpsc::UnboundedSender<OutgoingControlMessage>,
+    window_extension: Arc<Mutex<window_extension::State>>,
     echo_responses: mpsc::UnboundedSender<Vec<u8>>,
     protocol_changed: Arc<Notify>,
 }
@@ -628,6 +629,7 @@ impl StreamControlHandle {
                 cursor,
                 audio,
                 network: crate::features::network_control::NetworkControl::new(),
+                window_extension: Arc::new(Mutex::new(window_extension::State::default())),
                 shared: Arc::new(Mutex::new(state)),
                 outgoing,
                 echo_responses,
@@ -983,3 +985,4 @@ mod settings;
 mod tracks;
 mod wire;
 pub(crate) use wire::encode_touch_input;
+mod window_extension;

@@ -1,0 +1,33 @@
+name: Private window control
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: private-window-control-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native assembler when needed
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress
+            "$env:ProgramFiles\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+      - name: Check Windows host and viewer code
+        run: cargo check --locked --lib
+      - name: Unit-test private window protocol
+        run: cargo test --locked --lib window_control
+      - name: Unit-test controller request lifecycle
+        run: cargo test --locked --lib stream_control::window_extension

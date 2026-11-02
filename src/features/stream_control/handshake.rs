@@ -31,6 +31,9 @@ impl StreamControlHandle {
     }
 
     pub(crate) fn set_data_channel_open(&self, label: &str, open: bool) {
+        if !open && matches!(label, "TEXT_DATA_CHANNEL" | "CONTROL_DATA_CHANNEL") {
+            self.window_control_disconnect();
+        }
         if label == "TEXT_DATA_CHANNEL" && !open {
             self.disconnect_audio_quality();
         }

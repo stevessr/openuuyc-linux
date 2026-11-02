@@ -36,6 +36,7 @@ enum Page {
     Mouse,
     DisplayAspect,
     Display,
+    Windows,
 }
 
 impl Page {
@@ -50,6 +51,7 @@ impl Page {
             Self::Mouse => "鼠标模式",
             Self::DisplayAspect => "本地显示比例",
             Self::Display => "显示设置",
+            Self::Windows => "远端窗口",
         }
     }
 }
@@ -626,7 +628,7 @@ pub(super) fn show_stream_control_window(
             ui.horizontal(|ui| {
                 if state.page != Page::Quality {
                     back =
-                        icon_button(ui, Icon::Back, if matches!(state.page, Page::Mouse | Page::Microphone | Page::DisplayAspect) { "返回高级设置" } else { "返回画质菜单；未应用的修改会取消" }).clicked();
+                        icon_button(ui, Icon::Back, if matches!(state.page, Page::Mouse | Page::Microphone | Page::DisplayAspect | Page::Windows) { "返回高级设置" } else { "返回画质菜单；未应用的修改会取消" }).clicked();
                 }
                 let title = if state.page == Page::Display {
                     "显示设置".to_owned()
@@ -940,6 +942,13 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                 if menu_row(ui, "本地显示比例", label, None, true, true).clicked() {
                                     state.page = Page::DisplayAspect;
                                 }
+                                if menu_row(ui, "远端窗口", "私有拓展", None, true, true)
+                                    .on_hover_text("两端均需为 OpenUUYC，被控端必须本机安装并允许窗口拓展；选择窗口会将其切到前台")
+                                    .clicked()
+                                {
+                                    state.page = Page::Windows;
+                                    state.local_error = handle.request_remote_windows().err().map(|e| e.to_string());
+                                }
                                 if menu_row(ui, "仅音频模式", "关闭画面", None, true, false).on_hover_text("关闭此设备会话的所有画面，继续播放声音").clicked() {
                                     handle.request_audio_only(true);
                                     state.open = false;
@@ -1043,6 +1052,42 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                                     .clicked()
                                 {
                                     view.send_ctrl_alt_del = true;
+                                }
+                            });
+                    }
+                    Page::Windows => {
+                        let windows = handle.window_snapshot();
+                        if ui.button("刷新远端窗口").clicked() {
+                            state.local_error = handle.request_remote_windows().err().map(|e| e.to_string());
+                        }
+                        if windows.pending {
+                            ui.label(RichText::new("等待远端窗口列表或操作回执…").color(MUTED));
+                        }
+                        if let Some(error) = windows.error.as_deref() {
+                            ui.label(RichText::new(error).color(MUTED));
+                        }
+                        egui::ScrollArea::vertical()
+                            .id_salt("private-remote-window-list")
+                            .max_height((ctx.content_rect().height() - 195.0).max(140.0))
+                            .show(ui, |ui| {
+                                for window in &windows.windows {
+                                    let label = if window.application.is_empty() {
+                                        window.title.clone()
+                                    } else {
+                                        format!("{} · {}", window.application, window.title)
+                                    };
+                                    let label = if window.focused {
+                                        format!("● {label}")
+                                    } else { label };
+                                    if ui.add_enabled(!windows.pending, egui::Button::new(label))
+                                        .on_hover_text(&window.id).clicked()
+                                    {
+                                        state.local_error = handle.focus_remote_window(&window.id)
+                                            .err().map(|e| e.to_string());
+                                    }
+                                }
+                                if windows.windows.is_empty() && !windows.pending && windows.error.is_none() {
+                                    ui.label(RichText::new("暂无窗口。点击刷新以请求远端列表。").color(MUTED));
                                 }
                             });
                     }
@@ -1298,7 +1343,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
     if back {
         state.page = if matches!(
             state.page,
-            Page::Mouse | Page::Microphone | Page::DisplayAspect
+            Page::Mouse | Page::Microphone | Page::DisplayAspect | Page::Windows
         ) {
             Page::Advanced
         } else {

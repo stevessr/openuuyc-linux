@@ -200,6 +200,31 @@ pub(super) async fn bind_channel(
                 }
                 return;
             }
+            // This is a private OpenUUYC-to-OpenUUYC extension, carried only
+            // on the authenticated TEXT data channel. It cannot be interpreted
+            // as an official UU command, and no action runs in the RTC callback.
+            if text && crate::features::window_control::is_packet(&message.data) {
+                if message.data.len() > crate::features::window_control::MAX_PACKET_BYTES {
+                    return;
+                }
+                let permission = input.clone();
+                let packet = message.data.to_vec();
+                let response = tokio::task::spawn_blocking(move || {
+                    crate::features::window_control::serve(
+                        &packet,
+                        permission.window_control_permitted(),
+                    )
+                })
+                .await;
+                if !cancel.is_cancelled()
+                    && let Ok(Some(reply)) = response
+                    && !reply.is_empty()
+                    && let Err(error) = channel.send_text_bytes(&Bytes::from(reply)).await
+                {
+                    tracing::warn!(%error, "private window response failed");
+                }
+                return;
+            }
             if (text || file) && crate::protocol::drag_drop::is_packet(&message.data) {
                 let result = if file {
                     clipboard.receive_file(&channel, &message.data)

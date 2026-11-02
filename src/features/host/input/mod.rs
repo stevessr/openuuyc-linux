@@ -254,6 +254,13 @@ impl Receiver {
         self.enqueue(Some(stream), event);
         Ok(true)
     }
+    /// A private extension is allowed only while the input binding is alive,
+    /// the authorized host lease is current, and the input generation is sound.
+    pub(crate) fn window_control_permitted(&self) -> bool {
+        let gate = lock(&self.shared.gate);
+        gate.stream.is_some() && !gate.faulted && self.shared.permitted()
+    }
+
     pub fn receive_action(&self, bytes: &[u8]) -> Result<bool> {
         if bytes.len() > wire::MAX_MESSAGE || bytes.first() == Some(&b'{') {
             return Ok(false);

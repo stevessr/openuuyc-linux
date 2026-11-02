@@ -177,6 +177,11 @@ enum Commands {
         #[command(subcommand)]
         command: PicoVrCommand,
     },
+    /// 为当前用户安装/移除私有窗口远控拓展（无需管理员权限）
+    WindowExtension {
+        #[arg(value_enum)]
+        action: WindowExtensionAction,
+    },
     #[command(hide = true)]
     PluginVideoHost,
 
@@ -233,6 +238,13 @@ enum Commands {
         #[arg(long)]
         force_takeover: bool,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum WindowExtensionAction {
+    Enable,
+    Disable,
+    Status,
 }
 
 fn main() -> Result<()> {
@@ -414,6 +426,24 @@ fn main() -> Result<()> {
         }
         Commands::Terminal { session, list, new } => {
             openuuyc::application::terminal_attach(session.as_deref(), list, new)
+        }
+        Commands::WindowExtension { action } => {
+            match action {
+                WindowExtensionAction::Enable => {
+                    openuuyc::features::window_control::set_enabled(true)?;
+                    println!("当前用户已启用窗口拓展；现有远控连接仍须获得正常授权。");
+                }
+                WindowExtensionAction::Disable => {
+                    openuuyc::features::window_control::set_enabled(false)?;
+                    println!("当前用户已禁用窗口拓展。");
+                }
+                WindowExtensionAction::Status => {
+                    println!("{}", if openuuyc::features::window_control::enabled() {
+                        "enabled"
+                    } else { "disabled" });
+                }
+            }
+            Ok(())
         }
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),
         #[cfg(target_os = "linux")]

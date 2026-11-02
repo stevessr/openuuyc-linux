@@ -7,7 +7,7 @@ pub(crate) use windows::{
     audio_thread, capture, cursor_shape, decoder, device_profile, display, display_hdr, drag_drop,
     encoder, file_locations, graphics, host_service, input::deadline, loopback, notifications,
     power_request, surface, swapchain, system_power, terminal, transfer, video_shader,
-    virtual_audio, wol,
+    virtual_audio, wol, window_control,
 };
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
@@ -15,7 +15,7 @@ pub(crate) mod linux;
 pub(crate) use linux::{
     audio_thread, capture, cursor_shape, deadline, decoder, device_profile, display, display_hdr,
     drag_drop, encoder, file_locations, graphics, host_service, loopback, notifications,
-    power_request, surface, system_power, terminal, transfer, virtual_audio, virtual_display, wol,
+    power_request, surface, system_power, terminal, transfer, virtual_audio, virtual_display, wol, window_control,
 };
 // The pty half of the terminal is identical on both, so it lives in one place
 // and each platform re-exports it. The rest of the macOS platform does not

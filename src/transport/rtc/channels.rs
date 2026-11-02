@@ -260,6 +260,10 @@ impl DataChannels {
                     if local_channel && let Some(channel)=drag_channel.upgrade() {
                         if let Err(error) = stream_control.drag_drop().receive(&channel, &message.data, label == "FILE_DATA_CHANNEL") { tracing::warn!(%error,"invalid native drag message"); }
                     }
+                } else if label == "TEXT_DATA_CHANNEL" && crate::features::window_control::is_packet(&message.data) {
+                    if let Err(error) = stream_control.receive_window_reply(&message.data) {
+                        tracing::warn!(%error, "private window response rejected");
+                    }
                 } else if label == "TEXT_DATA_CHANNEL" && crate::protocol::annotation::is_packet(&message.data) {
                     if let Err(error)=stream_control.handle_native_annotation(&message.data) {tracing::warn!(%error,"invalid native annotation message");}
                 } else if matches!(label.as_str(), "TEXT_DATA_CHANNEL" | "FILE_DATA_CHANNEL") && !message.data.starts_with(b"{")

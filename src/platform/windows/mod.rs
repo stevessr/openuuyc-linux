@@ -38,6 +38,7 @@ pub(crate) mod terminal;
 pub(crate) mod transfer;
 pub(crate) mod virtual_audio;
 pub(crate) mod wol;
+pub(crate) mod window_control;
 
 use crate::media::encoding as format;
 use crate::media::encoding::rate as encoder_rate;

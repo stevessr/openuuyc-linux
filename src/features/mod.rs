@@ -13,3 +13,4 @@ pub mod stream_control;
 pub(crate) mod viewing_settings;
 
 pub(crate) mod remote_terminal;
+pub mod window_control;

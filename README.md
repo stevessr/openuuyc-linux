@@ -70,6 +70,22 @@ Linux/macOS 的交互式入口使用系统 TTY 原始模式，支持 ANSI 输出
 
 支持本机导出及远端获取脱敏诊断包（ZIP / zstd，最多 32 MiB）；远端获取需双方 beta.3+，并开启被控端文件访问权限。
 
+## Windows / niri 私有窗口远控拓展
+
+两端均为 OpenUUYC 时，可在被控端由当前桌面用户显式启用私有窗口拓展：
+
+```sh
+OpenUUYC window-extension enable   # 安装/启用（不需要管理员权限）
+OpenUUYC window-extension status   # 查询状态
+OpenUUYC window-extension disable  # 撤销
+```
+
+主控远控窗口 → 高级设置 → **远端窗口** 可查询并激活 Windows 顶层窗口或
+niri 原生窗口（`NIRI_SOCKET`）。该功能经现有已授权会话的私有 TEXT 消息交换，
+不会在网络上另开服务或兼容官方 UU 客户端。**目前只提供窗口选择/聚焦，不提供
+单窗口专属画面或窗口级键鼠隔离**。详细权限和验收说明：
+[私有窗口拓展](extensions/window-control/README.md)。
+
 ## Windows / Linux 功能矩阵
 
 对照本分支（v1.0.2-beta.5 加 Linux 移植）在两个平台、两种角色下的能力；功能有增减时同步更新这张表。✅ 支持，⚠️ 部分支持或有前提，❌ 不支持，— 该角色不涉及。Linux 的安装、权限与运行前提见[构建 → Linux](#linux)。

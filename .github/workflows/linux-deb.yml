@@ -56,6 +56,8 @@ jobs:
 
       - name: Test UU remote terminal controller protocol
         run: cargo test --release --locked --lib session::controller::terminal::tests
+      - name: Test private window control (including niri IPC parser)
+        run: cargo test --locked --lib window_control
 
       - name: Test the virtual display helper
         # 它有自己的 workspace，根目录的 cargo fmt 与 cargo test 都管不到它。

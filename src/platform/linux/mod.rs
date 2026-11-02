@@ -39,3 +39,4 @@ pub(crate) mod virtual_display;
 pub(crate) mod wol;
 
 pub(crate) mod x11_connection;
+pub(crate) mod window_control;
