@@ -159,13 +159,30 @@ impl Drop for ReportTask {
         self.task.abort();
     }
 }
+fn registration_already_recorded(
+    last_registered: Option<&LanInfo>,
+    info: &LanInfo,
+    force: bool,
+) -> bool {
+    !force && last_registered == Some(info)
+}
+
+fn remember_registration(
+    last_registered: &mut Option<LanInfo>,
+    info: &LanInfo,
+    result: &Result<bool>,
+) {
+    if result.is_ok() {
+        *last_registered = Some(info.clone());
+    }
+}
 async fn run(client: HostClient, mut requests: mpsc::Receiver<Queued>, stop: CancellationToken) {
     let handle = client.host.wol.clone();
     let ended = client.ended();
     let changes = handle.0.network.clone();
     let mut watcher: Option<network::Watcher> = None;
     let mut dirty = true;
-    let mut last_attempt: Option<LanInfo> = None;
+    let mut last_registered: Option<LanInfo> = None;
     let mut report: Option<ReportTask> = None;
     let mut status = Status::default();
     let mut recent: VecDeque<(Target, Instant)> = VecDeque::new();
@@ -180,7 +197,7 @@ async fn run(client: HostClient, mut requests: mpsc::Receiver<Queued>, stop: Can
             if !allowed(&client, revision, &stop) {
                 report = None;
                 watcher = None;
-                last_attempt = None;
+                last_registered = None;
                 recent.clear();
                 while requests.try_recv().is_ok() {}
                 status = Status {
@@ -224,7 +241,7 @@ async fn run(client: HostClient, mut requests: mpsc::Receiver<Queued>, stop: Can
                         return Ok(());
                     }
                     report = None;
-                    if !force && last_attempt.as_ref() == Some(&info) {
+                    if registration_already_recorded(last_registered.as_ref(), &info, force) {
                         status.reporting = false;
                         return Ok(());
                     }
@@ -246,7 +263,7 @@ async fn run(client: HostClient, mut requests: mpsc::Receiver<Queued>, stop: Can
                 .await;
                 if let Err(e) = result {
                     report = None;
-                    last_attempt = None;
+                    last_registered = None;
                     status.network = None;
                     status.interface_name = None;
                     status.support_wol = None;
@@ -272,12 +289,24 @@ async fn run(client: HostClient, mut requests: mpsc::Receiver<Queued>, stop: Can
             result=async {match &mut report {Some(r)=>(&mut r.task).await,None=>std::future::pending().await}}=>{
                 let completed=report.take().unwrap();
                 if allowed(&client,completed.revision,&stop)&&completed.network_revision==changes.revision.load(Ordering::Acquire) {
-                    last_attempt=Some(completed.info.clone());status.reporting=false;
-                    match result.map_err(|_|anyhow::anyhow!("网络登记任务中断")).and_then(|r|r) {
-                        Ok(supported)=>{status.support_wol=Some(supported);status.registered_at=Some(chrono::Utc::now().timestamp());status.message="局域网信息已登记".into();status.error=None;},
-                        Err(error)=>{status.message="局域网登记未完成".into();status.error=Some(error.to_string());}
+                    status.reporting = false;
+                    let result = result
+                        .map_err(|_| anyhow::anyhow!("网络登记任务中断"))
+                        .and_then(|r| r);
+                    remember_registration(&mut last_registered, &completed.info, &result);
+                    match result {
+                        Ok(supported) => {
+                            status.support_wol = Some(supported);
+                            status.registered_at = Some(chrono::Utc::now().timestamp());
+                            status.message = "局域网信息已登记".into();
+                            status.error = None;
+                        }
+                        Err(error) => {
+                            status.message = "局域网登记未完成".into();
+                            status.error = Some(error.to_string());
+                        }
                     }
-                    client.host.wol_status(completed.revision,status.clone());
+                    client.host.wol_status(completed.revision, status.clone());
                 } else {dirty=true;}
             },
             request=requests.recv()=>{
@@ -302,5 +331,48 @@ async fn run(client: HostClient, mut requests: mpsc::Receiver<Queued>, stop: Can
                 client.host.wol_status(request.revision,status.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LanInfo, registration_already_recorded, remember_registration};
+
+    #[test]
+    fn a_failed_registration_can_be_retried_but_success_is_deduplicated() {
+        let info = LanInfo {
+            mac: "00:11:22:33:44:55".into(),
+            inner_ip: "192.0.2.10".into(),
+            subnet_mask: "255.255.255.0".into(),
+        };
+        let mut last_registered = None;
+
+        assert!(!registration_already_recorded(
+            last_registered.as_ref(),
+            &info,
+            false
+        ));
+        remember_registration(
+            &mut last_registered,
+            &info,
+            &Err(anyhow::anyhow!("transient failure")),
+        );
+        assert!(!registration_already_recorded(
+            last_registered.as_ref(),
+            &info,
+            false
+        ));
+
+        remember_registration(&mut last_registered, &info, &Ok(false));
+        assert!(registration_already_recorded(
+            last_registered.as_ref(),
+            &info,
+            false
+        ));
+        assert!(!registration_already_recorded(
+            last_registered.as_ref(),
+            &info,
+            true
+        ));
     }
 }

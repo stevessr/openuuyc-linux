@@ -297,6 +297,8 @@ pub(super) fn decoder_manager(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
+        #[cfg(target_os = "linux")]
+        super::pico_bridge::publish(&frame);
         let completion = frame.completion.clone();
         let submitted_at = Instant::now();
         let frame_id = frame.frame_id;

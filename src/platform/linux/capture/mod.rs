@@ -22,7 +22,7 @@ mod portal;
 mod wlr_screencopy;
 mod x11;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -131,12 +131,24 @@ pub(crate) struct Frame {
 /// The active RandR outputs, in the protocol's terms. The identity is the
 /// one the display topology uses, so screens and targets pair up exactly.
 pub(crate) fn screens() -> Result<Vec<Screen>> {
-    // Monitors come from RandR, which XWayland also provides on Wayland.
-    ensure!(
-        std::env::var_os("DISPLAY").is_some(),
-        "没有 X11 显示（DISPLAY 未设置），无法枚举显示器"
-    );
-    let monitors = super::display::topology::Topology::query(true)?.monitors();
+    let monitors = match super::display::topology::Topology::query(true).and_then(|topology| {
+        let monitors = topology.monitors();
+        ensure!(!monitors.is_empty(), "没有检测到 X11 显示器");
+        Ok(monitors)
+    }) {
+        Ok(monitors) => monitors,
+        Err(error) if wayland_session() => {
+            if let Some(layout) = super::display::compositor_layout_soon() {
+                let screens = wayland_screens(&layout)?;
+                if !screens.is_empty() {
+                    tracing::warn!(error=%format!("{error:#}"),"X11 inventory unavailable; falling back to compositor screen descriptions");
+                    return Ok(screens);
+                }
+            }
+            return Err(error).context("X11 和 Wayland 屏幕清单均不可用");
+        }
+        Err(error) => return Err(error),
+    };
     ensure!(!monitors.is_empty(), "没有检测到显示器");
     monitors
         .into_iter()
@@ -160,6 +172,41 @@ pub(crate) fn screens() -> Result<Vec<Screen>> {
             })
         })
         .collect()
+}
+
+// Use real compositor logical rectangles as a reduced-capability fallback,
+// never invented physical modes or an arbitrary 1920x1080 desktop.
+fn wayland_screens(layout: &crate::platform::CompositorLayout) -> Result<Vec<Screen>> {
+    let mut found = Vec::new();
+    for output in &layout.outputs {
+        let Some(name) = output.name.as_deref().filter(|n| !n.is_empty()) else {
+            continue;
+        };
+        if output.width == 0
+            || output.height == 0
+            || found.iter().any(|s: &Screen| s.device_name == name)
+        {
+            continue;
+        }
+        let identity = super::display::topology::identity(name);
+        found.push(Screen {
+            id: super::display::source_id(&identity)?,
+            device_name: name.into(),
+            display_name: format!("{name} · Wayland"),
+            width: output.width,
+            height: output.height,
+            left: output.left,
+            top: output.top,
+            primary: found.is_empty(),
+            fps: 60,
+            dpi_scale: None,
+            hdr: false,
+            adapter: 0,
+            render_adapter: None,
+            identity: Some(identity),
+        });
+    }
+    Ok(found)
 }
 
 /// Whether this is a Wayland session, where X11 sees only XWayland clients.
@@ -886,5 +933,34 @@ mod stage_tests {
             ts.as_secs_f64() * 1000.0 / f64::from(n),
             tc.as_secs_f64() * 1000.0 / f64::from(n)
         );
+    }
+}
+
+#[cfg(test)]
+mod screen_fallback_tests {
+    use super::*;
+    #[test]
+    fn compositor_fallback_preserves_real_names_geometry_and_stable_identity() {
+        let output = crate::platform::CompositorOutput {
+            name: Some("DP-1".into()),
+            left: -1920,
+            top: 12,
+            width: 1920,
+            height: 1080,
+            rotation: Default::default(),
+        };
+        let layout = crate::platform::CompositorLayout {
+            outputs: vec![output.clone(), output],
+        };
+        let screens = wayland_screens(&layout).unwrap();
+        assert_eq!(screens.len(), 1);
+        assert_eq!(screens[0].left, -1920);
+        assert_eq!(screens[0].width, 1920);
+        assert_eq!(screens[0].identity.as_deref(), Some("x11/DP-1"));
+        assert!(!screens[0].hdr);
+    }
+    #[test]
+    fn missing_outputs_do_not_become_a_fake_default_monitor() {
+        assert!(wayland_screens(&Default::default()).unwrap().is_empty());
     }
 }

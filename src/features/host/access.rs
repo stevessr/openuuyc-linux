@@ -1177,6 +1177,15 @@ impl Lease {
             update_media_summary(&mut state.status);
         }
     }
+    pub(crate) fn audio_refresh_rate(&self) -> u32 {
+        lock(&self.handle.ownership)
+            .status
+            .streams
+            .values()
+            .filter_map(|stream| stream.video.map(|video| video.fps))
+            .max()
+            .unwrap_or(60)
+    }
     pub(crate) fn video(&self, encoding: Option<ActiveEncoding>) {
         self.modify(|state| {
             state.status.streams.entry(self.track).or_default().video = encoding;
@@ -1307,6 +1316,19 @@ impl Lease {
                 && state.port_mapping,
             state.port_revision,
         )
+    }
+    pub(crate) fn app_launch_allowed(&self) -> bool {
+        let state = lock(&self.handle.ownership);
+        self.current(&state)
+            && self.assistance.is_none()
+            && !self.handle.guest
+            && (state.terminal || super::quick_apps::launch_allowed())
+    }
+    /// Read-only installed-app inventory for the currently authorized owner.
+    /// Launching still requires the separate terminal grant.
+    pub(crate) fn app_catalog_allowed(&self) -> bool {
+        let state = lock(&self.handle.ownership);
+        self.current(&state) && self.assistance.is_none() && !self.handle.guest
     }
     /// Whether this lease may open a shell on the controlled machine.
     ///

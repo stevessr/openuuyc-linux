@@ -14,7 +14,7 @@ use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 
 const RATE: u32 = 48_000;
-const BLOCK: usize = 480;
+const BLOCK: usize = crate::media::audio::sender::BLOCK;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())

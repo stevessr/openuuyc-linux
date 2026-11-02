@@ -9,7 +9,7 @@
 //! frame carries a [`SurfaceLease`] instead: it names the pool slot and returns
 //! it when the renderer is done with the picture. The slot is not reusable
 //! until then, which is why the pool reserves headroom for exported frames.
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -25,13 +25,7 @@ pub(crate) struct Plane {
 impl Plane {
     /// Duplicates the handle: `texture_from_dmabuf_fd` consumes its fd.
     pub(crate) fn dup(&self) -> std::io::Result<OwnedFd> {
-        // Safe: the raw fd is owned by `self.fd` and stays open across the call.
-        let raw = unsafe { libc::dup(self.fd.as_raw_fd()) };
-        if raw < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // Safe: `dup` returned a fresh descriptor we now own.
-        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        self.fd.try_clone()
     }
 }
 
@@ -62,17 +56,24 @@ impl DmabufFrame {
 /// Keeps a decoded surface out of the decoder pool until the last clone drops.
 #[derive(Clone, Debug)]
 pub(crate) struct SurfaceLease {
+    _inner: Arc<SurfaceLeaseInner>,
+}
+
+#[derive(Debug)]
+struct SurfaceLeaseInner {
     returned: Arc<Mutex<Vec<usize>>>,
     index: usize,
 }
 
 impl SurfaceLease {
     pub(crate) fn new(returned: Arc<Mutex<Vec<usize>>>, index: usize) -> Self {
-        Self { returned, index }
+        Self {
+            _inner: Arc::new(SurfaceLeaseInner { returned, index }),
+        }
     }
 }
 
-impl Drop for SurfaceLease {
+impl Drop for SurfaceLeaseInner {
     fn drop(&mut self) {
         // A poisoned lock only means some other thread panicked; the surface is
         // still ours to hand back, so ignore the poison.
@@ -97,21 +98,42 @@ static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 /// Records that importing an exported buffer failed.
 pub(crate) fn mark_unsupported() {
     if !UNSUPPORTED.swap(true, Ordering::Relaxed) {
-        tracing::warn!("dmabuf 导入不可用，回退到 CPU 回读路径");
+        tracing::warn!("dmabuf 零拷贝不可用，回退到 CPU 回读路径");
     }
 }
 
-/// Whether the zero-copy path is enabled: opt in with `OPENUUYC_ZEROCOPY=1`.
-///
-/// Off by default until it is verified beyond the Intel (i965) machine it was
-/// written on: NVIDIA's VA driver exports differently tiled buffers, and a
-/// wrong import shows a corrupted picture rather than an error.
+/// Prefer zero-copy automatically; explicit false values retain a diagnostic
+/// escape hatch for drivers that accept imports but display corrupt pixels.
 pub(crate) fn enabled() -> bool {
-    if UNSUPPORTED.load(Ordering::Relaxed) {
-        return false;
+    !UNSUPPORTED.load(Ordering::Relaxed)
+        && requested(std::env::var("OPENUUYC_ZEROCOPY").ok().as_deref())
+}
+
+fn requested(value: Option<&str>) -> bool {
+    !matches!(value, Some("0" | "false" | "no" | "off"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_by_default_with_explicit_opt_out() {
+        assert!(requested(None));
+        assert!(requested(Some("1")));
+        for value in ["0", "false", "no", "off"] {
+            assert!(!requested(Some(value)));
+        }
     }
-    matches!(
-        std::env::var("OPENUUYC_ZEROCOPY").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
+
+    #[test]
+    fn returns_surface_only_after_last_lease() {
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let lease = SurfaceLease::new(Arc::clone(&returned), 7);
+        let renderer = lease.clone();
+        drop(lease);
+        assert!(returned.lock().unwrap().is_empty());
+        drop(renderer);
+        assert_eq!(*returned.lock().unwrap(), vec![7]);
+    }
 }

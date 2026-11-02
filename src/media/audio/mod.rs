@@ -2,6 +2,8 @@
 pub(crate) mod dsp;
 pub(crate) mod encoder;
 pub(crate) mod neteq;
+#[cfg(target_os = "linux")]
+mod output_buffer;
 pub(crate) mod sender;
 pub(crate) mod waveform;
 
@@ -100,6 +102,7 @@ pub(crate) struct OutputDevices {
 }
 
 struct Packet {
+    received: Instant,
     data: Bytes,
     timestamp: u32,
     sequence: u16,
@@ -384,15 +387,18 @@ impl AudioPlayback {
         let Ok(samples) = opusic_c::utils::get_nb_samples(&data, SampleRate::Hz48000) else {
             return;
         };
-        // Our negotiated Opus receive fmtp is minptime=10. Keep the jitter
+        // Accept short Opus RTP frames; keep the decoder jitter
         // processing quantum at 10 ms even when RTP packets contain 20/60 ms.
-        if data.len() > MAX_PACKET || !(BLOCK..=MAX_SAMPLES).contains(&samples) {
+        if data.len() > MAX_PACKET
+            || !(super::audio::sender::BLOCK..=MAX_SAMPLES).contains(&samples)
+        {
             return;
         }
         let first_packet = !shared.receiving.swap(true, Ordering::AcqRel);
         // No pre-player backlog, and no unbounded queue while an output device is absent.
         if shared.started.load(Ordering::Acquire) {
             shared.packets.force_push(Packet {
+                received: Instant::now(),
                 data,
                 timestamp,
                 sequence,
@@ -509,6 +515,9 @@ impl Engine {
             let Some(packet) = self.shared.packets.pop() else {
                 break;
             };
+            if packet.received.elapsed() > Duration::from_millis(80) {
+                continue;
+            }
             if packet.generation != generation
                 || self.seen.contains(&(packet.sequence, packet.timestamp))
             {
@@ -613,6 +622,20 @@ impl Renderer {
     }
 
     fn next(&mut self) -> Result<[f32; 2]> {
+        // At the native rate, consume NetEq's buffer directly rather than
+        // copying every block into the resampling scratch buffer.
+        if self.resampler.is_none() {
+            if self.input_offset == self.input.len() {
+                self.engine.block(&mut self.input)?;
+                self.input_offset = 0;
+            }
+            let pair = [
+                self.input[self.input_offset],
+                self.input[self.input_offset + 1],
+            ];
+            self.input_offset += 2;
+            return Ok(pair);
+        }
         while self.output_offset == self.output_len {
             if self.input_offset == self.input.len() {
                 self.engine.block(&mut self.input)?;
@@ -722,11 +745,15 @@ fn open_output(
     shared: Arc<Shared>,
     failed: Arc<OutputFailure>,
 ) -> Result<cpal::Stream> {
-    let config = device
+    let supported = device
         .default_output_config()
         .context("读取音频输出格式失败")?;
-    let format = config.sample_format();
-    let config = config.config();
+    let format = supported.sample_format();
+    let config = cpal::StreamConfig {
+        #[cfg(target_os = "linux")]
+        buffer_size: output_buffer::playback_buffer(device, &supported),
+        ..supported.config()
+    };
     tracing::info!(?format, rate = config.sample_rate, channels = config.channels,
         buffer = ?config.buffer_size, "audio output format selected");
     match format {

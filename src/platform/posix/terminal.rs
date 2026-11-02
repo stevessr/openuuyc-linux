@@ -25,6 +25,9 @@
 //! spawn on another thread. The child gets the slave as 0–2 through `dup2`,
 //! which clears the flag on the copies, so the shell itself is unaffected.
 
+#[path = "terminal/osc.rs"]
+mod osc;
+
 use anyhow::{Context, Result, bail};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -49,10 +52,69 @@ pub(crate) fn foreground_supported() -> bool {
 
 /// The shell a terminal emulator would start on this system.
 pub(crate) fn default_shell() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|shell| !shell.is_empty() && std::path::Path::new(shell).exists())
+    select_shell(std::env::var("SHELL").ok(), account_defaults().map(|a| a.0))
+}
+
+fn executable_shell(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::path::Path::new(path);
+    path.is_absolute()
+        && path
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+fn select_shell(environment: Option<String>, account: Option<String>) -> String {
+    environment
+        .into_iter()
+        .chain(account)
+        .find(|s| executable_shell(s))
         .unwrap_or_else(|| DEFAULT_SHELL.to_owned())
+}
+
+/// Resolve service environments without SHELL/HOME using the current user's
+/// NSS account, not an assumed bash home. Reentrant lookup is safe on GUI threads.
+fn account_defaults() -> Option<(String, std::path::PathBuf)> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    let mut size = 4096;
+    while size <= 1024 * 1024 {
+        let mut buffer = vec![0u8; size];
+        let mut account = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        // SAFETY: all output storage lives through copying its strings below;
+        // getpwuid_r writes at most buffer.len() bytes and owns no shared buffer.
+        let code = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                account.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if code == libc::ERANGE {
+            size *= 2;
+            continue;
+        }
+        if code != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: success with non-null result initializes passwd and its strings.
+        let account = unsafe { account.assume_init() };
+        if account.pw_shell.is_null() || account.pw_dir.is_null() {
+            return None;
+        }
+        let shell = unsafe { CStr::from_ptr(account.pw_shell) }
+            .to_str()
+            .ok()?
+            .to_owned();
+        let home = std::path::PathBuf::from(OsStr::from_bytes(
+            unsafe { CStr::from_ptr(account.pw_dir) }.to_bytes(),
+        ));
+        return Some((shell, home));
+    }
+    None
 }
 
 /// `$SHELL` is usually set, but a service environment need not have it.
@@ -78,13 +140,14 @@ pub(crate) fn resolve_shell(requested: &str) -> String {
         _ => None,
     };
     match candidate {
-        Some(path) if std::path::Path::new(path).exists() => path.to_owned(),
+        Some(path) if executable_shell(path) => path.to_owned(),
         _ => default_shell(),
     }
 }
 
 /// A shell running on a pty, with the master side owned by this process.
 pub(crate) struct Session {
+    filter: std::cell::RefCell<osc::Filter>,
     master: OwnedFd,
     child: Child,
     shell: String,
@@ -112,6 +175,7 @@ impl Session {
         // The service environment carries no terminal type, and curses
         // programs (`top`, `less`, `vi`) refuse to start without one. The
         // reference server sets the same pair before forking the pty.
+        command.env("SHELL", shell);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         if std::env::var_os("LANG").is_none() {
@@ -121,8 +185,14 @@ impl Session {
         // directory the service happened to be launched from (usually `/`).
         if let Some(home) = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
-            .filter(|home| home.is_dir())
+            .filter(|home| home.is_absolute() && home.is_dir())
+            .or_else(|| {
+                account_defaults()
+                    .map(|a| a.1)
+                    .filter(|home| home.is_absolute() && home.is_dir())
+            })
         {
+            command.env("HOME", &home);
             command.current_dir(home);
         }
         // The child gets the slave as its three standard streams; the parent
@@ -168,6 +238,7 @@ impl Session {
 
         set_nonblocking(master_raw)?;
         Ok(Self {
+            filter: Default::default(),
             master,
             child,
             shell: shell.to_owned(),
@@ -225,6 +296,34 @@ impl Session {
     /// `Ok(Some(0))` is end-of-file, which Linux reports as `EIO` on the
     /// master once the last slave closes.
     pub(crate) fn read(&self, buffer: &mut [u8]) -> Result<Option<usize>> {
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        let mut filter = self.filter.borrow_mut();
+        let mut eof = false;
+        if filter.ready.is_empty() {
+            let mut raw = [0u8; 8192];
+            match self.read_raw(&mut raw)? {
+                None => filter.flush_idle(Instant::now()),
+                Some(0) => {
+                    filter.finish();
+                    eof = true;
+                }
+                Some(n) => filter.push(&raw[..n]),
+            }
+        }
+        let count = buffer.len().min(filter.ready.len());
+        for slot in &mut buffer[..count] {
+            *slot = filter.ready.pop_front().unwrap();
+        }
+        if count == 0 && !eof {
+            Ok(None)
+        } else {
+            Ok(Some(count))
+        }
+    }
+
+    fn read_raw(&self, buffer: &mut [u8]) -> Result<Option<usize>> {
         // SAFETY: the descriptor is open for the life of `self` and `buffer`
         // is valid for writes of its own length.
         let read = unsafe {
@@ -523,6 +622,37 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pty_releases_lone_escape_while_child_is_still_running() {
+        let mut session = Session::open("/bin/sh", 80, 24).unwrap();
+        session
+            .write(b"stty -echo; printf '\\033'; sleep 5\n")
+            .unwrap();
+        let output = read_until(&mut session, b"\x1b", Duration::from_secs(3));
+        assert!(output.contains(&27), "lone ESC was held until EOF");
+        assert!(matches!(session.child.try_wait(), Ok(None)));
+    }
+
+    #[test]
+    fn pty_suppresses_context_markers() {
+        let mut session = Session::open("/bin/sh", 80, 24).unwrap();
+        session
+            .write(b"printf '\\033]3008;start=test\\007VISIBLE_OSC_TEST\\n'\n")
+            .unwrap();
+        let output = read_until(
+            &mut session,
+            b"VISIBLE_OSC_TEST\r\n",
+            Duration::from_secs(3),
+        );
+        assert!(
+            output
+                .windows(b"VISIBLE_OSC_TEST\r".len())
+                .any(|w| w == b"VISIBLE_OSC_TEST\r"),
+            "{output:?}"
+        );
+        assert!(!output.windows(7).any(|w| w == b"\x1b]3008;"));
+    }
+
     /// Drains the pty until `needle` appears, the shell exits, or time runs out.
     fn read_until(session: &mut Session, needle: &[u8], timeout: Duration) -> Vec<u8> {
         let deadline = Instant::now() + timeout;
@@ -559,10 +689,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             foreground = session.foreground();
-            if foreground
-                .as_ref()
-                .is_some_and(|foreground| foreground.name == "sleep")
-            {
+            if foreground.as_ref().is_some_and(|foreground| {
+                foreground.name == "sleep" && foreground.command.contains("sleep 5")
+            }) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -602,11 +731,18 @@ mod tests {
     /// Linux exposes a process's descriptors as symlinks; macOS has no
     /// equivalent view, so the two tests below only run on Linux.
     #[cfg(target_os = "linux")]
-    fn descriptor_targets(pid: u32) -> Vec<String> {
+    fn descriptor_targets(pid: u32) -> Vec<(String, String)> {
         std::fs::read_dir(format!("/proc/{pid}/fd"))
             .expect("list child descriptors")
-            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-            .map(|target| target.to_string_lossy().into_owned())
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let descriptor = entry.file_name().to_string_lossy().into_owned();
+                let target = std::fs::read_link(entry.path())
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned();
+                Some((descriptor, target))
+            })
             .collect()
     }
 
@@ -629,11 +765,14 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_ne!(first_slave, second_slave);
-        for target in descriptor_targets(second.child.id()) {
-            assert_ne!(target, "/dev/ptmx", "second shell holds a pty master");
-            assert!(
-                !target.starts_with("/dev/pts/") || target == second_slave,
-                "second shell holds another terminal: {target}"
+        for (fd, target) in descriptor_targets(second.child.id()) {
+            assert_ne!(
+                target, "/dev/ptmx",
+                "second shell holds a pty master on fd {fd}"
+            );
+            assert_ne!(
+                target, first_slave,
+                "second shell inherited the first session's pty on fd {fd}: {target}"
             );
         }
     }
@@ -705,5 +844,37 @@ mod tests {
         // Either the shell closed the pty (EOF) or it printed nothing more;
         // both mean the session ended rather than hanging.
         assert!(session.exited() || !seen.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod shell_fallback_tests {
+    use super::*;
+    #[test]
+    fn missing_or_invalid_environment_uses_account_shell() {
+        assert_eq!(select_shell(None, Some("/bin/sh".into())), "/bin/sh");
+        assert_eq!(
+            select_shell(Some("/not/a/shell".into()), Some("/bin/sh".into())),
+            "/bin/sh"
+        );
+        assert_eq!(
+            select_shell(Some("/tmp".into()), Some("/bin/sh".into())),
+            "/bin/sh"
+        );
+        assert_eq!(
+            select_shell(Some("sh".into()), Some("/bin/sh".into())),
+            "/bin/sh"
+        );
+    }
+    #[test]
+    fn environment_override_and_platform_fallback_are_preserved() {
+        assert_eq!(select_shell(Some("/bin/sh".into()), None), "/bin/sh");
+        assert_eq!(select_shell(None, None), DEFAULT_SHELL);
+    }
+    #[test]
+    fn live_account_lookup_is_owned_and_has_an_absolute_home() {
+        let (shell, home) = account_defaults().expect("current user NSS account");
+        assert!(executable_shell(&shell));
+        assert!(home.is_absolute());
     }
 }

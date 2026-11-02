@@ -258,6 +258,71 @@ impl DeviceCenterApp {
         }
     }
     fn host_settings_controls(&mut self, ui: &mut egui::Ui) {
+        #[cfg(target_os = "linux")]
+        super::mr_devices::show(ui);
+        #[cfg(target_os = "linux")]
+        {
+            section(ui, "内置 PCVR · OpenXR 优先");
+            use crate::pcvr::runtime::{self, Preference};
+            let current = runtime::preference();
+            if let Err(error) = &current {
+                ui.label(egui::RichText::new(error.to_string()).color(theme::AMBER));
+            }
+            let old = current.unwrap_or_default();
+            let mut selected = old;
+            egui::ComboBox::from_id_salt("pcvr-runtime-preference")
+                .selected_text(selected.label())
+                .show_ui(ui, |ui| {
+                    for preference in Preference::ALL {
+                        ui.selectable_value(&mut selected, preference, preference.label());
+                    }
+                });
+            if selected != old {
+                if let Err(error) = runtime::set_preference(selected) {
+                    self.status = StatusMessage::error(error.to_string());
+                }
+            }
+            ui.label(runtime::status());
+            if ui
+                .button("复制 VRChat / OpenVR 的 Steam 启动选项")
+                .clicked()
+            {
+                match runtime::plan().and_then(|plan| plan.steam_options(runtime::Api::OpenVr)) {
+                    Ok(options) => {
+                        ui.ctx().copy_text(options);
+                        self.status = StatusMessage::success(
+                            "已复制；粘贴到该游戏的 Steam 启动选项，不会修改全局运行时",
+                        );
+                    }
+                    Err(error) => self.status = StatusMessage::error(error.to_string()),
+                }
+            }
+
+            ui.small("仅为游戏进程选择 XR_RUNTIME_JSON / VR_OVERRIDE，不切换全局 OpenXR。Steam 已运行时需使用该游戏的启动选项，不能只给 steam -applaunch 设置环境。");
+            ui.label("双眼链路已有代码与本地测试：内置 OpenXR 走受管设备与合成器导出，SteamVR 既有场景可在 PICO 沉浸菜单「附加已有 VR 应用 → 附加 SteamVR 运行中场景」请求只读双眼镜像（不会启动 SteamVR/游戏）。真实游戏/头显验收仍未完成。");
+            ui.small("SteamVR 镜像需要本机 SteamVR 已在运行且场景正在渲染；命令行诊断：OpenUUYC pico-vr steamvr-mirror-probe / steamvr-mirror-attach。");
+            if ui.button("安装 / 更新 OpenUUYC 内置 OpenVR 驱动").clicked() {
+                self.status = match crate::pcvr::install_driver() {
+                    Ok(()) => StatusMessage::success(
+                        "内置追踪驱动已安装；请自行重启 SteamVR 后，在 PICO 沉浸菜单启用追踪诊断（追踪驱动不是双眼镜像）",
+                    ),
+                    Err(e) => StatusMessage::error(e.to_string()),
+                };
+            }
+        }
+        {
+            let mut allowed = crate::features::host::quick_apps::launch_allowed();
+            if ui
+                .checkbox(
+                    &mut allowed,
+                    "允许应用快捷启动（仅本次运行，不开放远程终端）",
+                )
+                .changed()
+            {
+                crate::features::host::quick_apps::set_launch_allowed(allowed);
+            }
+            ui.small("仅当前已授权的非访客连接可启动主机列出的应用；关闭后立即撤销。");
+        }
         section(ui, "被控设置");
         let host = self.host.clone();
         let mut allowed = host.as_ref().is_some_and(|h| h.allowed());
@@ -296,6 +361,36 @@ impl DeviceCenterApp {
                 self.wol_setup_entry(ui);
             }
             section(ui, "画面与声音");
+            #[cfg(target_os = "linux")]
+            {
+                let mut requested = crate::platform::audio_thread::rt_requested();
+                form_row(
+                    ui,
+                    "低延迟",
+                    "默认开启；专用音频线程实时调度，队列按串流 FPS 限制；重连生效",
+                    |ui| {
+                        if crate::ui::controls::switch(ui, &mut requested).changed() {
+                            crate::platform::audio_thread::set_rt_requested(requested);
+                        }
+                    },
+                );
+                let audio = host.status().audio;
+                if audio.rt_requested {
+                    ui.label(format!(
+                        "低延迟：{} · 队列预算 {:.2}ms",
+                        if audio.rt_active {
+                            "实时调度已生效"
+                        } else {
+                            "普通调度（实时调度未生效）"
+                        },
+                        audio.queue_budget_us as f64 / 1000.0
+                    ));
+                    if let Some(error) = audio.rt_error {
+                        ui.label(egui::RichText::new(error).color(theme::AMBER));
+                    }
+                }
+            }
+
             let inventory = host.audio_devices();
             let mut quality = host.audio_quality();
             let mut quality_changed = false;

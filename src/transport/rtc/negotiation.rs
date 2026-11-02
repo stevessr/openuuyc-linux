@@ -164,7 +164,7 @@ pub(super) fn register_uu_codecs(media_engine: &mut MediaEngine) -> Result<()> {
         111,
         48_000,
         2,
-        "minptime=10;stereo=1;useinbandfec=1",
+        "minptime=3;stereo=1;useinbandfec=1",
         true,
     )] {
         media_engine

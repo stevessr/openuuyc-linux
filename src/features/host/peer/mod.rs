@@ -194,7 +194,7 @@ impl Peer {
                     mime_type: "audio/opus".into(),
                     clock_rate: 48_000,
                     channels: 2,
-                    sdp_fmtp_line: "minptime=10;stereo=1;useinbandfec=1".into(),
+                    sdp_fmtp_line: "minptime=3;stereo=1;useinbandfec=1".into(),
                     rtcp_feedback: vec![RTCPFeedback {
                         typ: "transport-cc".into(),
                         parameter: String::new(),
@@ -408,7 +408,7 @@ impl Peer {
                 mime_type: "audio/opus".into(),
                 clock_rate: 48_000,
                 channels: 2,
-                sdp_fmtp_line: "minptime=10;stereo=1;useinbandfec=1".into(),
+                sdp_fmtp_line: "minptime=3;stereo=1;useinbandfec=1".into(),
                 ..Default::default()
             },
             "audio_0".into(),
@@ -729,10 +729,38 @@ impl Peer {
         let channel_annotation = annotation.clone();
         let channel_clipboard = clipboard_receiver.clone();
         let channel_control = control_receiver.clone();
+        let terminal_binding: Arc<Mutex<Option<CancellationToken>>> = Default::default();
         let diagnostics_binding: Arc<Mutex<Option<CancellationToken>>> = Default::default();
         let diagnostics_lease = handle.clone();
         let diagnostics_connected = connected.clone();
+        #[cfg(target_os = "linux")]
+        let pcvr = crate::pcvr::host::Session::new(handle.clone(), connected.clone());
+        let native_audio = audio.clone();
         connection.on_data_channel(Box::new(move |channel| {
+            if channel.label() == crate::features::host::native_audio::CHANNEL {
+                native_audio.bind_native(channel, channel_cancel.clone());
+                return Box::pin(async {});
+            }
+
+            #[cfg(target_os = "linux")]
+            if matches!(
+                channel.label(),
+                crate::pcvr::host::CONTROL
+                    | crate::pcvr::host::TRACKING
+                    | crate::pcvr::stereo::CHANNEL
+            ) {
+                pcvr.bind(channel, channel_cancel.clone());
+                return Box::pin(async {});
+            }
+            if channel.label() == crate::features::host::quick_apps::CHANNEL {
+                crate::features::host::quick_apps::bind(
+                    channel,
+                    diagnostics_lease.clone(),
+                    diagnostics_connected.clone(),
+                    channel_cancel.clone(),
+                );
+                return Box::pin(async {});
+            }
             if diagnostics_extension && channel.label() == crate::diagnostics::remote::CHANNEL {
                 channel_kcp.bind_stream(channel.id(), false);
                 let token = crate::diagnostics::remote::bind_host(
@@ -744,6 +772,18 @@ impl Peer {
                 if let Some(previous) = lock(&diagnostics_binding).replace(token) {
                     previous.cancel();
                 }
+                return Box::pin(async {});
+            }
+            if channel.label() == crate::features::remote_terminal::CHANNEL {
+                let token = channel_cancel.child_token();
+                if let Some(previous) = lock(&terminal_binding).replace(token.clone()) {
+                    previous.cancel();
+                }
+                crate::features::host::terminal::bind_extension(
+                    &channel,
+                    channel_screens.clone(),
+                    token,
+                );
                 return Box::pin(async {});
             }
             // The terminal rides the same low-priority BINARY channel the

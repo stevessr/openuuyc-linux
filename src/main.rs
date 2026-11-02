@@ -16,6 +16,9 @@ use openuuyc::diagnostics::logging;
 use openuuyc::media;
 use openuuyc::session::controller;
 
+#[cfg(target_os = "linux")]
+mod pico_vr;
+
 #[derive(Parser)]
 #[command(
     name = "OpenUUYC",
@@ -36,6 +39,44 @@ struct Cli {
     log_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+enum PicoVrCommand {
+    #[command(hide = true)]
+    RuntimeProbe,
+    /// 查看内置 OpenXR/SteamVR 后端优先级和组件状态
+    RuntimeStatus,
+    /// Inspect an existing SteamVR scene without starting the runtime or a game
+    SteamvrMirrorProbe,
+    /// 手动附加到正在运行的 SteamVR 场景，写入本机私有双眼导出（Ctrl-C 结束）
+    SteamvrMirrorAttach,
+    /// 选择后端：openxr-first（默认）、openxr-only、steamvr
+    RuntimePreference { value: String },
+    /// 从已构建目录安装 Monado/xrizer 组件；不切换系统运行时
+    ComponentsInstall { directory: std::path::PathBuf },
+    /// 无 SteamVR 时显式创建最小 OpenVR 配置；已有配置不会覆盖
+    ComponentsInitOpenvr,
+    /// 在选定的内置 OpenXR/SteamVR 环境下启动应用；--openvr 启用 xrizer
+    Run {
+        #[arg(long)]
+        openvr: bool,
+        #[arg(required=true,num_args=1..,last=true)]
+        command: Vec<std::ffi::OsString>,
+    },
+    /// 安装并注册 OpenUUYC 内置 OpenVR 追踪诊断驱动（不启动外部客户端）
+    BuiltinInstall,
+    /// 检查 WiVRn、WayVR 和 OpenXR 运行时
+    Doctor,
+    /// 打开 WiVRn 配对管理器
+    Setup,
+    /// 通过本机 OpenXR 桌面映射，在 PICO 头显中使用 OpenUUYC
+    Launch {
+        /// 已在其它地方启动 WiVRn 时不再打开配对管理器
+        #[arg(long)]
+        no_dashboard: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -119,6 +160,12 @@ enum Commands {
         #[arg(long)]
         new: bool,
     },
+    #[cfg(target_os = "linux")]
+    /// PICO VR 头显支持（WiVRn + WayVR 桌面模式）
+    PicoVr {
+        #[command(subcommand)]
+        command: PicoVrCommand,
+    },
     #[command(hide = true)]
     PluginVideoHost,
 
@@ -200,6 +247,28 @@ fn main() -> Result<()> {
         hardware_decode: None,
         transport: None,
     });
+    #[cfg(target_os = "linux")]
+    if let Commands::PicoVr {
+        command: PicoVrCommand::Launch { no_dashboard },
+    } = &command
+    {
+        pico_vr::launch(*no_dashboard)?;
+    }
+    // Route VR launching through the normal GUI instance/activation path.
+    // This preserves existing login, window reuse, transport and cleanup.
+    #[cfg(target_os = "linux")]
+    let command = match command {
+        Commands::PicoVr {
+            command: PicoVrCommand::Launch { .. },
+        } => Commands::Gui {
+            background: false,
+            fps: None,
+            codec: None,
+            hardware_decode: None,
+            transport: None,
+        },
+        other => other,
+    };
 
     #[cfg(windows)]
     if let Commands::Notification { uri } = &command {
@@ -331,6 +400,64 @@ fn main() -> Result<()> {
             openuuyc::application::terminal_attach(session.as_deref(), list, new)
         }
         Commands::PluginVideoHost => openuuyc::plugins::video::host(),
+        #[cfg(target_os = "linux")]
+        Commands::PicoVr { command } => match command {
+            PicoVrCommand::RuntimeProbe => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&openuuyc::pcvr::runtime_probe::probe()?)?
+                );
+                Ok(())
+            }
+            PicoVrCommand::RuntimeStatus => {
+                println!("{}", openuuyc::pcvr::runtime::status());
+                let plan = openuuyc::pcvr::runtime::plan()?;
+                println!("{}", serde_json::to_string_pretty(&plan.probe()?)?);
+                println!(
+                    "Steam OpenVR 启动选项：{}",
+                    plan.steam_options(openuuyc::pcvr::runtime::Api::OpenVr)?
+                );
+                Ok(())
+            }
+            PicoVrCommand::RuntimePreference { value } => {
+                use openuuyc::pcvr::runtime::Preference;
+                let preference = match value.as_str() {
+                    "openxr-first" => Preference::OpenXrFirst,
+                    "openxr-only" => Preference::OpenXrOnly,
+                    "steamvr" => Preference::SteamVr,
+                    _ => anyhow::bail!("支持 openxr-first、openxr-only、steamvr"),
+                };
+                openuuyc::pcvr::runtime::set_preference(preference)
+            }
+            PicoVrCommand::SteamvrMirrorProbe => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&openuuyc::pcvr::steamvr::probe()?)?
+                );
+                Ok(())
+            }
+            PicoVrCommand::SteamvrMirrorAttach => openuuyc::pcvr::steamvr::attach_diagnostic(),
+            PicoVrCommand::ComponentsInstall { directory } => {
+                println!(
+                    "组件安装到 {}",
+                    openuuyc::pcvr::runtime::install(&directory)?.display()
+                );
+                Ok(())
+            }
+            PicoVrCommand::ComponentsInitOpenvr => openuuyc::pcvr::runtime::init_openvr(),
+            PicoVrCommand::Run { openvr, command } => openuuyc::pcvr::runtime::run(
+                if openvr {
+                    openuuyc::pcvr::runtime::Api::OpenVr
+                } else {
+                    openuuyc::pcvr::runtime::Api::OpenXr
+                },
+                &command,
+            ),
+            PicoVrCommand::BuiltinInstall => openuuyc::pcvr::install_driver(),
+            PicoVrCommand::Doctor => pico_vr::doctor(),
+            PicoVrCommand::Setup => pico_vr::setup(),
+            PicoVrCommand::Launch { .. } => unreachable!("VR launch normalized to GUI"),
+        },
         #[cfg(windows)]
         Commands::Notification { .. } => {
             unreachable!("notification activation is handled before application startup")

@@ -69,6 +69,7 @@ pub(super) struct LocalViewSettings {
     pub performance_mode: super::PerformancePanelMode,
     pub performance_always_visible: bool,
     pub intercept_shortcuts: bool,
+    pub window_control_enabled: bool,
     pub send_ctrl_alt_del: bool,
 }
 
@@ -491,6 +492,7 @@ pub(super) fn show_stream_control_window(
     local_size: Option<(u32, u32)>,
     anchor_offset: egui::Vec2,
 ) {
+    handle.terminal().ui(ctx);
     topology_menu::show(ctx, handle, local_size);
     topology_menu::show_error(ctx, handle);
     let mic = handle.microphone().snapshot();
@@ -1023,14 +1025,18 @@ crate::ui::controls::observe_notice(ui.ctx(), "audio-output-disconnected", "音�
                                     crate::ui::controls::progress_notice(ui.ctx(),"clipboard-wait","剪贴板同步",(!clip.active && snapshot.mouse_mode != MouseMode::View).then_some("等待剪贴板通道就绪"));
 crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同步失败", crate::ui::controls::DialogIcon::Error, clip.error.as_deref());
                                 }
+                                if menu_row(ui,"远端终端","",None,true,false).clicked() {handle.terminal().show();}
                                 let can_send = snapshot.ready
                                     && !snapshot.mouse_pending
                                     && snapshot.mouse_mode != MouseMode::View
+                                    && view.window_control_enabled
                                     && handle.mouse().supports_ctrl_alt_del()
                                     && !handle.mouse().waiting_for_neutral();
                                 if menu_row(ui, "发送 Ctrl+Alt+Del", "", None, can_send, false)
                                     .on_hover_text(if can_send {
                                         "打开远端 Windows 安全选项"
+                                    } else if !view.window_control_enabled {
+                                        "请先开启本窗口远程输入"
                                     } else {
                                         "请先开启 Windows 设备的键鼠控制并松开按键"
                                     })
@@ -1112,6 +1118,9 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                         crate::ui::controls::observe_notice(ui.ctx(),"microphone-device-query","麦克风设备",crate::ui::controls::DialogIcon::Error,inputs.error.as_deref());
                     }
                     Page::Mouse => {
+                        switch_row(ui, "本窗口远程输入", &mut view.window_control_enabled)
+                            .on_hover_text("仅影响当前播放窗口；关闭后释放此窗口的键鼠、触摸和手柄输入（进行中的文件拖放交接除外），其他窗口不受影响。");
+                        section_separator(ui);
                         for (mode, label, description) in [
                             (
                                 MouseMode::Smart,

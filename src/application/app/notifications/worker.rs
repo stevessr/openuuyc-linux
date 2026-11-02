@@ -2,7 +2,7 @@
 use super::{Action, Card, Mode};
 use crate::platform::notifications::{Native, Toast, ToastAction};
 use anyhow::{Context, Result};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 
 pub(super) enum Event {
     Mode(Mode, u64),
@@ -43,6 +43,23 @@ fn save(mode: Mode) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(windows)]
+fn folder_available(folder: &std::path::Path) -> bool {
+    let text = folder.to_string_lossy();
+    let bytes = text.as_bytes();
+    folder.is_absolute()
+        && bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && folder.is_dir()
+}
+
+#[cfg(not(windows))]
+fn folder_available(folder: &std::path::Path) -> bool {
+    folder.is_absolute() && folder.is_dir()
+}
+
 impl Worker {
     pub fn new(ctx: egui::Context) -> Self {
         let latest = Arc::new(Mutex::new(Latest::default()));
@@ -89,16 +106,7 @@ impl Worker {
                 }
                 let result = (|| -> Result<()> {
                     if let Some(folder) = folder {
-                        let text = folder.to_string_lossy();
-                        let bytes = text.as_bytes();
-                        anyhow::ensure!(
-                            folder.is_absolute()
-                                && bytes.len() > 2
-                                && bytes[0].is_ascii_alphabetic()
-                                && bytes[1] == b':'
-                                && folder.is_dir(),
-                            "文件所在目录已不可用"
-                        );
+                        anyhow::ensure!(folder_available(&folder), "文件所在目录已不可用");
                         crate::diagnostics::logging::open_folder(&folder)?;
                     }
                     if wanted != mode {
@@ -220,5 +228,25 @@ impl Drop for Worker {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::folder_available;
+    use std::path::Path;
+
+    #[test]
+    fn accepts_existing_absolute_directory() {
+        let folder = std::env::temp_dir();
+        assert!(folder.is_absolute());
+        assert!(folder.is_dir());
+        assert!(folder_available(&folder));
+    }
+
+    #[test]
+    fn rejects_relative_directory() {
+        assert!(Path::new(".").is_dir());
+        assert!(!folder_available(Path::new(".")));
     }
 }

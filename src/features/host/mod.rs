@@ -17,11 +17,13 @@ mod hevc;
 pub(crate) mod input;
 mod keyframe;
 pub(crate) mod microphone;
+pub(crate) mod native_audio;
 pub(crate) mod network;
 pub(crate) mod parameters;
 pub(crate) mod peer;
 pub(crate) mod power;
 mod protection;
+pub(crate) mod quick_apps;
 mod settings;
 pub(crate) mod terminal;
 mod track;
@@ -85,10 +87,10 @@ impl Default for VideoConfig {
             requested_fps: 30,
             fps_limit: 165,
             bitrate: 8_000_000,
-            quality: 2,
-            auto_quality: 2,
+            quality: 3,
+            auto_quality: 3,
             revision: 0,
-            reported_quality: 2,
+            reported_quality: 3,
             format: format::Format::AVC,
             color: format::Color::Sdr,
             requested_maximum: None,

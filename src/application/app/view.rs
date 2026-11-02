@@ -19,6 +19,8 @@ mod diagnostics_panel;
 mod host_assist;
 mod host_settings;
 mod logs;
+#[cfg(target_os = "linux")]
+mod mr_devices;
 mod port_mapping;
 mod power;
 mod remote_diagnostics;

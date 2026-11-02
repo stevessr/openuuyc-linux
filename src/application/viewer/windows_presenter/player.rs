@@ -67,6 +67,7 @@ pub(in crate::application::viewer) struct ThreadedWindowsApp {
     pub(in crate::application::viewer) egui_winit: egui_winit::State,
     pub(in crate::application::viewer) performance_mode: PerformancePanelMode,
     pub(in crate::application::viewer) intercept_shortcuts: bool,
+    pub(in crate::application::viewer) window_control_enabled: bool,
     pub(in crate::application::viewer) startup_backdrop: Option<ConnectionProgressApp>,
     pub(in crate::application::viewer) last_window_size: PhysicalSize<u32>,
     pub(in crate::application::viewer) pending_aspect_size: Option<PhysicalSize<u32>>,
@@ -122,6 +123,9 @@ impl ThreadedWindowsApp {
         self.title = session.title.clone();
         self.performance = session.performance.clone();
         self.stream_control = session.stream_control.clone();
+        self.stream_control
+            .mouse()
+            .set_owner_enabled(self.mouse.owner(), self.window_control_enabled);
         self.shutdown = Arc::clone(&session.shutdown);
         self.fatal_error = Arc::clone(&session.fatal_error);
         self.bound_screen = session.screen_binding();
@@ -184,6 +188,7 @@ impl ThreadedWindowsApp {
             egui_context: connecting.egui_context,
             egui_winit: connecting.egui_winit,
             performance_mode: preferences.performance_mode,
+            window_control_enabled: true,
             intercept_shortcuts: preferences.intercept_shortcuts,
             startup_backdrop: Some(connecting.progress),
             last_window_size: window.inner_size(),
@@ -245,6 +250,21 @@ impl ThreadedWindowsApp {
         if self
             .fullscreen_chrome
             .intercept_touch(&self.egui_context, event)
+        {
+            window.request_redraw();
+            return Ok(());
+        }
+        // Native touch passthrough comes next: a contact on the video during
+        // control is remote input, everything else stays with the local UI.
+        if let WindowEvent::Touch(touch) = event
+            && self.mouse.touch(
+                window,
+                &self.egui_context,
+                &self.stream_control,
+                self._session.track_index,
+                &self.renderer.current_video_size,
+                touch,
+            )
         {
             window.request_redraw();
             return Ok(());
@@ -492,6 +512,7 @@ impl ThreadedWindowsApp {
                 .performance_always_visible,
             intercept_shortcuts: self.intercept_shortcuts,
             send_ctrl_alt_del: false,
+            window_control_enabled: self.window_control_enabled,
         };
         let mut chrome_action = PlayerChromeAction::default();
         let fullscreen = window.fullscreen().is_some();
@@ -639,6 +660,14 @@ impl ThreadedWindowsApp {
                 );
             }
         });
+        if self.window_control_enabled != view.window_control_enabled {
+            self.window_control_enabled = view.window_control_enabled;
+            let input = self.stream_control.mouse();
+            input.set_owner_enabled(self.mouse.owner(), self.window_control_enabled);
+            if !self.window_control_enabled {
+                self.mouse.release(window);
+            }
+        }
         if self.performance_mode != view.performance_mode {
             self.stream_control
                 .set_performance_mode(view.performance_mode);

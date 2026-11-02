@@ -239,6 +239,16 @@ impl Controller {
             ticket.cancel();
         }
     }
+    pub fn cancel_gesture_for_owner(&self, owner: u64, preparing_only: bool) {
+        let binding = lock(&self.0);
+        if binding.reverse_owner == Some(owner)
+            && let Some(ticket) = binding.active.upgrade()
+            && ticket.id == self.1.load(Ordering::Acquire)
+            && (!preparing_only || ticket.snapshot().stage == Stage::Preparing)
+        {
+            ticket.cancel();
+        }
+    }
     pub fn is_native(&self) -> bool {
         lock(&self.0).seen_native
     }

@@ -269,7 +269,7 @@ impl KWalletWindows {
         use x11rb::protocol::xproto::ConnectionExt as _;
         let appid = std::env::var("SteamAppId")?.parse::<u32>()?;
         ensure!(appid != 0, "没有 Steam 应用 ID");
-        let (connection, screen) = x11rb::connect(None)?;
+        let (connection, screen) = crate::platform::linux::x11_connection::connect()?;
         let root = connection.setup().roots[screen].root;
         let pid_atom = connection.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
         let steam_atom = connection.intern_atom(false, b"STEAM_GAME")?.reply()?.atom;

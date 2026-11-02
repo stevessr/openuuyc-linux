@@ -903,6 +903,7 @@ mod crop_tests {
     #[test]
     #[ignore = "requires a VA-API H.264 decoder and render-node access"]
     fn vaapi_decodes_1080p_cropped_fixture() {
+        crate::platform::linux::dmabuf::mark_unsupported();
         let frame = Avc::new()
             .decode(
                 include_bytes!("testdata/crop-1080.h264"),
@@ -911,7 +912,7 @@ mod crop_tests {
             .expect("VA-API decode");
         assert_eq!((frame.width, frame.height), (1920, 1080));
         let FrameData::Cpu(data) = &frame.data else {
-            panic!("zero-copy export is opt-in; this checks the readback");
+            panic!("zero-copy disabled; this checks the readback");
         };
         let plane = 1920 * 1080;
         assert_eq!(data.len(), plane * 3 / 2);
@@ -1031,7 +1032,11 @@ fn submit(
     // does a picture cropped on the left or top: the renderer samples an
     // exported surface from its top-left corner.
     let exported = if crate::platform::linux::dmabuf::enabled() && (x, y) == (0, 0) {
-        export_nv12(picture.surface())
+        let exported = export_nv12(picture.surface());
+        if exported.is_none() {
+            crate::platform::linux::dmabuf::mark_unsupported();
+        }
+        exported
     } else {
         None
     };
@@ -1074,7 +1079,12 @@ fn export_nv12(surface: &Surface) -> Option<(u64, [crate::platform::linux::dmabu
         return None;
     }
     let layer = descriptor.layers.first()?;
-    if descriptor.objects.len() != 1 || layer.num_planes != 2 {
+    if descriptor.objects.len() != 1
+        || descriptor.layers.len() != 1
+        || layer.num_planes != 2
+        || layer.object_index[..2] != [0, 0]
+        || layer.pitch[..2].contains(&0)
+    {
         // Only the single-buffer, two-plane layout maps onto two single-plane
         // Vulkan images; anything else keeps the CPU path.
         tracing::debug!(

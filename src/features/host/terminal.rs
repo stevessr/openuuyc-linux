@@ -192,7 +192,7 @@ impl Frame {
     }
 
     /// Builds a frame the controller will accept.
-    fn encode(kind: FrameType, session: u32, payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn encode(kind: FrameType, session: u32, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER + payload.len());
         out.extend_from_slice(MAGIC);
         out.push(VERSION);
@@ -603,6 +603,15 @@ impl Sessions {
     /// [`Sessions::sweep`]）。编号从 [`LOCAL_HANDLE_BASE`] 起，与手机端
     /// 常用的小编号分开。
     pub(crate) fn create_local(&mut self, name: Option<String>) -> Result<u32, SessionError> {
+        let shell = Sessions::default_shell();
+        self.create_local_with_shell(name, &shell)
+    }
+
+    fn create_local_with_shell(
+        &mut self,
+        name: Option<String>,
+        shell: &str,
+    ) -> Result<u32, SessionError> {
         if self.sessions.len() >= MAX_TOTAL {
             return Err(SessionError::TooMany);
         }
@@ -619,9 +628,8 @@ impl Sessions {
         let handle = (LOCAL_HANDLE_BASE..u32::MAX)
             .find(|handle| !self.sessions.contains_key(&key(LOCAL_OWNER, *handle)))
             .unwrap_or(LOCAL_HANDLE_BASE);
-        let shell = Sessions::default_shell();
         // 尺寸只是占位：接上本地终端时 `attach_local` 会按那端改。
-        let pty = crate::platform::terminal::Session::open(&shell, 80, 24)
+        let pty = crate::platform::terminal::Session::open(shell, 80, 24)
             .map_err(|_| SessionError::Gone)?;
         let stamp = now_ms();
         self.sessions.insert(
@@ -1386,6 +1394,23 @@ pub(crate) fn bind(
     screens: Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
     cancel: CancellationToken,
 ) {
+    bind_impl(channel, screens, cancel, true);
+}
+
+/// A refused/revoked optional terminal must never tear down desktop streaming.
+pub(crate) fn bind_extension(
+    channel: &Arc<RTCDataChannel>,
+    screens: Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
+    cancel: CancellationToken,
+) {
+    bind_impl(channel, screens, cancel.child_token(), false);
+}
+fn bind_impl(
+    channel: &Arc<RTCDataChannel>,
+    screens: Arc<tokio::sync::Mutex<crate::features::host::peer::screens::Screens>>,
+    cancel: CancellationToken,
+    dedicated: bool,
+) {
     let connection = next_connection();
     let stop = cancel.child_token();
     let close = stop.clone();
@@ -1412,6 +1437,9 @@ pub(crate) fn bind(
             let data = message.data.clone();
             if data.starts_with(MAGIC) {
                 handle_frame(&channel, &screens, &data, connection, &stop).await;
+                return;
+            }
+            if !dedicated {
                 return;
             }
             let responses = {
@@ -1456,6 +1484,7 @@ pub(crate) fn bind(
         // The session list this controller saw last; the first tick only
         // records it, so connecting does not itself send a notification.
         let mut listed: Option<u64> = None;
+        let mut had_grant = false;
         loop {
             ticker.tick().await;
             let Some(channel) = pump_channel.upgrade().filter(|_| !pump_stop.is_cancelled()) else {
@@ -1470,12 +1499,16 @@ pub(crate) fn bind(
             // for the reattach.
             let lease = pump_screens.lock().await.authorization();
             if !lease.terminal_allowed() {
+                if !dedicated && !had_grant {
+                    continue;
+                }
                 tracing::info!("host terminal grant ended; closing the terminal connection");
                 pump_stop.cancel();
                 cancel.cancel();
                 let _ = channel.close().await;
                 break;
             }
+            had_grant = true;
             // The same goes for the shells opened on this machine: once the
             // controller may no longer reach them, it lets go of them within
             // a tick, and each is reported as ended to the controller (an
@@ -2597,7 +2630,9 @@ mod tests {
     #[cfg_attr(not(target_os = "linux"), ignore = "local attach is Linux-only")]
     fn a_local_session_is_created_listed_and_kept() {
         let mut sessions = Sessions::default();
-        let handle = sessions.create_local(Some("mine".into())).expect("create");
+        let handle = sessions
+            .create_local_with_shell(Some("mine".into()), shell())
+            .expect("create");
         assert!(
             handle >= LOCAL_HANDLE_BASE,
             "local handles stay out of the controller's small numbers"
@@ -2629,7 +2664,9 @@ mod tests {
         assert!(exited.sessions.is_empty());
         assert!(abandoned.sessions.is_empty(), "kept after a local detach");
         assert_eq!(
-            sessions.create_local(Some("mine".into())).err(),
+            sessions
+                .create_local_with_shell(Some("mine".into()), shell())
+                .err(),
             Some(SessionError::DuplicateName)
         );
         // Once its shell exits, the sweep takes it out of the list.
@@ -2660,7 +2697,7 @@ mod tests {
     fn the_controller_can_take_over_a_local_session() {
         let mut sessions = Sessions::default();
         let handle = sessions
-            .create_local(Some("shared".into()))
+            .create_local_with_shell(Some("shared".into()), shell())
             .expect("create local");
         // 获准接入的主控用同一个编号 open，接上的是本机开的那个 shell，不是新的。
         let allowed = Owner::new("acct", true);
@@ -2680,12 +2717,21 @@ mod tests {
             "controller input reaches the local shell"
         );
 
-        // 本机接上同一会话时，看到的是同一份输出。
-        sessions
+        let (_, replay) = sessions
             .attach_local(handle, 100, 80, 24)
             .expect("attach local");
-        let local = local_output_until(&mut sessions, 100, "MOBILE-TO-LOCAL");
-        assert!(local.contains("MOBILE-TO-LOCAL"));
+        assert!(
+            String::from_utf8_lossy(&replay).contains("MOBILE-TO-LOCAL"),
+            "the local attach receives the current screen replay"
+        );
+        sessions
+            .write(allowed, handle, &line("echo REMOTE-TO-LOCAL-LIVE"))
+            .expect("write live output");
+        let local = local_output_until(&mut sessions, 100, "REMOTE-TO-LOCAL-LIVE");
+        assert!(
+            local.contains("REMOTE-TO-LOCAL-LIVE"),
+            "the local consumer receives fresh output"
+        );
     }
 
     #[test]

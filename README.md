@@ -28,10 +28,10 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 | 设备 ID / 验证码协助 | 支持主动连接，也能直接点开邀请链接 | 支持账号及游客协助 | 随机 / 自定义密码、本机确认；主控支持最近连接和收藏，对方分享的 `uuremote://external/assistance?...` 链接会拉起本程序并填好设备 ID 与验证码 |
 | 画面传输 | 接收与播放 | 采集与编码 | H.264 / H.265 / AV1、真彩及 HDR，可调画质、码率和帧率（最高 165 FPS）；AV1 与 SDR 自动 10 位需双方 OpenUUYC 支持 |
 | 编解码 | DXVA11 硬解 / Rust 软解 | NVENC、AMF、QSV 硬编 / Rust H.264 软编 | 可选格式与显卡首选；软解支持 H.264 / AV1，整个客户端最多一个软解播放窗口 |
-| 键鼠与触摸 | 键盘、鼠标控制 | 键鼠及移动端原生触摸接收 | 相对/绝对鼠标、组合键、光标同步；可选 125 / 500 / 1000 Hz 鼠标节流（默认关闭） |
+| 键鼠与触摸 | 键盘、鼠标及触摸屏控制 | 键鼠及原生触摸接收 | 相对/绝对鼠标、组合键、光标同步；播放窗口可独立暂停远程输入，不影响同设备其他窗口；触摸屏在 OpenUUYC 被控（beta.3+）的当前屏上原生多点，官方被控或其他屏单指模拟左键；可选 125 / 500 / 1000 Hz 鼠标节流（默认关闭） |
 | 多显示器与显示设置 | 切屏、多窗口、本地比例拉伸、分辨率及 DPI 调整 | 多屏采集与设置接收 | 屏幕标签可拖出独立窗口；本地比例拉伸不修改远端分辨率，物理设置按目标支持的配置应用 |
 | 虚拟屏、超级屏与无屏接管 | 支持操作远端 | 支持 | 需安装显示驱动；自动兜底屏断线保留，其他可用屏幕接入后回收 |
-| 桌面声音 | 播放与远程音质调整 | 采集与发送 | 默认或指定设备，设备变化后恢复；64 / 128 / 192 / 256 kbps，远程调音质需双方 alpha.6+ |
+| 桌面声音 | 播放与远程音质调整 | 采集与发送 | 默认或指定设备，设备变化后恢复；PICO 使用立体声 Opus，新配置默认 256 kbps，低延迟通路用 Opus PLC 掩蔽短时缺包，欠载后扩缓冲并在稳定时逐级回收；桌面 Opus 按带宽自适应降码率，网络稳定后逐级恢复；支持 64 / 128 / 192 / 256 kbps，远程调音质需双方 alpha.6+ |
 | 仅音频连接 | 支持 | 支持 | 默认 256 kbps，提供波形、电平、网络 RTT、精简模式，可恢复画面 |
 | 麦克风与虚拟声卡 | 选择麦克风、调整音质并发送 | 虚拟扬声器及远程麦克风接收 | 被控端需选装虚拟音频驱动，可配置默认音频设备切换策略 |
 | 剪贴板与文件拖放 | 支持 | 支持 | 文字、富文本、图片及文件复制；OpenUUYC 双端支持双向拖放，与官方端连接时使用其支持的发送方式 |
@@ -74,13 +74,13 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 | 键盘鼠标 | ✅ 含组合键、光标同步 | ✅ | ✅ | ✅ XTest，免设置 | ⚠️ uinput 需权限，否则仅 XWayland |
 | 手柄与震动 | ❌ | ❌ | ✅ 最多四个标准手柄，连接支持手柄的官方被控端 | ❌ | ❌ |
 | 绝对 / 相对鼠标 | ✅ 游戏锁定、可选节流 | ✅ | ✅ 游戏锁定、可选节流 | ✅ | ⚠️ 绝对定位需 xdg-output |
-| 触摸（多点） | ❌ 只发键鼠 | ✅ 移动端原生多点 | ❌ 只发键鼠 | ⚠️ 单指模拟 | ⚠️ 单屏未旋转时多点 |
-| 文字输入（移动端输入法） | — | ✅ | — | ✅ XTest | ⚠️ 虚拟键盘协议，GNOME 退回 XTest |
+| 触摸（多点） | ⚠️ OpenUUYC 被控当前屏原生多点，其余单指模拟 | ✅ 原生多点 | ⚠️ OpenUUYC 被控当前屏原生多点，其余单指模拟 | ⚠️ 单指模拟 | ⚠️ 单屏未旋转时多点 |
+| 文字输入（移动端输入法） | — | ✅ | — | ✅ XTest | ⚠️ Fcitx5 输入法门户（短时上下文）优先，回退虚拟键盘协议与 XTest，GNOME 退回 XTest |
 | 拦截本机快捷键 | ✅ | — | ⚠️ Xorg 抓键盘 / Wayland 需合成器协议 | — | — |
 | 多显示器切屏 | ✅ | ✅ | ✅ 顶栏屏标签，跟随远端拓扑 | ✅ | ✅ 门户需共享多屏 |
 | 播放中切换设备 | ✅ | — | ⚠️ 顶栏与全屏浮动栏，未实测 | — | — |
 | 多屏独立窗口 | ✅ 标签拖出 | — | ⚠️ 标签拖出，独立窗口各一块屏；仅硬解，Wayland 摆位由合成器决定 | — | — |
-| 分辨率 / DPI 调整 | ✅ 远端设置、本地拉伸 | ✅ | ✅ 远端设置、本地拉伸 | ⚠️ RandR 分辨率，无 DPI | ⚠️ 物理屏保持原分辨率（XWayland 不能改，按拒绝处理），虚拟屏经 niri；无 DPI |
+| 分辨率 / DPI 调整 | ✅ 远端设置、本地拉伸 | ✅ | ✅ 远端设置、本地拉伸 | ⚠️ RandR 分辨率（新尺寸首帧确认；30 秒未出帧回滚），无 DPI | ⚠️ 物理屏保持原分辨率（XWayland 不能改，按拒绝处理）；niri 虚拟屏与兜底屏切换后确认新尺寸首帧，30 秒未确认回滚；无 DPI |
 | 虚拟屏 / 超级屏 / 无屏兜底 | ✅ 操作远端 | ✅ 需显示驱动 | ✅ 操作远端 | ❌ | ⚠️ 仅 niri：虚拟屏与无屏兜底，内核 ≥ 6.19，需启用 openuuyc-vkms |
 | 桌面声音 | ✅ 播放、调音质 | ✅ | ✅ Pulse / PipeWire / ALSA | ✅ 录监听源 | ✅ 录监听源 |
 | 仅音频连接 | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -148,6 +148,26 @@ cargo dist
 源码已包含签名驱动包和公钥证书，构建主程序不需要签名私钥。修改驱动及发布前验证见 [驱动构建说明](drivers/README.md)。
 
 ### Linux
+
+### PICO VR 头显（Linux 桌面模式）
+
+支持通过本机 **OpenXR + WiVRn + WayVR** 让 PICO 头显显示并操控 OpenUUYC 的桌面窗口。WiVRn 在 Linux 和头显之间传输 VR 画面及手柄输入，WayVR 将 Wayland/X11 桌面映射到 VR 空间。OpenUUYC 的远控连接、编解码和授权机制不变，因此不会暴露额外的网络端口。
+
+> **边界**：这是 PICO 上的原生 OpenXR 桌面映射适配（2D 浮动窗口），**不是** PICO OS 专用 OpenUUYC APK，也不是双目 3D 远程画面。手柄输入由 WayVR 映射为桌面鼠标/键盘；OpenUUYC 尚未接收原始 6DoF 追踪数据。WiVRn 官方明确列出 PICO Neo 3、PICO 4，PICO 4 Ultra 请以实际固件和 WiVRn 版本验证。
+
+1. Linux 安装 [WiVRn](https://github.com/WiVRn/WiVRn) 和 [WayVR](https://github.com/wayvr-org/wayvr)。PICO 设备按 WiVRn 管理器指引安装与服务器相同版本的 Android VR 客户端。
+2. 先执行 `OpenUUYC pico-vr doctor` 检查命令、OpenXR 运行时清单；执行 `OpenUUYC pico-vr setup` 打开配对管理器。
+3. 在头显内连接 WiVRn 后执行 `OpenUUYC pico-vr launch`，使用 WayVR 的屏幕或应用视图显示 OpenUUYC 窗口并操作远端设备。若 WiVRn 已由外部进程管理，添加 `--no-dashboard`。
+4. 若在头显连接前启动，WayVR 的 `--wait` 会等待 OpenXR 运行时可用。首次连接时可能需要根据 WayVR 的提示授权 PipeWire 屏幕采集。
+
+**故障排查**：若 `doctor` 提示没有活跃 OpenXR runtime，先检查 WiVRn 客户端是否已连接；清单存在不等于已连接。WayVR 需可在 `PATH` 中找到。PICO/PC 端 WiVRn 版本必须一致。Wayland 下桌面采集依赖桌面门户与 PipeWire。WiVRn 的桌面 VR 能力不取代 OpenUUYC 自身的 UU 远控认证。
+
+
+### SteamVR PCVR 双目镜像
+
+SteamVR 场景镜像按每眼原生纹理尺寸采集，最大支持 **4096×4096/眼**；不支持的尺寸会明确拒绝，不再静默缩小。渲染眼位/FOV 与对应帧一起传输，并在投射前完成外部坐标系配准。
+
+这是分辨率与投影几何的 1:1 路径，不是逐像素无损传输：当前视频仍为 H.264 8-bit 4:2:0、20 Mbps。真实 SteamVR 验收需要正在运行的 SteamVR 场景和头显；合成夹具不构成实机证据。
 
 需要 Rust stable（edition 2024）与 C/C++ 工具链。
 
@@ -244,7 +264,7 @@ sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-
 #### 运行前提与开关
 
 - **运行环境**：登录态存在系统密钥环（Secret Service，需要 gnome-keyring、KWallet 等，没有明文回退）。托盘用 StatusNotifierItem，GNOME 需要 AppIndicator 扩展（Ubuntu 默认启用），桌面没有托盘时关闭窗口即退出；面板比程序晚起来时每 2 秒重试，托盘一出现就改回关闭收进托盘。粘贴远端文件要 `fuse3`。Wayland 会话被控也要有 XWayland（显示器列表与输入注入器都先连 X 服务器）；缩放（含分数缩放）的桌面上，门户共享的屏幕按合成器 `xdg-output` 布局里的输出名与所选显示器配对，需要 XWayland 23.1 及以上（输出以连接器命名）且程序能拿到 `WAYLAND_DISPLAY`，配不上时报错，不会采错屏。拖出文件的预览图要 `gio` 与 `rsvg-convert`。
-- **开机自启**：桌面接进 `graphical-session.target` 时是 systemd 用户单元 `openuuyc.service`（`journalctl --user -u openuuyc` 看日志），否则写 `~/.config/autostart/openuuyc.desktop`。两者都不处理的合成器（无 uwsm 的 sway、Hyprland 等）请自行启动 `OpenUUYC gui --background`。再次启动程序会经 `$XDG_RUNTIME_DIR/openuuyc/control.sock` 唤起已运行的控制中心。
+- **开机自启**：桌面接进 `graphical-session.target` 时是 systemd 用户单元 `app-openuuyc.service`（`journalctl --user -u app-openuuyc` 看日志）。单元名与 `openuuyc.desktop` 对应，门户才认得出这是 OpenUUYC，KDE 记下的屏幕共享授权才能沿用；旧版本启用的 `openuuyc.service` 在程序启动时迁移过去，迁移前的那次登录由它转发。否则写 `~/.config/autostart/openuuyc.desktop`。两者都不处理的合成器（无 uwsm 的 sway、Hyprland 等）请自行启动 `OpenUUYC gui --background`。再次启动程序会经 `$XDG_RUNTIME_DIR/openuuyc/control.sock` 唤起已运行的控制中心。
 - **协助邀请链接**：安装包的 `openuuyc.desktop` 登记了 `x-scheme-handler/uuremote`，没有 Windows 那样的接管开关，可用 `xdg-mime default <程序>.desktop x-scheme-handler/uuremote` 改。便携运行时把链接作为唯一参数传给程序。
 - **被控终端**：默认关闭，在被控设置的访问权限里打开，打开时会确认一次；以 root 运行时不提供，本机也不能新建。shell 跑在 pty 上，断线后保留、重连可接回（重开同一会话即接管，旧连接不再收输出），接回时重画当前屏幕，不带回已滚出屏幕的输出；主控开的会话在退出或切换账号、关闭终端开关、禁止被控或在本机断开连接时结束，两端都没有附着 30 分钟后也会结束。设置页显示运行中的会话数，可一键结束全部。
   - **终端会话页**：侧边栏常驻，列出全部会话，可结束；也能在本机新建会话，或用系统终端接上任一会话（`$TERMINAL` 优先，再找常见的终端模拟器）。命令行是 `OpenUUYC terminal [编号或名字]`、`--list`、`--new [名字]`，控制中心没在跑时新建和接入会以 `gui --background` 把它拉起来。本机经 `$XDG_RUNTIME_DIR/openuuyc/terminal.sock` 接入，只有同一用户能连。本机与主控同时附着时输入输出同步，终端按两边较小的尺寸显示；关掉本地终端只断开这一端。本机开的会话不会因空闲被结束，shell 退出后从列表消失。
@@ -253,7 +273,7 @@ sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-
 - **更新**：「关于」页的更新提醒指向上游的 Windows Release；Linux 版请从本 fork 的 Release 或 deb / AUR 包更新。下面的「命令行更新」只适用于 Windows。
 - **Gamescope**：在 SteamOS 游戏模式中，将原生程序添加为非 Steam 游戏即可，无需指定兼容性工具。启动时处理显示连接与缩放，控制中心匹配当前屏幕尺寸；保留手动设置的缩放比例。登录凭据使用系统配置的 Secret Service，锁定时先请求解锁；KWallet 解锁窗口会关联到当前 Steam 应用。
 - **手柄**：Linux 主控通过系统 SDL2 2.0.6 及以上读取标准手柄（Arch 安装 `sdl2-compat`，Debian / Ubuntu 安装 `libsdl2-2.0-0`），支持双摇杆、十字键、按钮和双扳机，震动回传还需要 SDL2 2.0.9 及以上版本和兼容手柄。SteamDeck 的 Steam Input 选择手柄布局（例如「支持视角控制的手柄」）。开启远控输入、将焦点留在播放窗口并松开已有按键后开始转发；失焦、操作本地菜单、拔出或断开连接时释放远端状态并停止震动。
-- **环境变量**：`OPENUUYC_CAPTURE` 指定采集后端顺序（如 `nvfbc`、`wlr`、`x11,portal`）；`OPENUUYC_ZEROCOPY=1` 让 VA-API 解码画面以 dmabuf 直接交给渲染器（只在 Intel 上验证过）；`OPENUUYC_CAPTURE_DMABUF=1` 与 `OPENUUYC_GPU_CONVERT=1` 是门户采集的试验开关；`OPENUUYC_BACKEND=gl|vulkan` 指定界面后端。
+- **环境变量**：`OPENUUYC_CAPTURE` 指定采集后端顺序（如 `nvfbc`、`wlr`、`x11,portal`）；VA-API 解码默认尝试通过 DMA-BUF 直接交给渲染器；不支持导入或导出失败时自动回退 CPU 回读，`OPENUUYC_ZEROCOPY=0` 可强制关闭（驱动接受导入但画面异常时也可使用）；`OPENUUYC_CAPTURE_DMABUF=1` 与 `OPENUUYC_GPU_CONVERT=1` 是门户采集的试验开关；`OPENUUYC_BACKEND=gl|vulkan` 指定界面后端。
 
 `cargo dist` 只用于 Windows 打包，Linux 直接用 `cargo build`。
 

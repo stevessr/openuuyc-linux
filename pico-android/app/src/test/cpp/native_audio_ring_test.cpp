@@ -1,0 +1,9 @@
+#include "native_audio_ring.h"
+#include <cassert>
+static_assert(ouaudio::timestamp_gap_action(false, 600) == ouaudio::GapAction::Continue);
+static_assert(ouaudio::timestamp_gap_action(false, 960) == ouaudio::GapAction::Continue);
+static_assert(ouaudio::timestamp_gap_action(false, 1080) == ouaudio::GapAction::Reset);
+static_assert(ouaudio::timestamp_gap_action(false, 601) == ouaudio::GapAction::Reset);
+static_assert(ouaudio::timestamp_gap_action(true, 0) == ouaudio::GapAction::Reset);
+static_assert(ouaudio::timestamp_gap_action(false, -120) == ouaudio::GapAction::Reject);
+int main(){ouaudio::Ring r;float in[240];for(auto&x:in)x=.25f;float out[240];assert(r.push(in,120));r.pull(out,120);for(auto x:out)assert(x==0);r.armed=true;r.pull(out,120);assert(out[0]>0.0f&&out[0]<.01f);assert(out[238]==.25f);r.pull(out,120);assert(r.underruns==1);assert(out[0]>.24f&&out[0]<.25f);assert(out[238]==0.0f);assert(r.push(in,120));r.pull(out,120);assert(out[0]>0.0f&&out[0]<.01f);assert(out[238]==.25f);r.reset=true;assert(!r.push(in,120));r.pull(out,120);assert(!r.reset);uint8_t p[504]{};std::memcpy(p,"OUA1",4);p[4]=1;p[6]=120;p[8]=1;p[20]=224;p[21]=1;ouaudio::Header h{};assert(ouaudio::parse(p,504,h));assert(!ouaudio::parse(p,503,h));p[5]=2;assert(!ouaudio::parse(p,504,h));}

@@ -305,29 +305,49 @@ impl Transport {
             .map(Self)
     }
 
-    pub(crate) fn audio_budget(&self, bitrate: u32) {
+    pub(crate) fn audio_budget(&self, reservation: u32, maximum: u32) {
+        let next = (maximum > 0).then_some(super::parameters::Bounds {
+            reservation: reservation.min(maximum),
+            maximum,
+            initial: reservation.min(maximum),
+            probe: 0,
+        });
         let mut allocations = lock(&self.0.allocations);
-        if allocations.get(&usize::MAX).map_or(0, |b| b.maximum) == bitrate {
+        if allocations.get(&usize::MAX).copied() == next {
             return;
         }
-        if bitrate == 0 {
-            allocations.remove(&usize::MAX);
-        } else {
-            allocations.insert(
-                usize::MAX,
-                super::parameters::Bounds {
-                    reservation: bitrate,
-                    maximum: bitrate,
-                    initial: bitrate,
-                    probe: bitrate,
-                },
-            );
+        match next {
+            Some(bounds) => {
+                allocations.insert(usize::MAX, bounds);
+            }
+            None => {
+                allocations.remove(&usize::MAX);
+            }
         }
         let bounds = super::allocation::total(&allocations);
         drop(allocations);
         if bounds.maximum > 0 {
             lock(&self.0.controller).configure(bounds, false);
         }
+    }
+    pub(crate) fn audio_allocation(&self) -> Option<u32> {
+        let (target, has_feedback) = {
+            let controller = lock(&self.0.controller);
+            (controller.target, controller.feedback_count > 0)
+        };
+        if !has_feedback {
+            return None;
+        }
+        let allocations = lock(&self.0.allocations);
+        if !allocations.contains_key(&usize::MAX) {
+            return None;
+        }
+        Some(super::allocation::share(
+            &allocations,
+            usize::MAX,
+            target,
+            super::allocation::View::Media,
+        ))
     }
     pub(crate) fn configure(&self, bounds: super::parameters::Bounds) {
         let bounds = {

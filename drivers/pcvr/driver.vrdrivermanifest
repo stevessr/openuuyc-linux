@@ -1,0 +1,8 @@
+{
+  "name": "openuuyc",
+  "directory": "",
+  "resourceOnly": false,
+  "hmd_presence": [],
+  "alwaysActivate": true,
+  "other_presence": ["*.*"]
+}

@@ -52,6 +52,10 @@ impl DataChannels {
             StreamControlHandle::new(profile, performance.clone());
         let port_mapping = Arc::new(crate::features::port_mapping::Transport::default());
         for channel in &local_channels {
+            if channel.label() == crate::features::remote_terminal::CHANNEL {
+                stream_control.terminal().bind(channel);
+                continue;
+            }
             if channel.label() == crate::diagnostics::remote::CHANNEL {
                 uu_kcp.bind_stream(channel.id(), false);
                 stream_control.diagnostics().bind(channel);
@@ -482,6 +486,7 @@ pub(super) async fn send_remote_input(
                 | InputEvent::Absolute { .. }
                 | InputEvent::Correction { .. } => "movement",
                 InputEvent::Wheel { .. } => "wheel",
+                InputEvent::Touch { .. } => "touch",
                 InputEvent::Heartbeat => "keyboard_heartbeat",
                 InputEvent::Gamepad(_) => "gamepad",
             };

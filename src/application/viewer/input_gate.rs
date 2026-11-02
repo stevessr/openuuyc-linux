@@ -47,6 +47,9 @@ impl InputGate {
 /// Whether keys a window owns should be kept from the local desktop's own
 /// shortcuts: the device's "intercept shortcuts" setting, a remote that takes
 /// keyboard input, and no shortcut recorder or text field claiming the keys.
-pub(super) fn intercepts_shortcuts(input: &RemoteInput, setting: bool) -> bool {
-    setting && input.keyboard_supported() && !crate::application::viewer_shortcuts::suspended()
+pub(super) fn intercepts_shortcuts(input: &RemoteInput, owner: u64, setting: bool) -> bool {
+    setting
+        && input.owner_enabled(owner)
+        && input.keyboard_supported()
+        && !crate::application::viewer_shortcuts::suspended()
 }

@@ -8,6 +8,7 @@ use display_info::DisplayInfo;
 pub(crate) mod compositor;
 pub(crate) mod recovery;
 pub(crate) mod topology;
+pub(crate) mod transaction;
 pub(crate) mod virtual_driver;
 pub(crate) mod wayland;
 

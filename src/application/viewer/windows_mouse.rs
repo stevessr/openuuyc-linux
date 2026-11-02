@@ -247,10 +247,17 @@ impl RawRouter {
             return;
         };
         let input = target.control.mouse();
+        // Touch goes out as touch; never also as the mouse Windows makes of it.
+        if crate::platform::windows::input::system::touch_promoted() {
+            return;
+        }
         if crate::platform::windows::input::system::own_message() && !input.accepts_host_input() {
             return;
         }
-        if input.mode() == MouseMode::View || input.waiting_for_neutral() {
+        if input.mode() == MouseMode::View
+            || !input.owner_enabled(owner)
+            || input.waiting_for_neutral()
+        {
             return;
         }
         let mut point = POINT::default();
@@ -399,6 +406,13 @@ impl RawRouter {
             return false;
         }
         let mouse = unsafe { raw.data.mouse };
+        // The mouse Windows promotes from a touch or pen contact: the contact
+        // itself already went out through `WindowMouse::touch`.
+        if crate::platform::windows::input::system::touch_message(mouse.ulExtraInformation as usize)
+            || crate::platform::windows::input::system::touch_promoted()
+        {
+            return false;
+        }
         let host_input = mouse.ulExtraInformation as usize
             == crate::platform::windows::input::system::INPUT_MARKER;
         let input = target.control.mouse();
@@ -413,7 +427,7 @@ impl RawRouter {
             unsafe { mouse.Anonymous.Anonymous.usButtonFlags }
         };
         let mode = input.mode();
-        if mode == MouseMode::View {
+        if mode == MouseMode::View || !input.owner_enabled(target.owner()) {
             return false;
         }
         if super::windows_keyboard::observe_mouse_buttons(target.owner(), flags)
@@ -496,6 +510,7 @@ impl RawRouter {
                 0,
             )
             || input.mode() == MouseMode::View
+            || !input.owner_enabled(target.owner())
         {
             return;
         }
@@ -621,6 +636,10 @@ impl WindowMouse {
         }
     }
 
+    pub fn owner(&self) -> u64 {
+        self.owner
+    }
+
     pub fn release(&mut self, window: &Window) {
         if self.drag.handoff_pending() {
             return;
@@ -641,6 +660,35 @@ impl WindowMouse {
 
     pub fn wheel(&self, delta: winit::event::MouseScrollDelta) {
         router().wheel(self.owner, delta);
+    }
+
+    /// Forwards one touchscreen contact on the picture. Returns false when
+    /// it belongs to the local UI and must reach egui untouched.
+    pub fn touch(
+        &self,
+        window: &Window,
+        context: &egui::Context,
+        control: &StreamControlHandle,
+        track: i32,
+        video_size: &VideoSize,
+        event: &winit::event::Touch,
+    ) -> bool {
+        let Some(target) = Target::for_window(window, control, context, track, video_size) else {
+            return false;
+        };
+        // winit reports client-area coordinates; position() converts from
+        // screen coordinates, so make the round trip explicitly.
+        let mut point = POINT {
+            x: event.location.x.round() as i32,
+            y: event.location.y.round() as i32,
+        };
+        // While a file drag owns the pointer no new contact reaches the
+        // remote; contacts already down still lift.
+        let spot = (!control.drag_drop().interactive()
+            && unsafe { ClientToScreen(HWND(target.hwnd as _), &mut point).as_bool() })
+        .then(|| target.position(point, false))
+        .flatten();
+        super::touch::forward(control, self.owner, event, spot)
     }
 
     fn release_capture(&mut self, window: &Window) -> bool {
@@ -681,7 +729,7 @@ impl WindowMouse {
         let gate = super::input_gate::InputGate {
             focused: window.has_focus(),
             minimized: window.is_minimized().unwrap_or(false),
-            controlling: mode != MouseMode::View,
+            controlling: mode != MouseMode::View && self.input.owner_enabled(self.owner),
             dragging: control.drag_drop().interactive(),
             menu_open,
             has_video: frame_size.is_some(),
@@ -922,7 +970,7 @@ impl Drop for WindowMouse {
     fn drop(&mut self) {
         super::windows_keyboard::clear(self.owner);
         router().clear(self.owner);
-        self.input.pause_owner(self.owner);
+        self.input.forget_owner(self.owner);
         // Winit releases cursor clipping with the owning Window. Normal paths
         // explicitly call release() while that Window is still alive.
     }

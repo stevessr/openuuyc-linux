@@ -58,7 +58,7 @@ pub(crate) const RETURN_CAPABLE: bool = false;
 /// Whether the left mouse button is down on the local display.
 pub(crate) fn left_held() -> bool {
     (|| -> Result<bool> {
-        let (connection, screen) = x11rb::connect(None)?;
+        let (connection, screen) = crate::platform::linux::x11_connection::connect()?;
         let root = connection.setup().roots[screen].root;
         let pointer = connection.query_pointer(root)?.reply()?;
         Ok(pointer.mask.contains(KeyButMask::BUTTON1))

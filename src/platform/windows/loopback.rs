@@ -1,7 +1,7 @@
 //! WASAPI render-endpoint loopback with explicit silence/discontinuity handling.
 use crate::media::audio::{
     dsp::Resampler,
-    sender::{BLOCK, RATE},
+    sender::{BLOCK, BLOCK_DURATION, RATE},
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -399,7 +399,7 @@ impl Convert {
                     if self.filled == self.frame.len() {
                         let timestamp = self.next.unwrap();
                         output(self.frame, timestamp);
-                        self.next = Some(timestamp + Duration::from_millis(10));
+                        self.next = Some(timestamp + BLOCK_DURATION);
                         self.filled = 0;
                     }
                 }

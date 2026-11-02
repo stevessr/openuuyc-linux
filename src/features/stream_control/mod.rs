@@ -153,7 +153,7 @@ pub struct StreamControlSettings {
 }
 
 pub(crate) fn default_auto_quality() -> i32 {
-    VIDEO_QUALITY_GENERAL
+    VIDEO_QUALITY_HD
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,7 +251,7 @@ impl StreamControlPreferences {
             auto_frame_quality: if settings.quality == StreamQuality::Auto {
                 saved.auto_frame_quality
             } else {
-                VIDEO_QUALITY_GENERAL
+                default_auto_quality()
             },
         }
     }
@@ -351,6 +351,7 @@ pub struct StreamControlHandle {
     drag_drop: crate::features::drag_drop::controller::Controller,
     files: Arc<crate::features::file_transfer::Transport>,
     diagnostics: crate::diagnostics::remote::Controller,
+    terminal: crate::features::remote_terminal::Terminal,
     mouse: crate::features::remote_input::RemoteInput,
     cursor: crate::features::remote_cursor::RemoteCursorState,
     audio: crate::media::audio::AudioPlayback,
@@ -557,7 +558,7 @@ impl StreamControlHandle {
                 requested_fps: profile.stream_fps,
                 fps_count,
                 frame_quality: VIDEO_QUALITY_AUTO,
-                auto_frame_quality: VIDEO_QUALITY_GENERAL,
+                auto_frame_quality: VIDEO_QUALITY_HD,
                 // Independent CursorShape coordinates are only sampled at
                 // shape changes. Watching needs capture-side cursor motion.
                 cursor_capture: true,
@@ -599,7 +600,7 @@ impl StreamControlHandle {
                     custom_bitrate_mbps: DEFAULT_CUSTOM_BITRATE_MBPS,
                 },
                 audio: None,
-                auto_frame_quality: VIDEO_QUALITY_GENERAL,
+                auto_frame_quality: VIDEO_QUALITY_HD,
             },
             pending_capture_preferences: VecDeque::new(),
             user_settings_requested: false,
@@ -622,6 +623,7 @@ impl StreamControlHandle {
                 drag_drop: Default::default(),
                 files: Arc::new(crate::features::file_transfer::Transport::default()),
                 diagnostics: Default::default(),
+                terminal: Default::default(),
                 mouse,
                 cursor,
                 audio,
@@ -672,6 +674,10 @@ impl StreamControlHandle {
 
     pub(crate) fn file_transfer(&self) -> &Arc<crate::features::file_transfer::Transport> {
         &self.files
+    }
+
+    pub(crate) fn terminal(&self) -> &crate::features::remote_terminal::Terminal {
+        &self.terminal
     }
 
     pub(crate) fn diagnostics(&self) -> &crate::diagnostics::remote::Controller {
@@ -976,3 +982,4 @@ mod input;
 mod settings;
 mod tracks;
 mod wire;
+pub(crate) use wire::encode_touch_input;

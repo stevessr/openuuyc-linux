@@ -17,3 +17,5 @@ pub mod plugins;
 mod ui;
 
 mod platform;
+
+pub mod pcvr;

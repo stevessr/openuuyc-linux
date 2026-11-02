@@ -34,7 +34,7 @@ fonts-noto-cjk | fonts-wqy-microhei | fonts-arphic-uming"""
 # gio (libglib2.0-bin) and rsvg-convert (librsvg2-bin) draw the host's drag
 # preview images; without them a drag goes out with no image.
 recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager, libglib2.0-bin, librsvg2-bin, libsdl2-2.0-0"
-suggests = "ethtool"
+suggests = "ethtool, libopenxr-loader1"
 assets = [
     ["target/release/OpenUUYC", "usr/bin/", "755"],
     # 被控端加虚拟屏要写 configfs，只有 root 能写，所以另有一个按需启动的系统服务。
@@ -43,6 +43,7 @@ assets = [
     ["packaging/linux/openuuyc.desktop", "usr/share/applications/", "644"],
     ["assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/openuuyc.png", "644"],
     ["packaging/linux/60-openuuyc-uinput.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/linux/app-openuuyc.service", "usr/lib/systemd/user/", "644"],
     ["packaging/linux/openuuyc.service", "usr/lib/systemd/user/", "644"],
     ["README.md", "usr/share/doc/openuuyc/", "644"],
     ["THIRD_PARTY_NOTICES", "usr/share/doc/openuuyc/", "644"],
@@ -90,7 +91,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 semver = "1.0"
 sha2 = "0.10.9"
-tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["rt"] }

@@ -245,3 +245,39 @@ impl WindowAdmission {
         (target - target / period as u32, drop)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn higher_default_auto_tier_still_downgrades_when_link_is_weak() {
+        let startup = crate::features::stream_control::default_auto_quality();
+        assert_eq!(startup, 3);
+        assert_eq!(
+            fixed(Format::AVC, startup, 0, (1920, 1080), 60).maximum,
+            14_000_000
+        );
+
+        let mut quality = AutoQuality::new(startup, 4);
+        let start = Instant::now();
+        let mut changed = None;
+        for second in 0..5 {
+            changed = quality.observe(
+                start + Duration::from_secs(second),
+                Format::AVC,
+                (1920, 1080),
+                60,
+                true,
+                NetworkSample {
+                    probe: 0,
+                    lower: 300_000,
+                    loss: 0.0,
+                    generation: 1,
+                },
+            );
+        }
+        assert_eq!(changed, Some(2));
+        assert_eq!(quality.quality(), 2);
+    }
+}

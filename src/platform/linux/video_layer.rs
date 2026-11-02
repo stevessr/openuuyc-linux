@@ -112,6 +112,20 @@ fn import_plane(
     height: u32,
 ) -> Option<wgpu::Texture> {
     use wgpu::hal::api::Vulkan as Vk;
+    // Reject invalid geometry before invoking the unsafe HAL import.
+    let bytes_per_pixel = match format {
+        wgpu::TextureFormat::R8Unorm => 1,
+        wgpu::TextureFormat::Rg8Unorm => 2,
+        _ => return None,
+    };
+    if width == 0
+        || height == 0
+        || width > device.limits().max_texture_dimension_2d
+        || height > device.limits().max_texture_dimension_2d
+        || plane.stride < u64::from(width) * bytes_per_pixel
+    {
+        return None;
+    }
     let fd = plane.dup().ok()?;
     // wgpu-hal wants its own descriptor type, with the usage already reduced to
     // the `TextureUses` bits the resource tracker understands.

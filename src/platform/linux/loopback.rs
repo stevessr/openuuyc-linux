@@ -5,15 +5,18 @@
 //! `libpulse.so.0` is opened at run time, so machines without a sound server
 //! report why there is no desktop sound instead of failing to start. The
 //! monitor is recorded as 48 kHz float stereo: the server resamples and
-//! downmixes, and this side only cuts it into 10-ms blocks on the capture
+//! downmixes, and this side only cuts it into 2.5-ms blocks on the capture
 //! clock, as the Windows loopback does.
-use crate::media::audio::sender::{BLOCK, RATE};
+use crate::media::audio::sender::{BLOCK, BLOCK_DURATION, RATE};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+const BLOCK_BYTES: usize = BLOCK * 2 * size_of::<f32>();
+const MAX_CAPTURE_BYTES: usize = BLOCK_BYTES * 12; // 30ms maximum, 2.5ms fragments
 
 pub(crate) type Samples = Arc<dyn Fn([f32; BLOCK * 2], Instant) + Send + Sync>;
 
@@ -130,6 +133,7 @@ struct Api {
         unsafe extern "C" fn(*mut c_void, *const c_char, *const BufferAttr, c_int) -> c_int,
     stream_get_state: unsafe extern "C" fn(*mut c_void) -> c_int,
     stream_readable_size: unsafe extern "C" fn(*mut c_void) -> usize,
+    stream_get_buffer_attr: unsafe extern "C" fn(*mut c_void) -> *const BufferAttr,
     stream_peek: unsafe extern "C" fn(*mut c_void, *mut *const c_void, *mut usize) -> c_int,
     stream_drop: unsafe extern "C" fn(*mut c_void) -> c_int,
     stream_disconnect: unsafe extern "C" fn(*mut c_void) -> c_int,
@@ -181,6 +185,7 @@ impl Api {
                 stream_connect_record: symbol!("pa_stream_connect_record"),
                 stream_get_state: symbol!("pa_stream_get_state"),
                 stream_readable_size: symbol!("pa_stream_readable_size"),
+                stream_get_buffer_attr: symbol!("pa_stream_get_buffer_attr"),
                 stream_peek: symbol!("pa_stream_peek"),
                 stream_drop: symbol!("pa_stream_drop"),
                 stream_disconnect: symbol!("pa_stream_disconnect"),
@@ -263,17 +268,19 @@ impl Connection {
     }
 
     /// One round of the event loop, waiting at most `timeout` for events.
-    fn run(&self, timeout: Duration) -> Result<()> {
+    fn run(&self, timeout: Duration) -> Result<usize> {
+        // libpulse mainloop prepare uses microseconds (unlike POSIX poll).
         let timeout = c_int::try_from(timeout.as_micros()).unwrap_or(c_int::MAX);
         unsafe {
             ensure!(
                 (self.api.mainloop_prepare)(self.mainloop, timeout) >= 0
-                    && (self.api.mainloop_poll)(self.mainloop) >= 0
-                    && (self.api.mainloop_dispatch)(self.mainloop) >= 0,
+                    && (self.api.mainloop_poll)(self.mainloop) >= 0,
                 "声音服务事件循环已停止"
             );
+            let dispatched = (self.api.mainloop_dispatch)(self.mainloop);
+            ensure!(dispatched >= 0, "声音服务事件循环已停止");
+            Ok(dispatched as usize)
         }
-        Ok(())
     }
 
     /// Runs the loop until `operation` completes. Its callback's user data
@@ -505,6 +512,9 @@ pub(crate) struct Capture {
     samples: Samples,
     opened: Instant,
     delivered: Option<Instant>,
+    data_bytes: u64,
+    hole_bytes: u64,
+    stale_bytes: u64,
 }
 
 pub(crate) fn open(endpoint: &Endpoint, samples: Samples) -> Result<Capture> {
@@ -530,10 +540,13 @@ pub(crate) fn open(endpoint: &Endpoint, samples: Samples) -> Result<Capture> {
         samples,
         opened: Instant::now(),
         delivered: None,
+        data_bytes: 0,
+        hole_bytes: 0,
+        stale_bytes: 0,
     };
-    // One 10-ms block per fragment keeps the server-side latency low.
+    // One 2.5-ms block per fragment keeps the server-side latency low.
     let attr = BufferAttr {
-        maxlength: u32::MAX,
+        maxlength: MAX_CAPTURE_BYTES as u32,
         tlength: u32::MAX,
         prebuf: u32::MAX,
         minreq: u32::MAX,
@@ -578,7 +591,14 @@ impl Capture {
     pub fn poll(&mut self) -> Result<()> {
         let api = self.connection.api;
         self.connection.check()?;
-        self.connection.run(Duration::ZERO)?;
+        // A libpulse read schedules deferred work. Drain ready I/O + deferred
+        // callbacks before sleeping again, rather than throttling each fragment
+        // to two application polls. Bounded to keep revocation responsive.
+        for _ in 0..8 {
+            if self.connection.run(Duration::ZERO)? == 0 {
+                break;
+            }
+        }
         ensure!(
             unsafe { (api.stream_get_state)(self.stream) } == STREAM_READY,
             "桌面声音采集已中断：{}",
@@ -608,14 +628,27 @@ impl Capture {
                     readable as f64 / (2. * 4. * f64::from(RATE)),
                 ))
                 .unwrap_or(now);
+            let skip = readable.saturating_sub(MAX_CAPTURE_BYTES).min(bytes) / 8 * 8;
+            self.stale_bytes += skip as u64;
+            if skip > 0 {
+                self.blocks.reset();
+            }
             if data.is_null() {
-                // A hole in the monitor: restart the block clock after it.
+                self.hole_bytes += bytes as u64;
                 self.blocks.reset();
             } else {
+                self.data_bytes += bytes as u64;
                 let samples = unsafe {
                     std::slice::from_raw_parts(data.cast::<f32>(), bytes / size_of::<f32>())
                 };
-                self.blocks.push(samples, at, &self.samples);
+                let offset = skip / size_of::<f32>();
+                if offset < samples.len() {
+                    self.blocks.push(
+                        &samples[offset..],
+                        at + Duration::from_secs_f64(skip as f64 / (8.0 * f64::from(RATE))),
+                        &self.samples,
+                    );
+                }
             }
             ensure!(
                 unsafe { (api.stream_drop)(self.stream) } >= 0,
@@ -650,7 +683,7 @@ impl Drop for Capture {
     }
 }
 
-/// Cuts interleaved 48 kHz stereo into 10-ms blocks, each stamped with the
+/// Cuts interleaved 48 kHz stereo into 2.5-ms blocks, each stamped with the
 /// capture time of its first sample.
 #[derive(Default)]
 struct Blocks {
@@ -692,7 +725,7 @@ impl Blocks {
             if self.frame.len() == BLOCK * 2 {
                 let timestamp = self.next.unwrap();
                 output(self.frame.as_slice().try_into().unwrap(), timestamp);
-                self.next = Some(timestamp + Duration::from_millis(10));
+                self.next = Some(timestamp + BLOCK_DURATION);
                 self.frame.clear();
             }
         }
@@ -703,6 +736,30 @@ impl Blocks {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn latency_capture_limit_is_twelve_aligned_fragments() {
+        assert_eq!(MAX_CAPTURE_BYTES, 11520);
+        assert_eq!(MAX_CAPTURE_BYTES % BLOCK_BYTES, 0);
+    }
+    #[test]
+    fn latency_blocks_preserve_short_timestamps_and_partial_fragments() {
+        let result = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let copy = result.clone();
+        let output: Samples = Arc::new(move |_, at| copy.lock().unwrap().push(at));
+        let start = Instant::now();
+        let mut blocks = Blocks::default();
+        blocks.push(&[0.0; BLOCK], start, &output);
+        blocks.push(
+            &[0.0; BLOCK * 3],
+            start + Duration::from_micros(1250),
+            &output,
+        );
+        let result = result.lock().unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], start);
+        assert_eq!(result[1], start + BLOCK_DURATION);
+    }
 
     /// Needs a sound server: `cargo test -- --ignored records_the_default`.
     #[test]
@@ -745,6 +802,18 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        let attributes = unsafe { (capture.connection.api.stream_get_buffer_attr)(capture.stream) };
+        if !attributes.is_null() {
+            let a = unsafe { &*attributes };
+            println!(
+                "capture bytes: data={}, holes={}, stale={}, server_max={}, server_fragment={}",
+                capture.data_bytes,
+                capture.hole_bytes,
+                capture.stale_bytes,
+                a.maxlength,
+                a.fragsize
+            );
+        }
         let (delay, before) = first.expect("no audio delivered");
         let rate = (blocks.load(Ordering::Relaxed) - before) as f64
             / (started.elapsed() - delay).as_secs_f64();
@@ -753,8 +822,8 @@ mod tests {
             peak.lock().unwrap()
         );
         assert!(
-            (90. ..=110.).contains(&rate),
-            "expected 100 blocks per second"
+            (360. ..=440.).contains(&rate),
+            "expected 400 short blocks per second"
         );
     }
 }

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "monado": {
+    "git": "https://gitlab.freedesktop.org/monado/monado.git",
+    "revision": "59be345db769a89c93d1bdf6ed8316fa6209d8ae"
+  },
+  "xrizer": {
+    "url": "https://codeload.github.com/Supreeeme/xrizer/tar.gz/0519ded7421e608805d710be01fdc51303eda16a",
+    "revision": "0519ded7421e608805d710be01fdc51303eda16a",
+    "sha256": "b69a55c2cb6716be30f698ff545dc7c5039cbb2886dc08c36ef7c9f49faaee12"
+  }
+}

@@ -35,6 +35,7 @@ pub(crate) struct Status {
     pub underrun_frames: u64,
 }
 struct Packet {
+    received: Instant,
     generation: u64,
     data: Bytes,
     sequence: u16,
@@ -205,10 +206,11 @@ impl Receiver {
         else {
             return;
         };
-        if data.len() > 65535 || !(480..=5760).contains(&frames) {
+        if data.len() > 65535 || !(crate::media::audio::sender::BLOCK..=5760).contains(&frames) {
             return;
         }
         self.shared.packets.force_push(Packet {
+            received: Instant::now(),
             generation,
             data,
             sequence,
@@ -311,6 +313,9 @@ impl Playout {
             let Some(packet) = shared.packets.pop() else {
                 break;
             };
+            if packet.received.elapsed() > Duration::from_millis(80) {
+                continue;
+            }
             if packet.generation != self.generation
                 || self.seen.contains(&(packet.sequence, packet.timestamp))
             {
