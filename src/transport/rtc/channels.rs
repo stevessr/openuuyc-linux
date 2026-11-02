@@ -11,7 +11,7 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_init::{RTCDataChannelInit, RTCDataChannelPriority};
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
@@ -35,6 +35,9 @@ pub(super) struct DataChannels {
     pub(super) streamer_sender_started: Arc<AtomicBool>,
     pub(super) stream_control: StreamControlHandle,
     pub(super) uu_kcp: UuKcpControl,
+    /// Only terminal TERM packets are published here; arbitrary binary channel
+    /// messages and credentials must not reach the interactive terminal.
+    pub(super) terminal_inbound: broadcast::Sender<Vec<u8>>,
     pub(super) workers: Arc<SessionWorkers>,
 }
 
@@ -51,6 +54,7 @@ impl DataChannels {
         let (stream_control, control_messages, echo_responses) =
             StreamControlHandle::new(profile, performance.clone());
         let port_mapping = Arc::new(crate::features::port_mapping::Transport::default());
+        let (terminal_inbound, _) = broadcast::channel(256);
         for channel in &local_channels {
             if channel.label() == crate::features::remote_terminal::CHANNEL {
                 stream_control.terminal().bind(channel);
@@ -90,6 +94,7 @@ impl DataChannels {
                 uu_kcp.clone(),
                 &workers,
                 Arc::clone(&port_mapping),
+                terminal_inbound.clone(),
             );
         }
         let control_channel = local_channels
@@ -129,6 +134,7 @@ impl DataChannels {
             streamer_sender_started,
             stream_control,
             uu_kcp,
+            terminal_inbound,
             workers,
         }
     }
@@ -142,6 +148,7 @@ impl DataChannels {
         uu_kcp: UuKcpControl,
         workers: &Arc<SessionWorkers>,
         port_mapping: Arc<crate::features::port_mapping::Transport>,
+        terminal_inbound: broadcast::Sender<Vec<u8>>,
     ) {
         if !local_channel {
             uu_kcp.bind_stream(channel.id(), channel.label() == "CONTROL_DATA_CHANNEL");
@@ -234,13 +241,21 @@ impl DataChannels {
 
         let label = channel.label().to_owned();
         let message_stream_control = stream_control;
+        let received_terminal = terminal_inbound;
         let drag_channel = Arc::downgrade(channel);
         channel.on_message(Box::new(move |message| {
             let drag_channel=drag_channel.clone();
             let mapping=Arc::clone(&port_mapping);
             let label = label.clone();
             let stream_control = message_stream_control.clone();
+            let received_terminal = received_terminal.clone();
             Box::pin(async move {
+                if label == "BINARY_DATA_CHANNEL" && message.data.starts_with(b"TERM") {
+                    // Never treat a terminal's binary output as protobuf, and
+                    // never log keystrokes or shell output.
+                    let _ = received_terminal.send(message.data.to_vec());
+                    return;
+                }
                 if matches!(label.as_str(), "TEXT_DATA_CHANNEL" | "FILE_DATA_CHANNEL") && crate::protocol::drag_drop::is_packet(&message.data) {
                     if local_channel && let Some(channel)=drag_channel.upgrade() {
                         if let Err(error) = stream_control.drag_drop().receive(&channel, &message.data, label == "FILE_DATA_CHANNEL") { tracing::warn!(%error,"invalid native drag message"); }
@@ -296,6 +311,7 @@ impl DataChannels {
             self.uu_kcp.clone(),
             &self.workers,
             Arc::clone(&self.port_mapping),
+            self.terminal_inbound.clone(),
         );
         std_mutex_lock(&self.incoming_channels).push(channel);
     }

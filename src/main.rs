@@ -149,6 +149,17 @@ enum Commands {
     },
     #[command(hide = true)]
     DisplayRecovery { token: String },
+    /// 使用 UU 官方终端协议控制已绑定设备（不建立桌面视频流）
+    RemoteTerminal {
+        /// 精确设备别名或设备 ID
+        device: String,
+        /// 只列出远端 Shell 会话
+        #[arg(long)]
+        list: bool,
+        /// 附着到远端已有会话；默认新建会话
+        #[arg(long)]
+        attach: Option<u32>,
+    },
     /// 列出或接上本机正在运行的被控终端会话
     Terminal {
         /// 会话名或编号；省略时列出
@@ -396,6 +407,11 @@ fn main() -> Result<()> {
             openuuyc::application::capture_agent(&pipe, parent)
         }
         Commands::DisplayRecovery { token } => openuuyc::application::display_recovery(&token),
+        Commands::RemoteTerminal { device, list, attach } => {
+            tokio::runtime::Runtime::new()?.block_on(
+                controller::terminal::run_saved(device, list, attach)
+            )
+        }
         Commands::Terminal { session, list, new } => {
             openuuyc::application::terminal_attach(session.as_deref(), list, new)
         }

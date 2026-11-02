@@ -78,6 +78,18 @@ pub struct NativePeer {
 }
 
 impl NativePeer {
+    /// UU terminal connections use the official reliable binary data channel.
+    /// Subscribe before the first request so an immediate OPEN_RESP is not lost.
+    pub(crate) fn terminal_transport(
+        &self,
+    ) -> anyhow::Result<(Arc<webrtc::data_channel::RTCDataChannel>, tokio::sync::broadcast::Receiver<Vec<u8>>)> {
+        let channel = self.data_channels._local_channels.iter()
+            .find(|channel| channel.label() == "BINARY_DATA_CHANNEL")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("UU binary terminal channel is missing"))?;
+        Ok((channel, self.data_channels.terminal_inbound.subscribe()))
+    }
+
     pub(crate) fn port_mapping(&self) -> Arc<crate::features::port_mapping::Transport> {
         Arc::clone(&self.data_channels.port_mapping)
     }

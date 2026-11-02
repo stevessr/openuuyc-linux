@@ -790,5 +790,6 @@ fn flatten_signal_task(
     result.context("controller signaling task failed")?
 }
 
+pub mod terminal;
 mod connection;
 mod viewing;

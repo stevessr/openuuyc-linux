@@ -36,6 +36,8 @@ pub(crate) enum ControlPurpose {
     Audio,
     PortMapping,
     FileTransfer,
+    /// UU official headless remote terminal (ConnectOptions.kind = 8).
+    Terminal,
 }
 
 pub(crate) fn build_control_frames(
@@ -192,6 +194,7 @@ fn encode_connect_options(
             ControlPurpose::Viewing | ControlPurpose::Audio => 1,
             ControlPurpose::PortMapping => 9,
             ControlPurpose::FileTransfer => 5,
+            ControlPurpose::Terminal => 8,
         },
     );
     push_signed_int32_field(&mut options, 2, -1);
