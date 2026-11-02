@@ -16,6 +16,8 @@ use webrtc::data_channel::{RTCDataChannel, data_channel_state::RTCDataChannelSta
 const MAGIC: &[u8;4] = b"TERM";
 const HEADER: usize = 16;
 const MAX_PAYLOAD: usize = 1024 * 1024;
+const MAX_FRAMES_PER_PACKET: usize = 256;
+const SEND_HIGH_WATER: usize = 1024 * 1024;
 const OPEN: u8 = 1;
 const STDIN: u8 = 2;
 const RESIZE: u8 = 3;
@@ -61,6 +63,7 @@ impl Decoder {
             let len = u32::from_le_bytes(b[12..16].try_into()?) as usize;
             ensure!(len <= MAX_PAYLOAD, "TERM frame exceeds 1 MiB");
             if b.len() < HEADER + len { break; }
+            ensure!(output.len() < MAX_FRAMES_PER_PACKET, "too many coalesced TERM frames");
             output.push(Frame {
                 kind: b[5],
                 session: u32::from_le_bytes(b[8..12].try_into()?),
@@ -89,6 +92,16 @@ impl Terminal {
     async fn send(&self, kind: u8, session: u32, body: &[u8]) -> Result<()> {
         ensure!(self.channel.ready_state() == RTCDataChannelState::Open,
                 "UU remote terminal channel is not open");
+        // Apply SCTP backpressure rather than buffering unlimited keyboard or
+        // paste data if the remote console stops reading.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while self.channel.buffered_amount().await > SEND_HIGH_WATER {
+            ensure!(self.channel.ready_state() == RTCDataChannelState::Open,
+                    "remote terminal channel closed during input backpressure");
+            ensure!(tokio::time::Instant::now() < deadline,
+                    "remote terminal data channel is backpressured");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         self.channel.send(&Bytes::from(encode(kind, session, body)?)).await?;
         Ok(())
     }
@@ -381,6 +394,11 @@ mod tests {
         data[12..16].copy_from_slice(&(MAX_PAYLOAD as u32 + 1).to_le_bytes());
         assert!(Decoder::default().push(&data).is_err());
         assert!(encode(STDIN, 1, &vec![0; MAX_PAYLOAD+1]).is_err());
+        let mut coalesced = Vec::new();
+        for _ in 0..MAX_FRAMES_PER_PACKET + 1 {
+            coalesced.extend(encode(STDOUT, 1, b"").unwrap());
+        }
+        assert!(Decoder::default().push(&coalesced).is_err());
         let mut bad = encode(OPEN, 0, b"").unwrap();
         bad[4] = 2;
         assert!(Decoder::default().push(&bad).is_err());
