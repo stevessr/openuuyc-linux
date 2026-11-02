@@ -1,9 +1,10 @@
-//! Read the private latest-frame export from the real Monado compositor.
+//! Read the private latest-frame export from a real XR compositor.
 //! Pixels are CPU readback for now; never substitute desktop capture.
 use anyhow::{Context, Result, ensure};
 use std::{fs::File, os::unix::fs::FileExt};
 const HEADER: usize = 256;
-const EYE_BYTES: usize = 1024 * 1024 * 4;
+const MAX_EYE_DIMENSION: usize = 4096;
+const EYE_BYTES: usize = MAX_EYE_DIMENSION * MAX_EYE_DIMENSION * 4;
 pub(crate) const MAP_BYTES: usize = HEADER + 2 * EYE_BYTES;
 pub(crate) struct RawFrame {
     pub sequence: u64,
@@ -18,6 +19,12 @@ pub(crate) struct RawFrame {
     /// External producers only (export version 3): the rendering head pose in
     /// the producer's own space, paired with these eyes.
     pub head: Option<[f32; 7]>,
+}
+fn valid_eye_geometry(w: usize, h: usize) -> bool {
+    (64..=MAX_EYE_DIMENSION).contains(&w)
+        && w % 2 == 0
+        && (64..=MAX_EYE_DIMENSION).contains(&h)
+        && h % 2 == 0
 }
 /// Both clocks are host CLOCK_MONOTONIC; PICO timestamps must not be compared here.
 pub(crate) fn fresh_at(predicted_time: i64, now: i64) -> bool {
@@ -95,10 +102,7 @@ pub(crate) fn read_latest(file: &File, previous: u64) -> Result<Option<RawFrame>
     let w = u32_at(32) as usize;
     let h = u32_at(36) as usize;
     ensure!(
-        (64..=1024).contains(&w)
-            && w % 2 == 0
-            && (64..=1024).contains(&h)
-            && h % 2 == 0
+        valid_eye_geometry(w, h)
             && u32_at(40) == 1
             && timestamp > 0
             && timestamp <= i64::MAX as u64,
@@ -178,6 +182,14 @@ mod tests {
         assert!(!fresh_at(now + 100_000_001, now));
         assert!(!fresh_at(0, now));
         assert!(!fresh_at(i64::MAX, now));
+    }
+    #[test]
+    fn accepts_native_eye_sizes_up_to_the_sbs_decoder_limit() {
+        assert!(valid_eye_geometry(4096, 4096));
+        assert!(!valid_eye_geometry(4097, 4096));
+        assert!(!valid_eye_geometry(4096, 4097));
+        assert!(!valid_eye_geometry(4095, 4096));
+        assert!(!valid_eye_geometry(4096, 4095));
     }
     fn fixture() -> File {
         use std::os::unix::fs::OpenOptionsExt;
@@ -321,7 +333,7 @@ mod tests {
         file.write_all_at(&3u64.to_le_bytes(), 0).unwrap();
         assert!(read_latest(&file, 0).unwrap().is_none());
         file.write_all_at(&4u64.to_le_bytes(), 0).unwrap();
-        file.write_all_at(&2048u32.to_le_bytes(), 32).unwrap();
+        file.write_all_at(&4098u32.to_le_bytes(), 32).unwrap();
         assert!(read_latest(&file, 0).is_err());
     }
 }

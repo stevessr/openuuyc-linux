@@ -39,9 +39,10 @@ struct Player {
   if(ring.reset.load(std::memory_order_acquire))return false;
   if(timeline){
    const int32_t delta=static_cast<int32_t>(h.timestamp-(lastTimestamp+120));
-   if(delta<0){rejected++;return false;}
-   if(h.reset||delta>480||delta%120){ring.reset.store(true,std::memory_order_release);timeline=false;lastCodec=-1;}
-   else for(int32_t gap=0;gap<delta;gap+=120){float silence[240]{};if(lastCodec==1 && opus_decode_float(decoder,nullptr,0,silence,120,0)<0)std::fill_n(silence,240,0.0f);ring.push(silence,120);gaps++;}
+   const auto action=ouaudio::timestamp_gap_action(h.reset,delta);
+   if(action==ouaudio::GapAction::Reject){rejected++;return false;}
+   if(action==ouaudio::GapAction::Reset){ring.reset.store(true,std::memory_order_release);timeline=false;lastCodec=-1;}
+   else for(int32_t gap=0;gap<delta;gap+=int32_t(ouaudio::kAudioPacketFrames)){float silence[240]{};if(lastCodec==1 && opus_decode_float(decoder,nullptr,0,silence,120,0)<0)std::fill_n(silence,240,0.0f);ring.push(silence,120);gaps++;}
   }
   if(lastCodec!=h.codec){opus_decoder_ctl(decoder,OPUS_RESET_STATE);lastCodec=h.codec;}
   float pcm[240];const auto started=std::chrono::steady_clock::now();
@@ -69,9 +70,9 @@ extern "C" JNIEXPORT jlongArray JNICALL Java_org_openuuyc_pico_uu_UuNativeAudio_
  const jlong values[]={jlong(p.packets),jlong(p.ring.played.load()),jlong(p.ring.underruns.load()),jlong(p.ring.dropped.load()),jlong(p.ring.queued()),jlong(p.failed.load()),p.burst,p.buffer,jlong(p.packets?p.decodeNs/p.packets:0),jlong(p.gaps),jlong(p.rejected),AAudioStream_getXRunCount(p.stream),jlong(p.ring.callbacks.load())};
  auto result=env->NewLongArray(13);if(result)env->SetLongArrayRegion(result,0,13,values);return result;
 }
-// Debug instrumentation: generated silence only, no network or microphone.
+// Debug instrumentation: generated silence with one timestamp gap; no network or microphone.
 extern "C" JNIEXPORT jlongArray JNICALL Java_org_openuuyc_pico_uu_UuNativeAudio_nativeProbe(JNIEnv*env,jobject){
- Player p;jlong values[7]={0,0,0,0,0,0,0};
+ Player p;jlong values[8]={0,0,0,0,0,0,0,0};
  if(p.open(12345)) {
   int error=0;OpusEncoder*encoder=opus_encoder_create(48000,2,OPUS_APPLICATION_RESTRICTED_LOWDELAY,&error);
   if(encoder&&error==OPUS_OK){
@@ -82,13 +83,13 @@ extern "C" JNIEXPORT jlongArray JNICALL Java_org_openuuyc_pico_uu_UuNativeAudio_
    for(uint32_t i=0;i<160;i++){
     packet[5]=i<80?0:1;put(12,i+1);put(16,i*120);
     int n=480;if(packet[5])n=opus_encode_float(encoder,zeros,120,packet+24,1200);else std::memset(packet+24,0,480);
-    if(n>0){put(20,uint32_t(n));p.feed(packet,24+size_t(n));}
+    if(n>0 && !(i>=100 && i<105)){put(20,uint32_t(n));p.feed(packet,24+size_t(n));}
     if(p.ring.callbacks.load()>0 && p.ring.queued()>=uint32_t(p.burst*2))p.ring.armed.store(true);
     std::this_thread::sleep_until(anchor+std::chrono::microseconds((i+1)*2500));
    }
    opus_encoder_destroy(encoder);
-   values[0]=1;values[1]=jlong(p.packets);values[2]=jlong(p.ring.played.load());values[3]=p.burst;values[4]=p.buffer;values[5]=jlong(p.ring.underruns.load());values[6]=AAudioStream_getPerformanceMode(p.stream);
+   values[0]=1;values[1]=jlong(p.packets);values[2]=jlong(p.ring.played.load());values[3]=p.burst;values[4]=p.buffer;values[5]=jlong(p.ring.underruns.load());values[6]=AAudioStream_getPerformanceMode(p.stream);values[7]=jlong(p.gaps);
   }
  }
- auto result=env->NewLongArray(7);if(result)env->SetLongArrayRegion(result,0,7,values);return result;
+ auto result=env->NewLongArray(8);if(result)env->SetLongArrayRegion(result,0,8,values);return result;
 }

@@ -171,6 +171,7 @@ fn build_pcvr_mirror() {
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     for path in [
         "drivers/pcvr/mirror.cpp",
+        "drivers/pcvr/mirror_extent.h",
         "drivers/pcvr/mirror_pose.h",
         "drivers/pcvr/vendor/openvr.h",
         "drivers/openxr/stereo_capture.c",

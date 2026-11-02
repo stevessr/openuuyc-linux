@@ -162,6 +162,9 @@ jobs:
             -Wall -Wextra -Werror -Wno-unused-parameter \
             drivers/pcvr/tests/driver_test.cpp -o /tmp/openuuyc-pcvr-test
           /tmp/openuuyc-pcvr-test
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            drivers/pcvr/tests/mirror_extent_test.cpp -o /tmp/openuuyc-pcvr-mirror-extent-test
+          /tmp/openuuyc-pcvr-mirror-extent-test
       - name: Validate PICO bridge authentication and protocol
         run: cargo test --locked --lib pico_bridge -- --nocapture
 

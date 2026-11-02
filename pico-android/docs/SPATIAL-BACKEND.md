@@ -58,6 +58,19 @@ CI 临时 debug 签名不能假定跨工作流一致，发行版本必须使用�
 
 当前 OS 5 头显不安装此 APK，不更改其系统或已安装兼容版。
 
+### OS 5/OpenXR debug XR test input
+
+`org.openuuyc.pico.DEBUG_XR_TEST_INPUT` is registered during `onResume` only by a debuggable `XrActivity`. Commands are accepted only while the XR session is running and its toolbar is active. The dynamic receiver requires sender permission `android.permission.DUMP` (ADB shell); release builds and background activities do not accept it.
+
+```bash
+adb shell am broadcast -p org.openuuyc.pico -a org.openuuyc.pico.DEBUG_XR_TEST_INPUT --es command quick_menu --ei hand 0
+adb shell am broadcast -p org.openuuyc.pico -a org.openuuyc.pico.DEBUG_XR_TEST_INPUT --es command navigate --ei direction 107 --ez confirm false
+adb shell am broadcast -p org.openuuyc.pico -a org.openuuyc.pico.DEBUG_XR_TEST_INPUT --es command navigate --ei direction 0 --ez confirm true
+adb shell am broadcast -p org.openuuyc.pico -a org.openuuyc.pico.DEBUG_XR_TEST_INPUT --es command menu_click --ef u 0.5 --ef v 0.22
+```
+
+`quick_menu` requires `hand=0|1`; `navigate` accepts `-1`, `0`, `1`, `9`, or radial sectors `100..107` (confirm only with direction `0`); `menu_click` uses normalized toolbar coordinates in `[0,1]`. These commands invoke the existing XR menu callbacks only. They do not synthesize controller poses, eye/FOV calibration, or stereo frames; PCVR startup still requires real headset calibration and the normal host-side quick-app policy.
+
 ## 本轮验证（2026-10-27）
 
 - OS 6 后端：使用实际官方 Maven SDK，`:spatial:assembleDebug` 和 `:spatial:lintDebug` 通过。

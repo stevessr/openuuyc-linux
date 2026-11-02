@@ -68,6 +68,7 @@ open class PicoActivity : Activity() {
     private external fun nativeSetFollowView(enabled: Boolean)
     private var xrWindowFrame: PicoXrWindowFrame? = null
     private var xrToolbar: PicoXrToolbar? = null
+    private var debugXrTestInputReceiver: android.content.BroadcastReceiver? = null
     private var xrDeviceAlias="远程设备"
     private var xrDeviceId=""
     private var xrMainAlive=true
@@ -1053,9 +1054,72 @@ open class PicoActivity : Activity() {
         if (!hasFocus) { panelVideo?.releasePointer(); remoteKeyboard?.cancelVoice();remoteKeyboard?.releaseKeys(); xrToolbar?.releaseKeyboardKeys(); session?.releaseInputs() }
     }
 
-    override fun onResume() {super.onResume();UuDirectSession.setApplicationFocused(true)}
+    @Suppress("DEPRECATION")
+    private fun registerDebugXrTestInput() {
+        if (this !is XrActivity ||
+            applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0 ||
+            debugXrTestInputReceiver != null) return
+
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: android.content.Context, intent: Intent) {
+                if (intent.`package` != packageName) {
+                    Log.w("PicoXrTestInput", "Rejected non-package-scoped XR input")
+                    return
+                }
+                val command = PicoXrTestInput.parse(
+                    intent.action,
+                    intent.getStringExtra("command"),
+                    if (intent.hasExtra("hand")) intent.getIntExtra("hand", -1) else null,
+                    if (intent.hasExtra("direction")) intent.getIntExtra("direction", Int.MIN_VALUE) else null,
+                    if (intent.hasExtra("confirm")) intent.getBooleanExtra("confirm", false) else null,
+                    if (intent.hasExtra("u")) intent.getFloatExtra("u", Float.NaN) else null,
+                    if (intent.hasExtra("v")) intent.getFloatExtra("v", Float.NaN) else null
+                )
+                if (command == null) {
+                    Log.w("PicoXrTestInput", "Rejected malformed XR test input")
+                    return
+                }
+                if (!running.get() || isFinishing || isDestroyed || xrToolbar == null) {
+                    Log.w("PicoXrTestInput", "Rejected XR test input while toolbar is unavailable")
+                    return
+                }
+                when (command) {
+                    is PicoXrTestInput.Command.QuickMenu -> this@PicoActivity.onXrQuickMenu(command.hand)
+                    is PicoXrTestInput.Command.Navigate -> this@PicoActivity.onXrMenuNavigate(command.direction, command.confirm)
+                    is PicoXrTestInput.Command.MenuClick -> this@PicoActivity.onXrMenuClick(command.u, command.v)
+                }
+                Log.i("PicoXrTestInput", "Applied debug XR menu input")
+            }
+        }
+        val filter = android.content.IntentFilter(PicoXrTestInput.ACTION)
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(receiver, filter, android.Manifest.permission.DUMP, null, android.content.Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter, android.Manifest.permission.DUMP, null)
+            }
+            debugXrTestInputReceiver = receiver
+            Log.i("PicoXrTestInput", "Debug XR input receiver registered")
+        } catch (error: Exception) {
+            Log.w("PicoXrTestInput", "Could not register debug XR input receiver", error)
+        }
+    }
+
+    private fun unregisterDebugXrTestInput() {
+        val receiver = debugXrTestInputReceiver ?: return
+        debugXrTestInputReceiver = null
+        runCatching { unregisterReceiver(receiver) }
+            .onFailure { Log.w("PicoXrTestInput", "Could not unregister debug XR input receiver", it) }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        UuDirectSession.setApplicationFocused(true)
+        registerDebugXrTestInput()
+    }
 
     override fun onPause() {
+        unregisterDebugXrTestInput()
         if(pendingTransferDocument==null) closeAppDirectories()
         UuDirectSession.setApplicationFocused(false)
         panelVideo?.releasePointer(); terminalKeyboard?.releaseKeys();remoteKeyboard?.cancelVoice();remoteKeyboard?.releaseKeys(); xrToolbar?.releaseKeyboardKeys(); session?.releaseInputs()

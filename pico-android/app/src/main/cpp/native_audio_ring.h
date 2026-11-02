@@ -6,6 +6,19 @@
 #include <cstring>
 namespace ouaudio {
 constexpr uint32_t kCapacity=4096;
+// Conceal up to 20 ms of whole 2.5 ms packets before rebasing the timeline.
+constexpr uint32_t kAudioPacketFrames = 120;
+constexpr uint32_t kMaxConcealedPackets = 8;
+enum class GapAction : uint8_t { Reject, Continue, Reset };
+constexpr GapAction timestamp_gap_action(bool reset, int32_t delta) {
+    if (delta < 0) return GapAction::Reject;
+    if (reset ||
+        delta > static_cast<int32_t>(kAudioPacketFrames * kMaxConcealedPackets) ||
+        delta % static_cast<int32_t>(kAudioPacketFrames) != 0) {
+        return GapAction::Reset;
+    }
+    return GapAction::Continue;
+}
 struct Header {uint8_t codec;bool reset;uint16_t frames;uint32_t epoch,sequence,timestamp,length;};
 inline uint32_t le32(const uint8_t*p){return uint32_t(p[0])|uint32_t(p[1])<<8|uint32_t(p[2])<<16|uint32_t(p[3])<<24;}
 inline bool parse(const uint8_t*p,size_t n,Header&h){

@@ -95,6 +95,7 @@ struct Shared {
     encoding: Mutex<Option<Config>>,
     quality_control: AtomicBool,
     remote_quality: AtomicU32,
+    adaptive_bitrate: AtomicU32,
     quality_report: Mutex<(u64, Option<(crate::media::audio::encoder::Quality, u32)>)>,
     status: Mutex<Status>,
     generation: AtomicU64,
@@ -140,6 +141,7 @@ impl Audio {
             encoding: Mutex::default(),
             quality_control: AtomicBool::new(false),
             remote_quality: AtomicU32::new(0),
+            adaptive_bitrate: AtomicU32::new(0),
             quality_report: Mutex::new((0, None)),
             status: Mutex::default(),
             generation: AtomicU64::new(0),
@@ -181,6 +183,18 @@ impl Audio {
         } else {
             crate::media::audio::encoder::Quality { kbps }
         }
+    }
+    fn selected_encoding(&self) -> Option<Config> {
+        let config = *lock(&self.0.encoding);
+        config.map(|config| config.quality(self.quality()))
+    }
+    fn adaptive_encoding(&self) -> Option<Config> {
+        let mut config = self.selected_encoding()?;
+        let cap = self.0.adaptive_bitrate.load(Ordering::Relaxed);
+        if cap > 0 {
+            config.bitrate = config.bitrate.min(cap);
+        }
+        Some(config)
     }
     fn quality_status(&self) -> Option<(u64, crate::media::audio::encoder::Quality, Config)> {
         let mut report = lock(&self.0.quality_report);
@@ -351,6 +365,8 @@ impl Audio {
         let mut retry = Retry::new(origin);
         let mut next_device_check = origin;
         let mut next_status = origin;
+        let mut rate_policy = AdaptiveAudioBitrate::default();
+        let mut next_rate_update = origin;
         let mut started = None;
         while !self.0.cancel.is_cancelled() && self.0.lease.requested() {
             let now = Instant::now();
@@ -469,18 +485,40 @@ impl Audio {
                 status.capturing = false;
                 status.device.clear();
             }
-            self.0
-                .transport
-                .audio_budget(if stream.is_some() && wanted {
-                    self.encoding()
-                        .map_or(0, |c| {
-                            c.bitrate
-                                .saturating_add(80 * 8 * RATE / c.packet_samples as u32)
-                        })
-                        .saturating_add(self.0.native.bandwidth())
+            if now >= next_rate_update {
+                next_rate_update = now + Duration::from_millis(250);
+                let selected = if stream.is_some() && wanted {
+                    self.selected_encoding()
                 } else {
-                    0
+                    None
+                };
+                let native = self.0.native.bandwidth();
+                let available = selected.and_then(|config| {
+                    self.0.transport.audio_allocation().map(|rate| {
+                        rate.saturating_sub(audio_wire_overhead(config))
+                            .saturating_sub(native)
+                    })
                 });
+                let ceiling = selected.map_or(0, |config| config.bitrate);
+                let rate = rate_policy.update(now, ceiling, available);
+                self.0.adaptive_bitrate.store(rate, Ordering::Relaxed);
+            }
+            let (reservation, maximum) = if stream.is_some() && wanted {
+                let native = self.0.native.bandwidth();
+                let reservation = self.adaptive_encoding().map_or(0, |config| {
+                    config.bitrate.saturating_add(audio_wire_overhead(config))
+                });
+                let maximum = self.selected_encoding().map_or(0, |config| {
+                    config.bitrate.saturating_add(audio_wire_overhead(config))
+                });
+                (
+                    reservation.saturating_add(native),
+                    maximum.saturating_add(native),
+                )
+            } else {
+                (0, 0)
+            };
+            self.0.transport.audio_budget(reservation, maximum);
             if now >= next_status {
                 let budget = rt_frame_budget(self.0.lease.audio_refresh_rate());
                 self.0
@@ -508,7 +546,7 @@ impl Audio {
         drop(stream);
         drop(endpoint);
         drop(devices);
-        self.0.transport.audio_budget(0);
+        self.0.transport.audio_budget(0, 0);
         self.0.stopped.store(true, Ordering::Release);
         self.0.wake.notify_one();
         self.0.report_wake.notify_one();
@@ -559,8 +597,7 @@ impl Source for Audio {
         &self.0.stopped
     }
     fn encoding(&self) -> Option<Config> {
-        let config = *lock(&self.0.encoding);
-        config.map(|config| config.quality(self.quality()))
+        self.adaptive_encoding()
     }
     fn frames(&self) -> &ArrayQueue<Frame> {
         &self.0.frames
@@ -578,6 +615,73 @@ impl Source for Audio {
     }
     fn send_error(&self, error: String) {
         lock(&self.0.status).error = Some(error);
+    }
+}
+
+fn audio_wire_overhead(config: Config) -> u32 {
+    80 * 8 * RATE / config.packet_samples as u32
+}
+
+const AUDIO_RATE_STEPS: [u32; 4] = [64_000, 128_000, 192_000, 256_000];
+#[derive(Default)]
+struct AdaptiveAudioBitrate {
+    current: u32,
+    feedback_seen: bool,
+    recovery_since: Option<Instant>,
+}
+impl AdaptiveAudioBitrate {
+    fn update(&mut self, now: Instant, ceiling: u32, available: Option<u32>) -> u32 {
+        if ceiling == 0 {
+            *self = Self::default();
+            return 0;
+        }
+        let Some(available) = available else {
+            self.current = if self.feedback_seen {
+                self.current.min(ceiling)
+            } else {
+                ceiling
+            };
+            self.recovery_since = None;
+            return self.current;
+        };
+        self.feedback_seen = true;
+        let floor = ceiling.min(AUDIO_RATE_STEPS[0]);
+        let target = if available >= ceiling {
+            ceiling
+        } else {
+            AUDIO_RATE_STEPS
+                .iter()
+                .copied()
+                .filter(|rate| *rate < ceiling && *rate <= available)
+                .max()
+                .unwrap_or(floor)
+        };
+        let current = if self.current == 0 {
+            ceiling
+        } else {
+            self.current.min(ceiling)
+        };
+        if target < current {
+            self.current = target;
+            self.recovery_since = None;
+        } else if target > current {
+            let since = *self.recovery_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= Duration::from_secs(5) {
+                self.current = AUDIO_RATE_STEPS
+                    .iter()
+                    .copied()
+                    .find(|rate| *rate > current && *rate <= target && *rate < ceiling)
+                    .unwrap_or(target)
+                    .min(ceiling);
+                self.recovery_since = Some(now);
+            } else {
+                self.current = current;
+            }
+        } else {
+            self.current = current;
+            self.recovery_since = None;
+        }
+        self.current
     }
 }
 
@@ -648,5 +752,141 @@ mod latency_tests {
             retained.push(block);
         }
         assert_eq!(retained, (2..10).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod adaptive_audio_bitrate_tests {
+    use super::AdaptiveAudioBitrate;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn downshifts_to_supported_rate_and_recovers_one_step_per_five_seconds() {
+        let start = Instant::now();
+        let mut policy = AdaptiveAudioBitrate::default();
+        assert_eq!(policy.update(start, 256_000, None), 256_000);
+        assert_eq!(
+            policy.update(start + Duration::from_secs(1), 256_000, Some(128_000)),
+            128_000
+        );
+        assert_eq!(
+            policy.update(start + Duration::from_secs(2), 256_000, Some(256_000)),
+            128_000
+        );
+        assert_eq!(
+            policy.update(start + Duration::from_secs(6), 256_000, Some(256_000)),
+            128_000
+        );
+        assert_eq!(
+            policy.update(start + Duration::from_secs(7), 256_000, Some(256_000)),
+            192_000
+        );
+        assert_eq!(
+            policy.update(start + Duration::from_secs(12), 256_000, Some(256_000)),
+            256_000
+        );
+    }
+
+    #[test]
+    fn user_ceiling_and_feedback_loss_preserve_quality_hysteresis() {
+        let start = Instant::now();
+        let mut policy = AdaptiveAudioBitrate::default();
+        assert_eq!(policy.update(start, 192_000, None), 192_000);
+        assert_eq!(
+            policy.update(start + Duration::from_secs(1), 192_000, Some(256_000)),
+            192_000
+        );
+        assert_eq!(
+            policy.update(start + Duration::from_secs(2), 192_000, Some(128_000)),
+            128_000
+        );
+        assert_eq!(
+            policy.update(start + Duration::from_secs(3), 192_000, None),
+            128_000
+        );
+        assert_eq!(policy.update(start + Duration::from_secs(4), 0, None), 0);
+    }
+
+    #[test]
+    fn constrained_link_keeps_the_minimum_supported_opus_tier() {
+        let start = Instant::now();
+        let mut policy = AdaptiveAudioBitrate::default();
+        policy.update(start, 256_000, None);
+        assert_eq!(
+            policy.update(start + Duration::from_secs(1), 256_000, Some(0)),
+            64_000
+        );
+    }
+    #[test]
+    fn adaptive_opus_rate_transitions_remain_decodable() {
+        use crate::media::audio::{
+            encoder::{Config, MAX_PACKET, create_encoder},
+            neteq::Receiver,
+        };
+
+        let start = Instant::now();
+        let config =
+            Config::negotiated("stereo=1;maxaveragebitrate=256000;useinbandfec=1", Some(3))
+                .unwrap();
+        let mut encoder = create_encoder(config).unwrap();
+        let mut receiver = Receiver::new().unwrap();
+        let mut policy = AdaptiveAudioBitrate::default();
+        let mut packet = [0u8; MAX_PACKET];
+        let mut pcm = [0.0f32; 240];
+        const PLAYOUT_SAMPLES: usize = 480;
+        let mut output = [0.0f32; PLAYOUT_SAMPLES * 2];
+        let mut stats = Default::default();
+        let mut queued_samples = 0;
+        let mut previous_rate = 0;
+        let mut segment = 0;
+        let expected_rates = [256_000, 128_000, 192_000, 256_000];
+        let mut peaks = [0.0f32; 4];
+
+        for sequence in 0..4_401usize {
+            let now = start + Duration::from_micros(sequence as u64 * 2_500);
+            let available = if sequence < 200 {
+                None
+            } else if sequence == 200 {
+                Some(128_000)
+            } else {
+                Some(256_000)
+            };
+            let rate = policy.update(now, 256_000, available);
+            if rate != previous_rate {
+                if previous_rate != 0 {
+                    segment += 1;
+                }
+                assert_eq!(rate, expected_rates[segment]);
+                encoder.set_bitrate(opusic_c::Bitrate::Value(rate)).unwrap();
+                previous_rate = rate;
+            }
+
+            for (sample, channels) in pcm.chunks_exact_mut(2).enumerate() {
+                let frame_sample = sequence * config.packet_samples + sample;
+                let phase = std::f32::consts::TAU * 440.0 * frame_sample as f32 / 48_000.0;
+                let value = phase.sin() * 0.2;
+                channels.fill(value);
+            }
+            let length = encoder.encode_float_to_slice(&pcm, &mut packet).unwrap();
+            assert!(receiver.insert(
+                &packet[..length],
+                (sequence * config.packet_samples) as u32,
+                sequence as u16
+            ));
+            queued_samples += config.packet_samples;
+            if queued_samples >= PLAYOUT_SAMPLES {
+                receiver.block(&mut output, &mut stats).unwrap();
+                queued_samples -= PLAYOUT_SAMPLES;
+                peaks[segment] = peaks[segment].max(
+                    output
+                        .iter()
+                        .fold(0.0f32, |peak, sample| peak.max(sample.abs())),
+                );
+            }
+        }
+        assert!(
+            peaks.iter().all(|peak| *peak > 0.01),
+            "decoded tone disappeared across Opus bitrate transitions: {peaks:?}"
+        );
     }
 }

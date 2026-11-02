@@ -1,8 +1,8 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
-#define OUST_WIDTH 1024u
-#define OUST_HEIGHT 1024u
+#define OUST_WIDTH 4096u
+#define OUST_HEIGHT 4096u
 #define OUST_EYE_BYTES (OUST_WIDTH*OUST_HEIGHT*4u)
 #define OUST_MAP_BYTES (256u+2u*OUST_EYE_BYTES)
 /* Private, ephemeral latest-frame map supplied by the host, not recording.
@@ -15,6 +15,11 @@
  *      origin producer must set it in the same frame window as the eyes, the
  *      host refuses to project external frames it cannot align to the headset.
  * Pixels: tightly packed left eye at 256, right at 256+OUST_EYE_BYTES. */
+/* Native per-eye extent: even dimensions, 64..4096, and a complete RGBA row. */
+static inline int oust_valid_eye_geometry(uint32_t width,uint32_t height,uint32_t stride)
+{
+    return width>=64 && width<=OUST_WIDTH && !(width&1) && height>=64 && height<=OUST_HEIGHT && !(height&1) && stride>=width*4u;
+}
 int oust_copy_eye(unsigned char *map, size_t size, uint32_t eye,
                   uint64_t id,uint64_t timestamp,uint32_t width,uint32_t height,
                   uint32_t stride,const unsigned char *rgba);

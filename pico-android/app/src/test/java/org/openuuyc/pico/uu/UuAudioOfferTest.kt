@@ -3,7 +3,7 @@ import org.junit.Assert.*
 import org.junit.Test
 class UuAudioOfferTest {
  @Test fun editsAudioOnlyAndIsIdempotent() {
-    val s="v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=ptime:60\r\na=fmtp:111 useinbandfec=1\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=ptime:90\r\n"
+    val s="v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\na=ptime:60\r\na=fmtp:111 useinbandfec=1\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=ptime:90\r\n"
     val result=UuAudioOffer.lowLatency(s)
     assertTrue(result.contains("a=ptime:10"));assertTrue(result.contains("a=ptime:90"));assertTrue(result.contains("useinbandfec=1"))
     assertEquals(result,UuAudioOffer.lowLatency(result))
@@ -26,11 +26,20 @@ class UuAudioOfferTest {
     val s="v=0\nm=application 9 x 1\na=mid:data\nm=video 9 x 96\na=msid:shared video\n"
     assertEquals(s,UuAudioOffer.independentPlayback(s,true))
  }
- @Test fun shortPacketsUseIntegerThreeAndOnlyRewriteOpusMinptime() {
+ @Test fun shortPacketsSetQualityAndLeaveOtherMediaUntouched() {
     val s="v=0\nm=audio 9 x 111 0\na=fmtp:111 minptime=10;useinbandfec=1\na=rtpmap:111 opus/48000/2\na=rtpmap:0 PCMU/8000\na=fmtp:0 untouched=1\na=ptime:60\nm=video 9 x 111\na=fmtp:111 minptime=90\n"
     val result=UuAudioOffer.lowLatency(s,true)
-    assertTrue(result.contains("a=ptime:3\n"));assertTrue(result.contains("useinbandfec=1;minptime=3"))
+    assertTrue(result.contains("a=ptime:3\n"));assertTrue(result.contains("useinbandfec=1;stereo=1;maxaveragebitrate=256000;minptime=3"))
     assertTrue(result.contains("a=fmtp:0 untouched=1"));assertTrue(result.contains("a=fmtp:111 minptime=90"))
     assertEquals(result,UuAudioOffer.lowLatency(result,true))
+ }
+ @Test fun stereoAndBitrateCapabilityApplyOnlyToOpusAudio() {
+    val s="v=0\nm=audio 9 x 111 0\na=rtpmap:111 opus/48000/2\na=fmtp:111 stereo=0;maxaveragebitrate=64000;useinbandfec=1\na=rtpmap:0 PCMU/8000\na=fmtp:0 untouched=1\nm=video 9 x 112\na=rtpmap:112 opus/48000/2\na=fmtp:112 stereo=0;maxaveragebitrate=64000\n"
+    val result=UuAudioOffer.lowLatency(s)
+    assertTrue(result.contains("useinbandfec=1;stereo=1;maxaveragebitrate=256000"))
+    assertTrue(result.contains("a=fmtp:0 untouched=1"))
+    assertTrue(result.contains("a=fmtp:112 stereo=0;maxaveragebitrate=64000"))
+    val withoutFmtp=UuAudioOffer.lowLatency("v=0\nm=audio 9 x 111\na=rtpmap:111 opus/48000/2\n")
+    assertTrue(withoutFmtp.contains("a=fmtp:111 stereo=1;maxaveragebitrate=256000"))
  }
 }

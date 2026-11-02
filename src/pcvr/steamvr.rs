@@ -160,6 +160,8 @@ fn explain(stderr: &str) -> &'static str {
         "SteamVR 当前没有正在运行的 VR 场景；请先进入一个 VR 应用（不会自动启动 SteamVR）"
     } else if stderr.contains("scene changed") {
         "SteamVR 场景已变化；请重新附加"
+    } else if stderr.contains("native mirror extent unsupported") {
+        "SteamVR 原生每眼镜像尺寸不受支持（宽高须为 64–4096 且为偶数）；为避免缩放失真，拒绝附加"
     } else if stderr.contains("readback failed") {
         "SteamVR 镜像 GPU 回读失败"
     } else if stderr.contains("GL mirror texture") {
@@ -353,6 +355,13 @@ impl Drop for Attach {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unsupported_native_mirror_extent_explains_why_attach_failed() {
+        assert_eq!(
+            explain("SteamVR mirror: native mirror extent unsupported (each eye must be even and within 64..4096)"),
+            "SteamVR 原生每眼镜像尺寸不受支持（宽高须为 64–4096 且为偶数）；为避免缩放失真，拒绝附加"
+        );
+    }
     #[test]
     fn an_already_reaped_helper_is_not_signaled_again() {
         let mut child = std::process::Command::new("true").spawn().unwrap();

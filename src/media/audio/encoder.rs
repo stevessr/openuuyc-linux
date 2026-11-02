@@ -11,7 +11,7 @@ pub(crate) struct Quality {
 }
 impl Default for Quality {
     fn default() -> Self {
-        Self { kbps: 128 }
+        Self { kbps: 256 }
     }
 }
 impl Quality {
@@ -237,6 +237,28 @@ mod short_packet_tests {
             );
         }
     }
+
+    #[test]
+    fn neteq_buffers_fifty_ms_of_short_packets() {
+        let config = Config::negotiated("stereo=1", Some(3)).unwrap();
+        let mut encoder = create_encoder(config).unwrap();
+        let mut receiver = crate::media::audio::neteq::Receiver::new().unwrap();
+        let mut encoded = [0u8; MAX_PACKET];
+        let pcm = [0.0f32; 240];
+        for sequence in 0usize..20 {
+            let count = encoder.encode_float_to_slice(&pcm, &mut encoded).unwrap();
+            assert!(receiver.insert(
+                &encoded[..count],
+                (sequence * config.packet_samples) as u32,
+                sequence as u16
+            ));
+        }
+        let mut block = [0.0; 960];
+        let mut stats = Default::default();
+        receiver.block(&mut block, &mut stats).unwrap();
+        assert_eq!(stats.discarded_packets, 0);
+        assert!(stats.buffer_ms >= 40, "NetEq buffer was only {} ms", stats.buffer_ms);
+    }
     #[test]
     fn opus_short_packets_keep_exact_samples_and_decode_duration() {
         for (ptime, samples) in [(3, 120), (5, 240), (10, 480), (20, 960)] {
@@ -257,5 +279,18 @@ mod short_packet_tests {
                 samples as u128 * 1_000_000 / 48000
             );
         }
+    }
+    #[test]
+    fn default_quality_uses_stereo_256_kbps_when_allowed() {
+        let config = Config::negotiated(
+            "stereo=1;maxaveragebitrate=256000;useinbandfec=1",
+            Some(3),
+        )
+        .unwrap();
+        assert!(config.stereo);
+        assert_eq!(Quality::default().kbps, 256);
+        assert_eq!(config.bitrate_limit, 256_000);
+        assert_eq!(config.bitrate, 256_000);
+        assert_eq!(config.quality(Quality { kbps: 128 }).bitrate, 128_000);
     }
 }

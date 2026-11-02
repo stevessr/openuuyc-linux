@@ -103,3 +103,33 @@ pub(super) fn share(
         .find(|(id, _, _)| *id == index)
         .map_or(0, |(_, rate, _)| rate)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_reservation_can_recover_to_its_quality_ceiling() {
+        let streams = BTreeMap::from([
+            (
+                0,
+                Bounds {
+                    reservation: 300_000,
+                    maximum: 2_000_000,
+                    initial: 300_000,
+                    probe: 0,
+                },
+            ),
+            (
+                usize::MAX,
+                Bounds {
+                    reservation: 320_000,
+                    maximum: 512_000,
+                    initial: 320_000,
+                    probe: 0,
+                },
+            ),
+        ]);
+        assert_eq!(share(&streams, usize::MAX, 620_000, View::Media), 320_000);
+        assert_eq!(share(&streams, usize::MAX, 1_004_000, View::Media), 512_000);
+    }
+}

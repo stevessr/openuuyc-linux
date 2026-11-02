@@ -13,10 +13,7 @@
 #include <stdexcept>
 #include <vector>
 #include <string>
-#include <algorithm>
-extern "C" {
-#include "../openxr/stereo_capture.h"
-}
+#include "mirror_extent.h"
 static volatile std::sig_atomic_t stopped=0;
 static void stop(int) {stopped=1;}
 static void require(bool value,const char *message) {if(!value) throw std::runtime_error(message);}
@@ -76,21 +73,25 @@ struct Access {
     ~Access(){mirror.compositor->UnlockGLSharedTextureForAccess(mirror.shared);}
 };
 struct Readback {
-    GLuint source=0,target=0,texture=0;
+    GLuint source=0,target=0,texture=0;uint32_t texture_width=0,texture_height=0;bool unsupported_extent=false;
     Readback(){glGenFramebuffers(1,&source);glGenFramebuffers(1,&target);glGenTextures(1,&texture);}
     ~Readback(){glDeleteTextures(1,&texture);glDeleteFramebuffers(1,&source);glDeleteFramebuffers(1,&target);}
     bool read(Mirror &mirror,uint32_t &width,uint32_t &height,std::vector<unsigned char> &rgba) {
+        unsupported_extent=false;
         Access access(mirror);
         glBindTexture(GL_TEXTURE_2D,mirror.texture);
         GLint w=0,h=0;glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_WIDTH,&w);glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_HEIGHT,&h);
-        if(w<64 || h<64 || w>8192 || h>8192) return false;
-        double scale=std::min(512.0/h,1024.0/w);
-        width=std::max(64u,uint32_t(w*scale)&~1u);height=std::max(64u,uint32_t(h*scale)&~1u);
-        glBindTexture(GL_TEXTURE_2D,texture);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+        if(!mirror_native_extent(w,h,width,height)) {unsupported_extent=true;return false;}
+        glBindTexture(GL_TEXTURE_2D,texture);
+        if(texture_width!=width || texture_height!=height) {
+            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+            if(glGetError()!=GL_NO_ERROR) return false;
+            texture_width=width;texture_height=height;
+        }
         glBindFramebuffer(GL_READ_FRAMEBUFFER,source);glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,mirror.texture,0);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER,target);glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
         if(glCheckFramebufferStatus(GL_READ_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE || glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE) return false;
-        glBlitFramebuffer(0,h,w,0,0,0,width,height,GL_COLOR_BUFFER_BIT,GL_LINEAR);
+        glBlitFramebuffer(0,h,w,0,0,0,width,height,GL_COLOR_BUFFER_BIT,GL_NEAREST);
         glBindFramebuffer(GL_READ_FRAMEBUFFER,target);glReadBuffer(GL_COLOR_ATTACHMENT0);
         rgba.resize(size_t(width)*height*4);glReadPixels(0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,rgba.data());
         return glGetError()==GL_NO_ERROR;
@@ -145,7 +146,10 @@ int main(int argc,char **argv) {
             else if(!before.m_HmdPose.bPoseIsValid || !before.m_HmdPose.bDeviceIsConnected) reason="headset-pose-invalid";
             else if(client.compositor->GetLastFrameRenderer()!=scene) reason="scene-renderer-not-focused";
             if(reason) {notice(reason);SDL_Delay(2);continue;}
-            if(!readback.read(left,width[0],height[0],eyes[0]) || !readback.read(right,width[1],height[1],eyes[1])) throw std::runtime_error("SteamVR mirror GPU readback failed");
+            if(!readback.read(left,width[0],height[0],eyes[0]) || !readback.read(right,width[1],height[1],eyes[1]))
+                throw std::runtime_error(readback.unsupported_extent
+                    ? "native mirror extent unsupported (each eye must be even and within 64..4096)"
+                    : "SteamVR mirror GPU readback failed");
             vr::Compositor_FrameTiming after{};after.m_nSize=sizeof(after);
             if(!client.compositor->GetFrameTiming(&after) || after.m_nFrameIndex!=before.m_nFrameIndex ||
                client.compositor->GetCurrentSceneFocusProcess()!=scene || client.compositor->GetLastFrameRenderer()!=scene ||

@@ -24,7 +24,7 @@ int oust_copy_eye(unsigned char *m,size_t size,uint32_t eye,uint64_t id,uint64_t
                   uint32_t w,uint32_t h,uint32_t stride,const unsigned char *pixels)
 {
     if(!m || ((uintptr_t)m&7) || size!=OUST_MAP_BYTES || !pixels || eye>1 || !id || !ts ||
-       !w || !h || w>OUST_WIDTH || h>OUST_HEIGHT || stride<w*4) return 0;
+       !oust_valid_eye_geometry(w,h,stride)) return 0;
     uint64_t *seq=(uint64_t*)m;
     if(!eye) {
         uint64_t s=__atomic_load_n(seq,__ATOMIC_RELAXED);
