@@ -224,6 +224,7 @@ struct State {
     /// derived `Default` starts out permitting it.
     relative_denied: bool,
     owner: Option<u64>,
+    disabled_owners: BTreeSet<u64>,
     drag_hold: Option<(u64, u64)>,
     drag_serial: u64,
     held: [bool; 5],
@@ -275,6 +276,36 @@ impl RemoteInput {
 
     pub(crate) fn accepts_host_input(&self) -> bool {
         self.lock().accept_host_input
+    }
+
+    pub fn owner_enabled(&self, owner: u64) -> bool {
+        !self.lock().disabled_owners.contains(&owner)
+    }
+
+    pub fn set_owner_enabled(&self, owner: u64, enabled: bool) {
+        let mut s = self.lock();
+        if enabled {
+            s.disabled_owners.remove(&owner);
+            return;
+        }
+        if !s.disabled_owners.insert(owner) {
+            return;
+        }
+        let paused = Self::pause_owner_locked(&mut s, owner);
+        drop(s);
+        if paused {
+            self.wake.notify_one();
+        }
+    }
+
+    pub fn forget_owner(&self, owner: u64) {
+        let mut s = self.lock();
+        let paused = !s.disabled_owners.contains(&owner) && Self::pause_owner_locked(&mut s, owner);
+        s.disabled_owners.remove(&owner);
+        drop(s);
+        if paused {
+            self.wake.notify_one();
+        }
     }
 
     pub fn set_throttle(&self, enabled: bool, rate: MouseThrottleRate) -> Result<()> {
@@ -377,6 +408,9 @@ impl RemoteInput {
         let mut s = self.lock();
         if s.keyboard_platform != 1 {
             bail!("仅支持向 Windows 设备发送 Ctrl+Alt+Del");
+        }
+        if s.disabled_owners.contains(&owner) {
+            bail!("本窗口已暂停远程输入");
         }
         if !s.ready || s.stopping || s.mode == MouseMode::View || s.waiting_for_neutral {
             bail!("请先开启键鼠控制并松开按键");
@@ -568,6 +602,7 @@ impl RemoteInput {
             || s.waiting_for_neutral
             || !s.gamepads.contains_key(&value.index)
             || !s.confirmed_gamepads.contains(&value.index)
+            || s.disabled_owners.contains(&owner)
         {
             return false;
         }
@@ -595,6 +630,7 @@ impl RemoteInput {
             || s.waiting_for_neutral
             || !s.gamepads.contains_key(&index)
             || !s.confirmed_gamepads.contains(&index)
+            || s.disabled_owners.contains(&owner)
         {
             return None;
         }
@@ -825,8 +861,16 @@ impl RemoteInput {
 
     pub fn pause_owner(&self, owner: u64) {
         let mut s = self.lock();
-        if s.owner != Some(owner) {
+        if s.disabled_owners.contains(&owner) || !Self::pause_owner_locked(&mut s, owner) {
             return;
+        }
+        drop(s);
+        self.wake.notify_one();
+    }
+
+    fn pause_owner_locked(s: &mut State, owner: u64) -> bool {
+        if s.owner != Some(owner) {
+            return false;
         }
         if s.drag_hold
             .is_some_and(|(held_owner, _)| held_owner == owner)
@@ -834,46 +878,48 @@ impl RemoteInput {
         {
             // Only the original LMB press belongs to a file handoff. Ordinary
             // focus loss still retires keyboard and other button ownership.
-            if !s.keys.is_empty() || s.held[1..].iter().any(|v| *v) {
-                s.queue.clear();
-                s.keyboard_generation = s.keyboard_generation.wrapping_add(1);
-                let keys: Vec<_> = s.remote_keys.keys().copied().collect();
-                s.release_checkpoint.extend(keys.iter().copied());
-                for modifier in [false, true] {
-                    for &key in &keys {
-                        if key.is_modifier() == modifier {
-                            s.queue.push_back(InputEvent::Key {
-                                key,
-                                down: false,
-                                lock: None,
-                                interrupt: false,
-                            });
-                        }
-                    }
-                }
-                s.keys.clear();
-                for (index, button) in BUTTONS.into_iter().enumerate().skip(1) {
-                    if s.remote_held[index] {
-                        s.queue.push_back(InputEvent::Button {
-                            button,
+            s.queue.clear();
+            s.keyboard_generation = s.keyboard_generation.wrapping_add(1);
+            s.release_checkpoint.extend(s.remote_keys.keys().copied());
+            for modifier in [false, true] {
+                for &key in s.remote_keys.keys() {
+                    if key.is_modifier() == modifier {
+                        s.queue.push_back(InputEvent::Key {
+                            key,
                             down: false,
+                            lock: None,
+                            interrupt: false,
                         });
                     }
-                    s.held[index] = false;
                 }
             }
+            s.keys.clear();
+            for (index, button) in BUTTONS.into_iter().enumerate().skip(1) {
+                if s.remote_held[index] {
+                    s.queue.push_back(InputEvent::Button {
+                        button,
+                        down: false,
+                    });
+                }
+                s.held[index] = false;
+            }
+            s.assists.clear();
+            s.assist_button_owner = None;
+            s.assist_down = false;
             // After the clear above, so the lift is never dropped with it.
             if let Some((kind, points)) = s.touch.clear() {
                 s.queue.push_back(InputEvent::Touch { kind, points });
             }
-            // A file drag keeps only its submitted left-button hold, never
-            // a controller or vibration owned by the window losing focus.
-            Self::release_gamepads_locked(&mut s);
+            if !s.gamepads.is_empty()
+                || !s.confirmed_gamepads.is_empty()
+                || !s.gamepad_feedback.is_empty()
+            {
+                Self::release_gamepads_locked(s);
+            }
         } else {
-            Self::release_locked(&mut s);
+            Self::release_locked(s);
         }
-        drop(s);
-        self.wake.notify_one();
+        true
     }
 
     pub(crate) fn hold_drag(&self, owner: u64) -> Result<DragHold> {
@@ -882,6 +928,7 @@ impl RemoteInput {
             s.ready
                 && !s.stopping
                 && s.mode != MouseMode::View
+                && !s.disabled_owners.contains(&owner)
                 && !s.relative
                 && s.owner == Some(owner)
                 && s.held[0]
@@ -974,7 +1021,12 @@ impl RemoteInput {
     }
 
     fn claim(s: &mut State, owner: u64) -> bool {
-        if !s.ready || s.stopping || s.mode == MouseMode::View || s.waiting_for_neutral {
+        if !s.ready
+            || s.stopping
+            || s.mode == MouseMode::View
+            || s.waiting_for_neutral
+            || s.disabled_owners.contains(&owner)
+        {
             return false;
         }
         if s.owner != Some(owner) {
@@ -1300,10 +1352,9 @@ impl RemoteInput {
     fn pending_current(s: &State, event: &InputEvent) -> bool {
         match *event {
             InputEvent::Correction { lease, expires, .. } => {
-                s.assists
-                    .get(&lease)
-                    .is_some_and(|(owner, guard)| s.owner == Some(*owner) && guard())
-                    && std::time::Instant::now() <= expires
+                s.assists.get(&lease).is_some_and(|(owner, guard)| {
+                    s.owner == Some(*owner) && !s.disabled_owners.contains(owner) && guard()
+                }) && std::time::Instant::now() <= expires
             }
             InputEvent::AssistButton {
                 lease,
@@ -1311,6 +1362,7 @@ impl RemoteInput {
                 expires,
             } => s.assists.get(&lease).is_some_and(|(owner, guard)| {
                 s.owner == Some(*owner)
+                    && (!down || !s.disabled_owners.contains(owner))
                     && (!down || (guard() && std::time::Instant::now() <= expires))
             }),
             InputEvent::Gamepad(GamepadEvent::Connect { index }) => s.gamepads.contains_key(&index),
@@ -1461,6 +1513,7 @@ impl RemoteInput {
             && !s.stopping
             && s.mode != MouseMode::View
             && s.relative
+            && !s.disabled_owners.contains(&owner)
             && s.owner == Some(owner)
             && s.assists
                 .get(&lease)
@@ -1500,6 +1553,7 @@ impl RemoteInput {
             || s.stopping
             || !s.relative
             || s.mode == MouseMode::View
+            || s.disabled_owners.contains(&owner)
             || s.owner != Some(owner)
             || s.assists.get(&lease).is_none_or(|(o, _)| *o != owner)
         {
@@ -1547,6 +1601,7 @@ impl RemoteInput {
         if !s.ready
             || s.stopping
             || s.owner != Some(owner)
+            || (down && s.disabled_owners.contains(&owner))
             || s.assists.get(&lease).is_none_or(|(o, _)| *o != owner)
         {
             return false;
@@ -2395,5 +2450,155 @@ mod touch_tests {
         assert!(!touch(&input, 1, Phase::Start, 4, None));
         assert!(!touch(&input, 1, Phase::Move, 4, Some((0.5, 0.5))));
         assert_eq!(input.lock().queue.len(), 0);
+    }
+}
+#[cfg(test)]
+mod owner_gate_tests {
+    use super::*;
+
+    fn controlling() -> RemoteInput {
+        let input = RemoteInput::default();
+        input.set_ready(true);
+        input.enable(MouseMode::Remote, false).unwrap();
+        input.confirm_neutral(input.activation_generation());
+        input
+    }
+
+    async fn event(input: &RemoteInput) -> QueuedInputEvent {
+        match tokio::time::timeout(Duration::from_secs(1), input.next())
+            .await
+            .unwrap()
+        {
+            InputWork::Event(event) => event,
+            InputWork::Recovery(_) => panic!("unexpected input recovery"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabling_one_owner_releases_it_without_disturbing_another() {
+        let input = controlling();
+        assert!(input.owner_enabled(1));
+        input.button(1, 1, true);
+        let pressed = event(&input).await;
+        assert!(matches!(
+            pressed.event,
+            InputEvent::Button {
+                button: 1,
+                down: true
+            }
+        ));
+        input.complete(&pressed, Ok(()));
+
+        input.set_owner_enabled(1, false);
+        assert!(!input.owner_enabled(1));
+        input.button(1, 1, true);
+        {
+            let state = input.lock();
+            assert_eq!(state.owner, None);
+            assert!(!state.held[0]);
+        }
+        input.button(2, 1, true);
+        {
+            let state = input.lock();
+            assert_eq!(state.owner, Some(2));
+            assert!(state.held[0]);
+        }
+
+        let released = event(&input).await;
+        assert!(matches!(
+            released.event,
+            InputEvent::Button {
+                button: 1,
+                down: false
+            }
+        ));
+        input.complete(&released, Ok(()));
+        let other_pressed = event(&input).await;
+        assert!(matches!(
+            other_pressed.event,
+            InputEvent::Button {
+                button: 1,
+                down: true
+            }
+        ));
+        input.complete(&other_pressed, Ok(()));
+
+        input.button(1, 1, true);
+        input.forget_owner(1);
+        assert!(input.owner_enabled(1));
+        {
+            let state = input.lock();
+            assert_eq!(state.owner, Some(2));
+            assert!(state.held[0]);
+        }
+        input.set_owner_enabled(1, false);
+        {
+            let state = input.lock();
+            assert_eq!(state.owner, Some(2));
+            assert!(state.held[0]);
+        }
+        input.set_owner_enabled(1, true);
+
+        input.button(2, 1, false);
+        let other_released = event(&input).await;
+        assert!(matches!(
+            other_released.event,
+            InputEvent::Button {
+                button: 1,
+                down: false
+            }
+        ));
+        input.complete(&other_released, Ok(()));
+    }
+    #[test]
+    fn disabled_owner_cannot_send_ctrl_alt_del() {
+        let input = controlling();
+        input.set_keyboard_platform(1);
+        input.set_owner_enabled(1, false);
+
+        assert!(input.send_ctrl_alt_del(1).is_err());
+        assert!(input.lock().queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabling_owner_preserves_active_handoff_but_discards_queued_motion() {
+        let input = controlling();
+        input.button(1, 1, true);
+        let pressed = event(&input).await;
+        assert!(matches!(
+            pressed.event,
+            InputEvent::Button {
+                button: 1,
+                down: true
+            }
+        ));
+        input.complete(&pressed, Ok(()));
+
+        let hold = input.hold_drag(1).unwrap();
+        input.absolute(1, 0, 0.25, 0.25);
+        assert!(!input.lock().queue.is_empty());
+
+        input.set_owner_enabled(1, false);
+        assert!(!input.owner_enabled(1));
+        assert!(hold.current());
+        {
+            let state = input.lock();
+            assert_eq!(state.owner, Some(1));
+            assert!(state.held[0]);
+            assert!(state.queue.is_empty());
+        }
+        input.absolute(1, 0, 0.75, 0.75);
+        assert!(input.lock().queue.is_empty());
+
+        hold.cancel();
+        let released = event(&input).await;
+        assert!(matches!(
+            released.event,
+            InputEvent::Button {
+                button: 1,
+                down: false
+            }
+        ));
+        input.complete(&released, Ok(()));
     }
 }

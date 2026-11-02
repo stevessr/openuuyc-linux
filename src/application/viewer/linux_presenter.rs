@@ -1660,6 +1660,8 @@ struct Player {
     wake: Option<FrameWakeBridge>,
     /// Identifies this window to `RemoteInput`, which arbitrates between windows.
     owner: u64,
+    /// Whether this playback window may forward remote input.
+    window_control_enabled: bool,
     gamepad: super::linux_gamepad::GamepadCapture,
     stream_control_ui: StreamControlUi,
     performance_mode: PerformancePanelMode,
@@ -1786,6 +1788,7 @@ impl Player {
             window_id,
             wake: Some(wake),
             owner,
+            window_control_enabled: true,
             gamepad,
             stream_control_ui: StreamControlUi::default(),
             performance_mode: PerformancePanelMode::Compact,
@@ -1831,12 +1834,13 @@ impl Player {
         let gate = super::input_gate::InputGate {
             focused: self.focused,
             minimized: window.is_minimized() == Some(true),
-            controlling: input.mode() != MouseMode::View,
+            controlling: input.mode() != MouseMode::View && self.window_control_enabled,
             dragging: self.session.stream_control.drag_drop().interactive(),
             menu_open: self.stream_control_ui.open,
             has_video: self.video_size.is_some(),
         };
-        let intercepts = super::input_gate::intercepts_shortcuts(input, self.intercept_shortcuts);
+        let intercepts =
+            super::input_gate::intercepts_shortcuts(input, self.owner, self.intercept_shortcuts);
         if let Some(shortcuts) = self.shortcuts.as_mut() {
             shortcuts.update(gate, context, intercepts);
         }
@@ -1889,6 +1893,7 @@ impl Player {
             && !self.is_pending()
             && !self.control().drag_drop().interactive()
             && self.input().mode() != MouseMode::View
+            && self.window_control_enabled
             && !self.input().waiting_for_neutral();
         self.gamepad.tick(active);
     }
@@ -1960,6 +1965,8 @@ impl Player {
             )?);
         }
         self.session = session;
+        self.input()
+            .set_owner_enabled(self.owner, self.window_control_enabled);
         self.session_failed = false;
         self.frame_paused = false;
         self.pending = None;
@@ -2391,6 +2398,7 @@ impl Player {
             performance_always_visible: preferences.performance_always_visible,
             intercept_shortcuts: self.intercept_shortcuts,
             send_ctrl_alt_del: false,
+            window_control_enabled: self.window_control_enabled,
         };
         let screen_id = self.session.screen_id();
         // "Follow local" asks for this monitor's size, as on Windows.
@@ -2406,6 +2414,9 @@ impl Player {
             local_size,
             egui::vec2(-114.0 - menu_inset, 52.0),
         );
+        if self.window_control_enabled != view.window_control_enabled {
+            self.set_window_control_enabled(window, view.window_control_enabled);
+        }
         self.set_performance_mode(view.performance_mode);
         self.session
             .stream_control
@@ -3028,6 +3039,17 @@ impl Player {
         }
     }
 
+    fn set_window_control_enabled(&mut self, window: &Arc<Window>, enabled: bool) {
+        if self.window_control_enabled == enabled {
+            return;
+        }
+        self.window_control_enabled = enabled;
+        self.input().set_owner_enabled(self.owner, enabled);
+        if !enabled {
+            self.release_window_control(window);
+        }
+    }
+
     fn release_pointer(&mut self, window: &Arc<Window>) {
         if self.pointer_locked {
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
@@ -3046,7 +3068,7 @@ impl Player {
         let DeviceEvent::MouseMotion { delta } = event else {
             return false;
         };
-        if !self.focused || self.local_input_blocked {
+        if !self.focused || self.local_input_blocked || !self.window_control_enabled {
             return false;
         }
         let input = self.input();
@@ -3089,6 +3111,7 @@ impl Player {
         let input = self.input();
         let wanted = self.focused
             && !self.local_input_blocked
+            && self.window_control_enabled
             && input.relative_mode()
             && input.mode() != MouseMode::View;
         if wanted == self.pointer_locked {
@@ -3192,6 +3215,14 @@ impl Player {
     /// Hand back everything held for the remote; control resumes on the next
     /// click into the video.
     fn release_input(&mut self, window: &Arc<Window>) {
+        self.release_input_inner(window, true);
+    }
+
+    fn release_window_control(&mut self, window: &Arc<Window>) {
+        self.release_input_inner(window, false);
+    }
+
+    fn release_input_inner(&mut self, window: &Arc<Window>, cancel_global_drag: bool) {
         self.gamepad.pause();
         self.release_pointer(window);
         self.release_keys();
@@ -3200,7 +3231,13 @@ impl Player {
         self.modifiers = winit::keyboard::ModifiersState::empty();
         self.motion_remainder = [0.0, 0.0];
         self.input().pause_owner(self.owner);
-        self.control().drag_drop().cancel_gesture(true);
+        if cancel_global_drag {
+            self.control().drag_drop().cancel_gesture(true);
+        } else {
+            self.control()
+                .drag_drop()
+                .cancel_gesture_for_owner(self.owner, true);
+        }
     }
 
     /// Hands a touchscreen contact to the remote; false leaves it to egui.
@@ -3357,6 +3394,7 @@ impl Player {
                 if dragging
                     || self.local_input_blocked
                     || !self.focused
+                    || !self.window_control_enabled
                     || self.input().mode() == MouseMode::View
                 {
                     return false;
@@ -3373,6 +3411,7 @@ impl Player {
                     || self.local_input_blocked
                     || !self.focused
                     || !self.pointer_in_video
+                    || !self.window_control_enabled
                     || context.dragged_id().is_some()
                 {
                     return false;
@@ -3561,7 +3600,7 @@ impl Player {
     }
 
     fn send_position(&mut self, position: PhysicalPosition<f64>) {
-        if !self.focused || self.local_input_blocked {
+        if !self.focused || self.local_input_blocked || !self.window_control_enabled {
             return;
         }
         let input = self.input();
@@ -3818,10 +3857,10 @@ impl Drop for Player {
         self.release_keys();
         if self.input_owns_connection {
             self.input().disable();
+        }
+        self.input().forget_owner(self.owner);
+        if self.input_owns_connection {
             self.screens.close_decoders();
-        } else {
-            // 独立窗口只交回自己持有的输入；别的窗口还在用这个连接。
-            self.input().pause_owner(self.owner);
         }
     }
 }

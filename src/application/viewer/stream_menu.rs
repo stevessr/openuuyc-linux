@@ -69,6 +69,7 @@ pub(super) struct LocalViewSettings {
     pub performance_mode: super::PerformancePanelMode,
     pub performance_always_visible: bool,
     pub intercept_shortcuts: bool,
+    pub window_control_enabled: bool,
     pub send_ctrl_alt_del: bool,
 }
 
@@ -1028,11 +1029,14 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                                 let can_send = snapshot.ready
                                     && !snapshot.mouse_pending
                                     && snapshot.mouse_mode != MouseMode::View
+                                    && view.window_control_enabled
                                     && handle.mouse().supports_ctrl_alt_del()
                                     && !handle.mouse().waiting_for_neutral();
                                 if menu_row(ui, "发送 Ctrl+Alt+Del", "", None, can_send, false)
                                     .on_hover_text(if can_send {
                                         "打开远端 Windows 安全选项"
+                                    } else if !view.window_control_enabled {
+                                        "请先开启本窗口远程输入"
                                     } else {
                                         "请先开启 Windows 设备的键鼠控制并松开按键"
                                     })
@@ -1114,6 +1118,9 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
                         crate::ui::controls::observe_notice(ui.ctx(),"microphone-device-query","麦克风设备",crate::ui::controls::DialogIcon::Error,inputs.error.as_deref());
                     }
                     Page::Mouse => {
+                        switch_row(ui, "本窗口远程输入", &mut view.window_control_enabled)
+                            .on_hover_text("仅影响当前播放窗口；关闭后释放此窗口的键鼠、触摸和手柄输入（进行中的文件拖放交接除外），其他窗口不受影响。");
+                        section_separator(ui);
                         for (mode, label, description) in [
                             (
                                 MouseMode::Smart,

@@ -215,6 +215,7 @@ fn intercept_key(
     key: u16,
     held: &[bool; 256],
     input: &RemoteInput,
+    owner: u64,
     intercept_shortcuts: bool,
 ) -> bool {
     // Capture ordinary keys before local RegisterHotKey/IME handling can take
@@ -225,7 +226,7 @@ fn intercept_key(
     if crate::application::viewer_shortcuts::suspended() || windows_state_key(key) {
         return false;
     }
-    if super::input_gate::intercepts_shortcuts(input, intercept_shortcuts) {
+    if super::input_gate::intercepts_shortcuts(input, owner, intercept_shortcuts) {
         return true;
     }
     let modifiers = u8::from(held[162] || held[163])
@@ -685,6 +686,7 @@ impl Router {
                     self.installed
                         && unsafe { GetForegroundWindow() } == HWND(t.owner as _)
                         && t.input.mode() != MouseMode::View
+                        && t.input.owner_enabled(t.owner)
                         && super::windows_mouse::router().keyboard_allowed(t.owner)
                 })
                 .map(|t| t.owner);
@@ -698,7 +700,7 @@ impl Router {
             let route = if let Some(owner) = owner {
                 if self.target.as_ref().is_some_and(|t| {
                     t.input.keyboard_supported()
-                        && intercept_key(edge.key, &held, &t.input, t.intercept_shortcuts)
+                        && intercept_key(edge.key, &held, &t.input, t.owner, t.intercept_shortcuts)
                 }) {
                     Route::Hook(owner)
                 } else {
@@ -922,6 +924,7 @@ impl Router {
         };
         if unsafe { GetForegroundWindow() } != HWND(target.owner as _)
             || target.input.mode() == MouseMode::View
+            || !target.input.owner_enabled(target.owner)
         {
             self.diagnostic(2, injected, "inactive_owner");
             self.clear();
