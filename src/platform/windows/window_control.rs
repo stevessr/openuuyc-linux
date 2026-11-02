@@ -10,7 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 unsafe extern "system" fn enumerate(hwnd: HWND, state: LPARAM) -> BOOL {
     let items = unsafe { &mut *(state.0 as *mut Vec<WindowInfo>) };
     if items.len() >= 128 || !unsafe { IsWindowVisible(hwnd).as_bool() }
-        || !unsafe { GetWindow(hwnd, GW_OWNER).0.is_null() } {
+        || unsafe { GetWindow(hwnd, GW_OWNER).is_ok() } {
         return BOOL(1);
     }
     let len = unsafe { GetWindowTextLengthW(hwnd) };
