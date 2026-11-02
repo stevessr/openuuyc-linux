@@ -67,10 +67,26 @@ pub(crate) fn decode_response(bytes: &[u8]) -> anyhow::Result<Response> {
 
 /// An explicit *per-user* opt-in. This marker is not authentication:
 /// authorization still belongs to the active host session.
-pub(crate) fn enabled() -> bool {
+pub fn enabled() -> bool {
     crate::platform::paths::require_local_app_data()
         .ok()
         .is_some_and(|root| root.join("OpenUUYC/private-window-control.enabled").is_file())
+}
+
+/// Install or revoke the per-user extension permission. Never requires UAC,
+/// sudo, a persistent service, or a native driver.
+pub fn set_enabled(value: bool) -> anyhow::Result<()> {
+    let path = crate::platform::paths::require_local_app_data()?
+        .join("OpenUUYC/private-window-control.enabled");
+    if value {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, "enabled")?;
+    } else if let Err(error) = std::fs::remove_file(&path) {
+        if error.kind() != std::io::ErrorKind::NotFound { return Err(error.into()); }
+    }
+    Ok(())
 }
 
 pub(crate) fn serve(bytes: &[u8], session_authorized: bool) -> Option<Vec<u8>> {
