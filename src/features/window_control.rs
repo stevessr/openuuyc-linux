@@ -94,7 +94,7 @@ pub(crate) fn serve(bytes: &[u8], session_authorized: bool) -> Option<Vec<u8>> {
         return None;
     }
     // Even malformed packets receive at most a short denial, with no action.
-    let request: Request = match decode(bytes) {
+    let request: Request = match decode::<Request>(bytes) {
         Ok(req) if req.request_id != 0 => req,
         _ => return Some(Vec::new()),
     };
