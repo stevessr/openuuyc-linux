@@ -5,8 +5,8 @@
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8] = b"OUWC/1\0";
-const MAX_PACKET: usize = 16 * 1024;
-const MAX_WINDOWS: usize = 128;
+const MAX_PACKET: usize = 128 * 1024;
+const MAX_WINDOWS: usize = 64;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct WindowInfo {
@@ -65,8 +65,8 @@ pub(crate) fn decode_response(bytes: &[u8]) -> anyhow::Result<Response> {
     Ok(result)
 }
 
-/// An explicit *per-user* opt-in. A remote peer can never create this file:
-/// the host's file transfer never treats this constant as a remote path.
+/// An explicit *per-user* opt-in. This marker is not authentication:
+/// authorization still belongs to the active host session.
 pub(crate) fn enabled() -> bool {
     crate::platform::paths::require_local_app_data()
         .ok()
