@@ -522,7 +522,6 @@ impl DeviceCenterApp {
         let mut power = None;
         let mut exit_account = false;
         self.alert(ui);
-        #[cfg(target_os = "linux")]
         {
             let launch_error = ui.ctx().data(|data| data.get_temp::<String>(
                 egui::Id::new(("remote-terminal-launch-error", &id))
@@ -563,7 +562,7 @@ impl DeviceCenterApp {
             let card_y = hero_h - 24.0;
             let has_power = owned && !current && matches!(device.platform, 1 | 4);
             let viewing = self.is_viewing_target(&id);
-            let terminal_available = cfg!(target_os = "linux")
+            let terminal_available = cfg!(any(target_os = "linux", windows))
                 && owned && !current && matches!(device.platform, 1 | 4);
             let power_y = card_y + card_h + 16.0;
             let info_y = if has_power || has_ports || viewing || terminal_available {
@@ -1026,7 +1025,6 @@ impl DeviceCenterApp {
         if files {
             self.open_file_transfer(id.clone());
         }
-        #[cfg(target_os = "linux")]
         if remote_terminal {
             if let Err(error) = crate::features::host::terminal::local::open_remote_in_terminal(&id) {
                 tracing::warn!(%error, "failed to open official UU terminal emulator");
