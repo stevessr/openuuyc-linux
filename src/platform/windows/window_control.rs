@@ -45,7 +45,7 @@ pub(crate) fn list() -> Result<Vec<WindowInfo>> {
             Some(enumerate),
             LPARAM(&mut items as *mut Vec<WindowInfo> as isize),
         )
-        .context("enumerate top-level windows")?;
+        .map_err(|error| anyhow::anyhow!("enumerate top-level windows: {error:?}"))?;
     }
     Ok(items)
 }
