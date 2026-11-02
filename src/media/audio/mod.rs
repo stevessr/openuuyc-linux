@@ -2,6 +2,8 @@
 pub(crate) mod dsp;
 pub(crate) mod encoder;
 pub(crate) mod neteq;
+#[cfg(target_os = "linux")]
+mod output_buffer;
 pub(crate) mod sender;
 pub(crate) mod waveform;
 
@@ -743,11 +745,15 @@ fn open_output(
     shared: Arc<Shared>,
     failed: Arc<OutputFailure>,
 ) -> Result<cpal::Stream> {
-    let config = device
+    let supported = device
         .default_output_config()
         .context("读取音频输出格式失败")?;
-    let format = config.sample_format();
-    let config = config.config();
+    let format = supported.sample_format();
+    let config = cpal::StreamConfig {
+        #[cfg(target_os = "linux")]
+        buffer_size: output_buffer::playback_buffer(device, &supported),
+        ..supported.config()
+    };
     tracing::info!(?format, rate = config.sample_rate, channels = config.channels,
         buffer = ?config.buffer_size, "audio output format selected");
     match format {

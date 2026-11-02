@@ -982,3 +982,4 @@ mod input;
 mod settings;
 mod tracks;
 mod wire;
+pub(crate) use wire::encode_touch_input;

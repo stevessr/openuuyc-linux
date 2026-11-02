@@ -31,6 +31,7 @@ mod input_gate;
 #[cfg(target_os = "linux")]
 mod pico_bridge;
 mod polling_warning;
+mod touch;
 
 #[cfg(windows)]
 mod windows_cursor;

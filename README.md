@@ -28,7 +28,7 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 | 设备 ID / 验证码协助 | 支持主动连接，也能直接点开邀请链接 | 支持账号及游客协助 | 随机 / 自定义密码、本机确认；主控支持最近连接和收藏，对方分享的 `uuremote://external/assistance?...` 链接会拉起本程序并填好设备 ID 与验证码 |
 | 画面传输 | 接收与播放 | 采集与编码 | H.264 / H.265 / AV1、真彩及 HDR，可调画质、码率和帧率（最高 165 FPS）；AV1 与 SDR 自动 10 位需双方 OpenUUYC 支持 |
 | 编解码 | DXVA11 硬解 / Rust 软解 | NVENC、AMF、QSV 硬编 / Rust H.264 软编 | 可选格式与显卡首选；软解支持 H.264 / AV1，整个客户端最多一个软解播放窗口 |
-| 键鼠与触摸 | 键盘、鼠标控制 | 键鼠及移动端原生触摸接收 | 相对/绝对鼠标、组合键、光标同步；可选 125 / 500 / 1000 Hz 鼠标节流（默认关闭） |
+| 键鼠与触摸 | 键盘、鼠标及触摸屏控制 | 键鼠及原生触摸接收 | 相对/绝对鼠标、组合键、光标同步；触摸屏在 OpenUUYC 被控（beta.3+）的当前屏上原生多点，官方被控或其他屏单指模拟左键；可选 125 / 500 / 1000 Hz 鼠标节流（默认关闭） |
 | 多显示器与显示设置 | 切屏、多窗口、本地比例拉伸、分辨率及 DPI 调整 | 多屏采集与设置接收 | 屏幕标签可拖出独立窗口；本地比例拉伸不修改远端分辨率，物理设置按目标支持的配置应用 |
 | 虚拟屏、超级屏与无屏接管 | 支持操作远端 | 支持 | 需安装显示驱动；自动兜底屏断线保留，其他可用屏幕接入后回收 |
 | 桌面声音 | 播放与远程音质调整 | 采集与发送 | 默认或指定设备，设备变化后恢复；PICO 使用立体声 Opus，新配置默认 256 kbps，低延迟通路用 Opus PLC 掩蔽短时缺包，欠载后扩缓冲并在稳定时逐级回收；桌面 Opus 按带宽自适应降码率，网络稳定后逐级恢复；支持 64 / 128 / 192 / 256 kbps，远程调音质需双方 alpha.6+ |
@@ -74,7 +74,7 @@ OpenUUYC 是用 Rust 编写的 UU 远程第三方客户端，支持 Windows 和 
 | 键盘鼠标 | ✅ 含组合键、光标同步 | ✅ | ✅ | ✅ XTest，免设置 | ⚠️ uinput 需权限，否则仅 XWayland |
 | 手柄与震动 | ❌ | ❌ | ✅ 最多四个标准手柄，连接支持手柄的官方被控端 | ❌ | ❌ |
 | 绝对 / 相对鼠标 | ✅ 游戏锁定、可选节流 | ✅ | ✅ 游戏锁定、可选节流 | ✅ | ⚠️ 绝对定位需 xdg-output |
-| 触摸（多点） | ❌ 只发键鼠 | ✅ 移动端原生多点 | ❌ 只发键鼠 | ⚠️ 单指模拟 | ⚠️ 单屏未旋转时多点 |
+| 触摸（多点） | ⚠️ OpenUUYC 被控当前屏原生多点，其余单指模拟 | ✅ 原生多点 | ⚠️ OpenUUYC 被控当前屏原生多点，其余单指模拟 | ⚠️ 单指模拟 | ⚠️ 单屏未旋转时多点 |
 | 文字输入（移动端输入法） | — | ✅ | — | ✅ XTest | ⚠️ Fcitx5 输入法门户（短时上下文）优先，回退虚拟键盘协议与 XTest，GNOME 退回 XTest |
 | 拦截本机快捷键 | ✅ | — | ⚠️ Xorg 抓键盘 / Wayland 需合成器协议 | — | — |
 | 多显示器切屏 | ✅ | ✅ | ✅ 顶栏屏标签，跟随远端拓扑 | ✅ | ✅ 门户需共享多屏 |
@@ -264,7 +264,7 @@ sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-
 #### 运行前提与开关
 
 - **运行环境**：登录态存在系统密钥环（Secret Service，需要 gnome-keyring、KWallet 等，没有明文回退）。托盘用 StatusNotifierItem，GNOME 需要 AppIndicator 扩展（Ubuntu 默认启用），桌面没有托盘时关闭窗口即退出；面板比程序晚起来时每 2 秒重试，托盘一出现就改回关闭收进托盘。粘贴远端文件要 `fuse3`。Wayland 会话被控也要有 XWayland（显示器列表与输入注入器都先连 X 服务器）；缩放（含分数缩放）的桌面上，门户共享的屏幕按合成器 `xdg-output` 布局里的输出名与所选显示器配对，需要 XWayland 23.1 及以上（输出以连接器命名）且程序能拿到 `WAYLAND_DISPLAY`，配不上时报错，不会采错屏。拖出文件的预览图要 `gio` 与 `rsvg-convert`。
-- **开机自启**：桌面接进 `graphical-session.target` 时是 systemd 用户单元 `openuuyc.service`（`journalctl --user -u openuuyc` 看日志），否则写 `~/.config/autostart/openuuyc.desktop`。两者都不处理的合成器（无 uwsm 的 sway、Hyprland 等）请自行启动 `OpenUUYC gui --background`。再次启动程序会经 `$XDG_RUNTIME_DIR/openuuyc/control.sock` 唤起已运行的控制中心。
+- **开机自启**：桌面接进 `graphical-session.target` 时是 systemd 用户单元 `app-openuuyc.service`（`journalctl --user -u app-openuuyc` 看日志）。单元名与 `openuuyc.desktop` 对应，门户才认得出这是 OpenUUYC，KDE 记下的屏幕共享授权才能沿用；旧版本启用的 `openuuyc.service` 在程序启动时迁移过去，迁移前的那次登录由它转发。否则写 `~/.config/autostart/openuuyc.desktop`。两者都不处理的合成器（无 uwsm 的 sway、Hyprland 等）请自行启动 `OpenUUYC gui --background`。再次启动程序会经 `$XDG_RUNTIME_DIR/openuuyc/control.sock` 唤起已运行的控制中心。
 - **协助邀请链接**：安装包的 `openuuyc.desktop` 登记了 `x-scheme-handler/uuremote`，没有 Windows 那样的接管开关，可用 `xdg-mime default <程序>.desktop x-scheme-handler/uuremote` 改。便携运行时把链接作为唯一参数传给程序。
 - **被控终端**：默认关闭，在被控设置的访问权限里打开，打开时会确认一次；以 root 运行时不提供，本机也不能新建。shell 跑在 pty 上，断线后保留、重连可接回（重开同一会话即接管，旧连接不再收输出），接回时重画当前屏幕，不带回已滚出屏幕的输出；主控开的会话在退出或切换账号、关闭终端开关、禁止被控或在本机断开连接时结束，两端都没有附着 30 分钟后也会结束。设置页显示运行中的会话数，可一键结束全部。
   - **终端会话页**：侧边栏常驻，列出全部会话，可结束；也能在本机新建会话，或用系统终端接上任一会话（`$TERMINAL` 优先，再找常见的终端模拟器）。命令行是 `OpenUUYC terminal [编号或名字]`、`--list`、`--new [名字]`，控制中心没在跑时新建和接入会以 `gui --background` 把它拉起来。本机经 `$XDG_RUNTIME_DIR/openuuyc/terminal.sock` 接入，只有同一用户能连。本机与主控同时附着时输入输出同步，终端按两边较小的尺寸显示；关掉本地终端只断开这一端。本机开的会话不会因空闲被结束，shell 退出后从列表消失。
