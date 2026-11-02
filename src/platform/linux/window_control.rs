@@ -18,9 +18,17 @@ fn ipc(message: Value) -> Result<Value> {
     stream.write_all(b"\n")?;
     let mut line = Vec::new();
     let mut reader = BufReader::new(stream);
-    // niri responds with a single JSON line. Do not wait for socket shutdown.
-    reader.read_until(b'\n', &mut line)?;
-    ensure!(line.len() <= MAX_REPLY, "niri IPC response too large");
+    // Read only one line and cap it *during* reading, not afterwards.
+    loop {
+        let available = reader.fill_buf()?;
+        ensure!(!available.is_empty(), "niri IPC closed without a reply");
+        let ending = available.iter().position(|b| *b == b'\n');
+        let size = ending.map_or(available.len(), |i| i + 1);
+        ensure!(line.len() + size <= MAX_REPLY, "niri IPC response too large");
+        line.extend_from_slice(&available[..size]);
+        reader.consume(size);
+        if ending.is_some() { break; }
+    }
     let reply: Value = serde_json::from_slice(&line).context("parse niri IPC reply")?;
     reply.get("Ok").cloned().ok_or_else(|| anyhow!("niri IPC rejected request: {}", reply.get("Err").unwrap_or(&reply)))
 }
