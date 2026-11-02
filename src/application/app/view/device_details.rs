@@ -4,6 +4,7 @@ use super::*;
 enum Glyph {
     Monitor,
     Headphones,
+    Terminal,
     PortMapping,
     Files,
     Diagnostics,
@@ -234,6 +235,15 @@ fn paint_glyph(p: &egui::Painter, r: egui::Rect, g: Glyph, color: Color32) {
             }
         }
         Glyph::Monitor => paint_icon(p, r, Icon::Monitor, color),
+        Glyph::Terminal => {
+            p.rect_stroke(
+                egui::Rect::from_min_max(q(-9.0, -8.0), q(9.0, 8.0)),
+                2.0, s, egui::StrokeKind::Inside,
+            );
+            p.line_segment([q(-5.0, -3.0), q(-1.0, 0.0)], s);
+            p.line_segment([q(-1.0, 0.0), q(-5.0, 3.0)], s);
+            p.line_segment([q(1.0, 4.0), q(6.0, 4.0)], s);
+        }
         Glyph::Headphones => crate::ui::controls::paint_headphones(p, r, color),
         Glyph::PortMapping => crate::ui::controls::paint_port_mapping_icon(p, r, color),
         Glyph::Diagnostics => crate::ui::controls::paint_file_icon(p, r, color, false),
@@ -507,10 +517,23 @@ impl DeviceCenterApp {
         };
         let mut connect = false;
         let mut audio_only = false;
+        let mut remote_terminal = false;
         let mut edit = None;
         let mut power = None;
         let mut exit_account = false;
         self.alert(ui);
+        #[cfg(target_os = "linux")]
+        {
+            let launch_error = ui.ctx().data(|data| data.get_temp::<String>(
+                egui::Id::new(("remote-terminal-launch-error", &id))
+            ));
+            crate::ui::controls::observe_notice(
+                ui.ctx(), ("remote-terminal-launch-error", &id),
+                "远程终端启动失败",
+                crate::ui::controls::DialogIcon::Warning,
+                launch_error.as_deref(),
+            );
+        }
         crate::ui::controls::observe_notice(
             ui.ctx(),
             ("device-detail-error", &id),
@@ -540,8 +563,10 @@ impl DeviceCenterApp {
             let card_y = hero_h - 24.0;
             let has_power = owned && !current && matches!(device.platform, 1 | 4);
             let viewing = self.is_viewing_target(&id);
+            let terminal_available = cfg!(target_os = "linux")
+                && owned && !current && matches!(device.platform, 1 | 4);
             let power_y = card_y + card_h + 16.0;
-            let info_y = if has_power || has_ports || viewing {
+            let info_y = if has_power || has_ports || viewing || terminal_available {
                 power_y + theme::CONTROL_HEIGHT + 24.0
             } else {
                 card_y + card_h + 24.0
@@ -679,7 +704,7 @@ impl DeviceCenterApp {
                 crate::account::power::PowerAction::Reboot,
             ];
             let power_count = if has_power { power_actions.len() } else { 0 };
-            let action_count = power_count + 2 * usize::from(has_ports) + usize::from(viewing);
+            let action_count = power_count + 2 * usize::from(has_ports) + usize::from(viewing) + usize::from(terminal_available);
             let gap = 16.0;
             let button_w = (card.width() - action_count.saturating_sub(1) as f32 * gap)
                 / action_count.max(1) as f32;
@@ -794,6 +819,29 @@ impl DeviceCenterApp {
                 if let Some(issue) = issue {
                     button.on_disabled_hover_text(issue);
                 }
+            }
+            if terminal_available {
+                let rect = egui::Rect::from_min_size(
+                    at(
+                        pad + (power_count + 2 * usize::from(has_ports) + usize::from(viewing))
+                            as f32 * (button_w + gap),
+                        power_y,
+                    ),
+                    vec2(button_w, theme::CONTROL_HEIGHT),
+                );
+                let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                let allowed = !self.mutation_pending && !self.logout_pending
+                    && device.is_connected() && device.controllable
+                    && device.controlled_support && device.participant_count() == 0;
+                remote_terminal = detail_button(
+                    &mut button_ui,
+                    "远程终端",
+                    Glyph::Terminal,
+                    allowed,
+                    rect.size(),
+                    ButtonTone::Normal,
+                ).on_disabled_hover_text("需设备在线并允许远程控制；已有主控时不能隐式接管")
+                 .clicked();
             }
             let left = card.left() + 12.0;
             let middle = card.center().x;
@@ -977,6 +1025,17 @@ impl DeviceCenterApp {
         }
         if files {
             self.open_file_transfer(id.clone());
+        }
+        #[cfg(target_os = "linux")]
+        if remote_terminal {
+            if let Err(error) = crate::features::host::terminal::local::open_remote_in_terminal(&id) {
+                tracing::warn!(%error, "failed to open official UU terminal emulator");
+                ui.ctx().data_mut(|data| data.insert_temp(
+                    egui::Id::new(("remote-terminal-launch-error", &id)),
+                    format!("{error:#}"),
+                ));
+                ui.ctx().request_repaint();
+            }
         }
         if connect || audio_only {
             self.selected_device_id = Some(id);
