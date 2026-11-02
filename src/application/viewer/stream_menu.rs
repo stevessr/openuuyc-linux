@@ -626,7 +626,7 @@ pub(super) fn show_stream_control_window(
             ui.horizontal(|ui| {
                 if state.page != Page::Quality {
                     back =
-                        icon_button(ui, Icon::Back, if matches!(state.page, Page::Mouse | Page::Microphone | Page::DisplayAspect) { "返回高级设置" } else { "返回画质菜单；未应用的修改会取消" }).clicked();
+                        icon_button(ui, Icon::Back, if matches!(state.page, Page::Mouse | Page::Microphone | Page::DisplayAspect | Page::Windows) { "返回高级设置" } else { "返回画质菜单；未应用的修改会取消" }).clicked();
                 }
                 let title = if state.page == Page::Display {
                     "显示设置".to_owned()
@@ -1334,7 +1334,7 @@ crate::ui::controls::observe_notice(ui.ctx(), "clipboard-error", "剪贴板同�
     if back {
         state.page = if matches!(
             state.page,
-            Page::Mouse | Page::Microphone | Page::DisplayAspect
+            Page::Mouse | Page::Microphone | Page::DisplayAspect | Page::Windows
         ) {
             Page::Advanced
         } else {
