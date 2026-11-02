@@ -1,10 +1,12 @@
 name: Private window control
 
 on:
-  push:
-    branches: [feat/private-window-control-niri-win]
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: private-window-control-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
