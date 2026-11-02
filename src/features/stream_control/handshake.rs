@@ -32,6 +32,7 @@ impl StreamControlHandle {
 
     pub(crate) fn set_data_channel_open(&self, label: &str, open: bool) {
         if label == "TEXT_DATA_CHANNEL" && !open {
+            self.window_control_disconnect();
             self.disconnect_audio_quality();
         }
         let mut state = lock(&self.shared);
