@@ -11,4 +11,4 @@ pub(crate) mod remote_input;
 pub(crate) mod remote_upgrade;
 pub mod stream_control;
 pub(crate) mod viewing_settings;
-pub(crate) mod window_control;
+pub mod window_control;
