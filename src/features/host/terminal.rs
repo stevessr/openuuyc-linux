@@ -66,6 +66,34 @@ pub(crate) mod local {
     pub(crate) fn open_in_terminal(_session: u32) -> anyhow::Result<()> {
         anyhow::bail!(UNSUPPORTED)
     }
+
+    /// Console host for an official remote terminal on Windows. A new console
+    /// is required because OpenUUYC's GUI executable has no parent console.
+    #[cfg(windows)]
+    pub(crate) fn open_remote_in_terminal(device_id: &str) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use std::os::windows::process::CommandExt;
+        crate::account::api::validate_device_id(device_id)?;
+        let exe = std::env::current_exe().context("找不到 OpenUUYC 可执行文件")?;
+        // CREATE_NEW_CONSOLE (Win32 process flag); no cmd.exe or shell injection.
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let mut child = std::process::Command::new(exe)
+            .arg("remote-terminal")
+            .arg(device_id)
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .context("无法启动 UU 远程终端控制台")?;
+        std::thread::Builder::new()
+            .name("UU remote terminal console".into())
+            .spawn(move || { let _ = child.wait(); })
+            .context("无法等待远程终端进程退出")?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn open_remote_in_terminal(_device_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!(UNSUPPORTED)
+    }
 }
 
 /// The four bytes every terminal frame starts with.
