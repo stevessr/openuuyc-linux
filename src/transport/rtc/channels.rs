@@ -244,6 +244,7 @@ impl DataChannels {
             let mapping=Arc::clone(&port_mapping);
             let label = label.clone();
             let stream_control = message_stream_control.clone();
+            let received_terminal = received_terminal.clone();
             Box::pin(async move {
                 if label == "BINARY_DATA_CHANNEL" && message.data.starts_with(b"TERM") {
                     // Never treat a terminal's binary output as protobuf, and
