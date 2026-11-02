@@ -204,10 +204,12 @@ pub(super) async fn bind_channel(
             // on the authenticated TEXT data channel. It cannot be interpreted
             // as an official UU command, and no action runs in the RTC callback.
             if text && crate::features::window_control::is_packet(&message.data) {
-                let allowed = input.window_control_permitted();
+                let permission = input.clone();
                 let packet = message.data.to_vec();
                 let response = tokio::task::spawn_blocking(move || {
-                    crate::features::window_control::serve(&packet, allowed)
+                    crate::features::window_control::serve(
+                        &packet, permission.window_control_permitted(),
+                    )
                 }).await;
                 if !cancel.is_cancelled()
                     && let Ok(Some(reply)) = response
