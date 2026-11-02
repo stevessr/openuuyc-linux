@@ -18,6 +18,18 @@
   显示器切换仍按 UU 的 screen-id 工作。GNOME/KDE Wayland 和 X11 的本机窗口
   枚举暂未实现。PICO 官方/原生客户端暂未加入此私有扩展。
 
+## 推荐：使用已安装程序的跨平台命令
+
+```text
+OpenUUYC window-extension enable
+OpenUUYC window-extension status
+OpenUUYC window-extension disable
+```
+
+这三条命令在 Windows 和 Linux 上均可直接使用，不需要额外脚本和管理员权限。
+标志写入当前用户的数据目录，现有连接需要重新请求窗口列表。以下脚本仅用于
+没有安装 CLI 或需要查看具体安装行为的源码场景。
+
 ## 启用和卸载（在被控电脑本机执行）
 
 Linux/niri（运行在桌面登录用户身份，禁止 sudo）：
