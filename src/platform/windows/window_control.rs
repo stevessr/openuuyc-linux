@@ -1,7 +1,8 @@
 //! Per-user Windows toplevel inventory; no injection or foreground-lock bypass.
 use crate::features::window_control::WindowInfo;
 use anyhow::{Context, Result, ensure};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindow, GetWindowTextLengthW, GetWindowTextW,
     IsWindow, IsWindowVisible, SetForegroundWindow, GW_OWNER,
@@ -41,7 +42,7 @@ pub(crate) fn focus(id: &str) -> Result<()> {
     ensure!(handle != 0, "invalid window handle");
     ensure!(list()?.iter().any(|w| w.id == id), "window is no longer available");
     let hwnd = HWND(handle as *mut core::ffi::c_void);
-    ensure!(unsafe { IsWindow(hwnd).as_bool() && IsWindowVisible(hwnd).as_bool() }, "window closed");
+    ensure!(unsafe { IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool() }, "window closed");
     ensure!(unsafe { SetForegroundWindow(hwnd).as_bool() },
         "Windows prevented foreground activation; interact locally with the target window");
     Ok(())
