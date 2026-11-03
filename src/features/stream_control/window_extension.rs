@@ -87,12 +87,12 @@ impl StreamControlHandle {
     }
 
     fn send_window_command(&self, action: &'static str, window_id: Option<String>) -> Result<()> {
-        ensure!(
-            lock(&self.shared).text_channel_open,
-            "远端 TEXT 数据通道尚未连接"
-        );
+        // Keep the channel-open state locked until the command is registered.
+        // Channel close takes this lock before clearing extension state, so a
+        // request cannot pass the open check and enqueue after disconnect.
+        let shared = lock(&self.shared);
+        ensure!(shared.text_channel_open, "远端 TEXT 数据通道尚未连接");
         let mut state = lock(&self.window_extension);
-        state.expire_pending(Instant::now());
         if state.pending.is_some() {
             bail!("上一条窗口命令仍在等待回执");
         }
@@ -202,5 +202,50 @@ mod tests {
         assert!(state.windows.is_empty());
         assert!(state.pending.is_none());
         assert_eq!(state.error.as_deref(), Some(TIMEOUT_ERROR));
+    }
+
+    #[test]
+    fn channel_close_cannot_leave_a_late_pending_window_command() {
+        use std::sync::TryLockError;
+        use std::thread;
+
+        let profile = crate::media::ConnectionMediaOptions::default()
+            .resolve(crate::media::LocalDisplayInfo::FALLBACK)
+            .unwrap();
+        let (handle, _outgoing, _echo) = StreamControlHandle::new(
+            profile,
+            crate::diagnostics::performance::PerformanceMonitor::new("window extension test"),
+        );
+        handle.set_data_channel_open("TEXT_DATA_CHANNEL", true);
+
+        let blocked_state = lock(&handle.window_extension);
+        let sender_handle = handle.clone();
+        let sender = thread::spawn(move || sender_handle.request_remote_windows());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match handle.shared.try_lock() {
+                Err(TryLockError::WouldBlock) => break,
+                Ok(guard) => drop(guard),
+                Err(TryLockError::Poisoned(_)) => panic!("shared state mutex poisoned"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sender did not hold channel state while waiting"
+            );
+            thread::yield_now();
+        }
+
+        let close_handle = handle.clone();
+        let close = thread::spawn(move || {
+            close_handle.set_data_channel_open("TEXT_DATA_CHANNEL", false);
+        });
+        drop(blocked_state);
+
+        sender.join().unwrap().unwrap();
+        close.join().unwrap();
+        let snapshot = handle.window_snapshot();
+        assert!(!snapshot.pending);
+        assert!(snapshot.windows.is_empty());
     }
 }

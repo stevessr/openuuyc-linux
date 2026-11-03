@@ -25,7 +25,7 @@
 
 - `cargo test --locked --lib window_control` 测试协议编解码、非法动作、缺失
   权限与 niri 列表解析（不需要真实 niri）。
-- `cargo test --locked --lib stream_control::window_extension` 覆盖请求拒绝、超时清缓存及忽略迟到回执。
+- `cargo test --locked --lib stream_control::window_extension` 覆盖请求拒绝、超时清缓存、忽略迟到回执及并发断线时清理待发送命令。
 - PR 的 Linux deb 工作流覆盖 Linux 构建，Windows 专项工作流执行
   `cargo check --locked --lib` 和 `cargo test --locked --lib window_control`。
 - GitHub Actions 的通过只证明编译/合成测试；真正的远程窗口切换还需两台实体
