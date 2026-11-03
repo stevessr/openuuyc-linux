@@ -190,6 +190,7 @@ pub(crate) struct UiPresenter {
     placement: Option<super::video_layer::VideoPlacement>,
     /// The YUV to RGB rows for an NV12 frame; `None` when the frame is RGBA.
     transform: Option<[[f32; 4]; 3]>,
+    hdr_peak_nits: Option<u16>,
     pending_output: Option<RendererOutput>,
     size: PhysicalSize<u32>,
     configured: bool,
@@ -219,6 +220,7 @@ impl UiPresenter {
             video,
             placement: None,
             transform: None,
+            hdr_peak_nits: None,
             pending_output: None,
             size,
             configured: true,
@@ -248,6 +250,7 @@ impl UiPresenter {
     /// Replace the video frame drawn under the UI with packed RGBA8 pixels.
     pub(crate) fn upload_video(&mut self, width: u32, height: u32, pixels: &[u8]) -> Result<()> {
         self.transform = None;
+        self.hdr_peak_nits = None;
         self.video
             .upload_rgba(&self.device, &self.queue, width, height, pixels)
     }
@@ -261,8 +264,24 @@ impl UiPresenter {
         transform: [[f32; 4]; 3],
     ) -> Result<()> {
         self.transform = Some(transform);
+        self.hdr_peak_nits = None;
         self.video
             .upload_nv12(&self.device, &self.queue, width, height, data)
+    }
+
+    /// Present P010 without discarding its 10-bit samples before the GPU conversion.
+    pub(crate) fn upload_video_p010(
+        &mut self,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        transform: [[f32; 4]; 3],
+        hdr_peak_nits: Option<u16>,
+    ) -> Result<()> {
+        self.transform = Some(transform);
+        self.hdr_peak_nits = hdr_peak_nits;
+        self.video
+            .upload_p010(&self.device, &self.queue, width, height, data)
     }
 
     /// Binds an exported dmabuf as the video picture.
@@ -283,6 +302,7 @@ impl UiPresenter {
             return Ok(());
         }
         self.transform = Some(transform);
+        self.hdr_peak_nits = None;
         Ok(())
     }
 
@@ -415,6 +435,7 @@ impl UiPresenter {
                     (self.config.width, self.config.height),
                     placement,
                     self.transform.unwrap_or_default(),
+                    self.hdr_peak_nits,
                 );
             }
             self.renderer.render(&mut pass, &jobs, &descriptor);

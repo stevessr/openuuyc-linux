@@ -10,6 +10,8 @@ use crate::transport::rtc::EncodedVideoFrame;
 
 pub(crate) mod diagnostics;
 pub(crate) mod software_slot;
+#[cfg(not(windows))]
+mod linux_packed;
 
 use crate::platform::surface as windows_surface;
 
@@ -47,6 +49,15 @@ pub(crate) enum DecodedSurface {
 
     CpuI444(Bytes),
 
+    #[cfg(not(windows))]
+    CpuP010(Bytes),
+
+    #[cfg(not(windows))]
+    CpuAyuv(Bytes),
+
+    #[cfg(not(windows))]
+    CpuY410(Bytes),
+
     /// A dmabuf the renderer imports instead of copying through the CPU.
     #[cfg(not(windows))]
     Dmabuf(crate::platform::linux::dmabuf::DmabufFrame),
@@ -66,6 +77,13 @@ pub(crate) enum RenderSurface {
     /// Doing that on the GPU saves a full-frame CPU conversion per picture.
     #[cfg(not(windows))]
     CpuNv12 {
+        data: Bytes,
+        color: RenderColor,
+    },
+
+    /// Packed high-aligned 10-bit YUV420; sampled as R16/RG16 on the GPU.
+    #[cfg(not(windows))]
+    CpuP010 {
         data: Bytes,
         color: RenderColor,
     },
@@ -107,6 +125,22 @@ impl DecodedSurface {
                 nv12_layout(width, height, &data)?;
                 Ok(RenderSurface::CpuNv12 { data, color })
             }
+
+            #[cfg(not(windows))]
+            Self::CpuP010(data) => {
+                p010_layout(width, height, &data)?;
+                Ok(RenderSurface::CpuP010 { data, color })
+            }
+            #[cfg(not(windows))]
+            Self::CpuAyuv(data) => linux_packed::packed_444_to_rgba(
+                width, height, &data, false, color,
+            )
+            .map(RenderSurface::CpuRgba8),
+            #[cfg(not(windows))]
+            Self::CpuY410(data) => linux_packed::packed_444_to_rgba(
+                width, height, &data, true, color,
+            )
+            .map(RenderSurface::CpuRgba8),
 
             // Already in the renderer's format: the shader samples it as NV12.
             #[cfg(not(windows))]
@@ -561,7 +595,14 @@ fn poll_platform_decoder(
                         CpuFormat::Nv12 => nv12_layout(frame.width, frame.height, &frame.data)
                             .map(|_| DecodedSurface::CpuNv12(frame.data)),
                         CpuFormat::I444 => Ok(DecodedSurface::CpuI444(frame.data)),
-                        #[allow(unreachable_patterns, reason = "Linux decodes only these two.")]
+                        #[cfg(not(windows))]
+                        CpuFormat::P010 => p010_layout(frame.width, frame.height, &frame.data)
+                            .map(|_| DecodedSurface::CpuP010(frame.data)),
+                        #[cfg(not(windows))]
+                        CpuFormat::Ayuv => Ok(DecodedSurface::CpuAyuv(frame.data)),
+                        #[cfg(not(windows))]
+                        CpuFormat::Y410 => Ok(DecodedSurface::CpuY410(frame.data)),
+                        #[allow(unreachable_patterns)]
                         _ => Err(anyhow!("software video format requires a texture uploader")),
                     }
                 };
@@ -643,18 +684,22 @@ pub(crate) fn detect_native_decoder_support(
                 });
             }
         }
-        // The Linux presenter draws software frames as NV12, which the AV1
-        // decoder produces for 8-bit 4:2:0 only.
-        #[cfg(not(windows))]
+        // The Rust AV1 kernel currently builds only on x86/x86_64. All four
+        // packed pixel formats have a corresponding Linux presentation path.
+        #[cfg(all(not(windows), any(target_arch = "x86", target_arch = "x86_64")))]
         if profile.decoder.mode.software() && profile.codec.accepts(VideoCodec::Av1) {
-            capabilities.push(CodecCapability {
-                video_codec: 5,
-                width: 1920,
-                height: 1080,
-                chroma_sampling: 1,
-                bit_depth: 8,
-                codec_impl: 37,
-            });
+            for chroma_sampling in [1, 3] {
+                for bit_depth in [8, 10] {
+                    capabilities.push(CodecCapability {
+                        video_codec: 5,
+                        width: 1920,
+                        height: 1080,
+                        chroma_sampling,
+                        bit_depth,
+                        codec_impl: 37,
+                    });
+                }
+            }
         }
         #[cfg(windows)]
         if profile.decoder.mode.software() && profile.codec.accepts(VideoCodec::Av1) {
@@ -770,6 +815,32 @@ fn nv12_layout(width: u32, height: u32, nv12: &[u8]) -> Result<(usize, usize)> {
         );
     }
     Ok((luma_len, expected_len))
+}
+
+#[cfg(not(windows))]
+fn p010_layout(width: u32, height: u32, data: &[u8]) -> Result<()> {
+    let (_, expected_nv12) = nv12_layout(width, height, data)?;
+    let expected = expected_nv12.checked_mul(2).context("P010 dimensions overflow")?;
+    anyhow::ensure!(data.len() >= expected, "short P010 frame: {} bytes, need {expected}", data.len());
+    Ok(())
+}
+
+#[cfg(all(test, not(windows)))]
+mod p010_tests {
+    use super::p010_layout;
+
+    #[test]
+    fn accepts_exact_two_by_two_p010() {
+        // Four 16-bit Y samples followed by two interleaved 16-bit UV samples.
+        assert!(p010_layout(2, 2, &[0; 12]).is_ok());
+    }
+
+    #[test]
+    fn rejects_short_and_odd_p010() {
+        assert!(p010_layout(2, 2, &[0; 11]).is_err());
+        assert!(p010_layout(3, 2, &[0; 24]).is_err());
+        assert!(p010_layout(0, 2, &[]).is_err());
+    }
 }
 
 fn i444_to_rgba_pixels(
