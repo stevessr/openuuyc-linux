@@ -813,7 +813,7 @@ internal class PicoXrToolbar(
                                 }
                                 if(entry==1 && direct==null) {status("请先连接 Linux OpenUUYC");return@post}
                                 if(entry==1 && direct!=null) {
-                                    options("附加已有 VR 应用",listOf("附加当前应用 · 不启动或重启游戏","停止连接 · 不关闭游戏","状态：${direct.vr.status}","附加 SteamVR 运行中场景 · 双眼镜像"),-1) {choice ->
+                                    options("附加已有 VR 应用",listOf("附加当前应用 · 不启动或重启游戏","停止连接 · 不关闭游戏","状态：${direct.vr.status}","附加 SteamVR 运行中场景 · 双眼镜像","眼动注视点编码 · ${direct.vr.gazeStatus}"),-1) {choice ->
                                         if(choice==0) direct.quickApps.runningVr {apps,error->
                                             if(apps.isNullOrEmpty()) {
                                                 val reason=error ?: "未检测到运行中的内置 OpenXR 应用；本操作不会自动启动游戏"
@@ -826,6 +826,16 @@ internal class PicoXrToolbar(
                                         else if(choice==3) direct.vr.prepareSteamVr {ready,message->
                                             status(if(ready) "已附加 SteamVR 运行中场景；等待真实双眼帧，不会启动游戏" else message)
                                             draw()
+                                        }
+                                        else if(choice==4) {
+                                            if(direct.vr.gazeConsent) {
+                                                direct.vr.setGazeConsent(false);status("已关闭眼动注视点编码")
+                                            } else {
+                                                options("启用眼动注视点编码？",listOf("同意：实时注视姿态将传至当前 Linux 远端，仅用于 H.264 注视区码率分配","取消"),-1) {consent->
+                                                    if(consent==0) {direct.vr.setGazeConsent(true);status("已同意眼动注视点编码：${direct.vr.gazeStatus}")}
+                                                    draw()
+                                                }
+                                            }
                                         }
                                         else status(direct.vr.status)
                                     };draw()

@@ -1,26 +1,33 @@
 //! Fixed-size, bounded binary tracking frames shared with drivers/pcvr/protocol.h.
 use anyhow::{Result, ensure};
 pub(crate) const FRAME_BYTES: usize = 224;
+pub(crate) const FRAME_V3_BYTES: usize = 444;
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GazeSample {
+    pub(crate) pose: [f32; 7],
+}
 pub(crate) const FRAME_V2_BYTES: usize = 400;
 pub(crate) fn sequence(frame: &[u8]) -> Result<u64> {
     ensure!(
-        matches!(frame.len(), FRAME_BYTES | FRAME_V2_BYTES) && &frame[..4] == b"OUVR",
+        matches!(frame.len(), FRAME_BYTES | FRAME_V2_BYTES | FRAME_V3_BYTES)
+            && &frame[..4] == b"OUVR",
         "invalid tracking frame"
     );
     let version = u32::from_le_bytes(frame[4..8].try_into()?);
     ensure!(
         (version == 1 && frame.len() == FRAME_BYTES)
-            || (version == 2 && frame.len() == FRAME_V2_BYTES),
+            || (version == 2 && frame.len() == FRAME_V2_BYTES)
+            || (version == 3 && frame.len() == FRAME_V3_BYTES),
         "unsupported tracking version/size"
     );
-    let devices_end = if version == 2 { 352 } else { 224 };
+    let devices_end = if version >= 2 { 352 } else { 224 };
     let sequence = u64::from_le_bytes(frame[8..16].try_into()?);
     ensure!(sequence > 0, "zero sequence");
     for device in frame[32..devices_end].chunks_exact(64) {
         let flags = u32::from_le_bytes(device[..4].try_into()?);
         let buttons = u32::from_le_bytes(device[4..8].try_into()?);
         ensure!(
-            flags <= if version == 2 { 63 } else { 15 } && buttons <= 3 && device[60..64] == [0; 4],
+            flags <= if version >= 2 { 63 } else { 15 } && buttons <= 3 && device[60..64] == [0; 4],
             "invalid tracking flags"
         );
         let mut values = [0f32; 13];
@@ -36,8 +43,8 @@ pub(crate) fn sequence(frame: &[u8]) -> Result<u64> {
             ensure!((0.98..=1.02).contains(&norm), "invalid quaternion");
         }
     }
-    if version == 2 {
-        for control in frame[352..].chunks_exact(24) {
+    if version >= 2 {
+        for control in frame[352..FRAME_V2_BYTES].chunks_exact(24) {
             let flags = u32::from_le_bytes(control[..4].try_into()?);
             let buttons = u32::from_le_bytes(control[4..8].try_into()?);
             ensure!(flags <= 127 && buttons <= 15, "invalid controller flags");
@@ -55,7 +62,52 @@ pub(crate) fn sequence(frame: &[u8]) -> Result<u64> {
             }
         }
     }
+    if version == 3 {
+        let flags = u32::from_le_bytes(frame[400..404].try_into()?);
+        let reserved = u32::from_le_bytes(frame[404..408].try_into()?);
+        let sample_time = u64::from_le_bytes(frame[408..416].try_into()?);
+        ensure!(flags <= 1 && reserved == 0, "invalid gaze flags");
+        let mut pose = [0f32; 7];
+        for (i, bytes) in frame[416..].chunks_exact(4).enumerate() {
+            pose[i] = f32::from_le_bytes(bytes.try_into()?);
+            ensure!(pose[i].is_finite(), "nonfinite gaze pose");
+        }
+        if flags == 1 {
+            ensure!(sample_time > 0, "gaze sample time unavailable");
+            ensure!(
+                pose[..3].iter().all(|v| v.abs() <= 1000.),
+                "gaze origin out of range"
+            );
+            let norm = pose[3..].iter().map(|v| v * v).sum::<f32>();
+            ensure!((0.98..=1.02).contains(&norm), "invalid gaze orientation");
+            let xr_time = u64::from_le_bytes(frame[16..24].try_into()?);
+            ensure!(xr_time > 0, "gaze frame time unavailable");
+            ensure!(
+                xr_time.abs_diff(sample_time) <= 100_000_000,
+                "stale gaze sample"
+            );
+        } else {
+            ensure!(
+                sample_time == 0 && pose.iter().all(|v| *v == 0.),
+                "invalid empty gaze sample"
+            );
+        }
+    }
     Ok(sequence)
+}
+/// Call only after sequence() validates the complete packet.
+pub(crate) fn gaze(frame: &[u8]) -> Option<GazeSample> {
+    if frame.len() != FRAME_V3_BYTES
+        || u32::from_le_bytes(frame[4..8].try_into().ok()?) != 3
+        || u32::from_le_bytes(frame[400..404].try_into().ok()?) != 1
+    {
+        return None;
+    }
+    let mut pose = [0.; 7];
+    for (value, bytes) in pose.iter_mut().zip(frame[416..].chunks_exact(4)) {
+        *value = f32::from_le_bytes(bytes.try_into().ok()?);
+    }
+    Some(GazeSample { pose })
 }
 /// Call only after sequence() validates the full packet. Lost head tracking is not a pose.
 pub(crate) fn head_valid(frame: &[u8]) -> bool {
@@ -96,6 +148,51 @@ mod tests {
         f[4] = 1;
         f[8] = 1;
         f
+    }
+    fn gaze_frame() -> Vec<u8> {
+        let mut frame = frame();
+        frame.resize(FRAME_V3_BYTES, 0);
+        frame[4] = 3;
+        frame[16..24].copy_from_slice(&100_000_000u64.to_le_bytes());
+        frame[400..404].copy_from_slice(&1u32.to_le_bytes());
+        frame[408..416].copy_from_slice(&95_000_000u64.to_le_bytes());
+        frame[424..428].copy_from_slice(&(-0.03f32).to_le_bytes());
+        frame[440..444].copy_from_slice(&1f32.to_le_bytes());
+        frame
+    }
+    #[test]
+    fn gaze_v3_requires_fresh_real_pose_and_extracts_only_valid_samples() {
+        let frame = gaze_frame();
+        assert_eq!(sequence(&frame).unwrap(), 1);
+        assert_eq!(
+            gaze(&frame),
+            Some(GazeSample {
+                pose: [0., 0., -0.03, 0., 0., 0., 1.],
+            })
+        );
+        assert!(sequence(&frame[..FRAME_V2_BYTES]).is_err());
+
+        let mut stale = frame.clone();
+        stale[408..416].copy_from_slice(&200_000_001u64.to_le_bytes());
+        assert!(
+            sequence(&stale).is_err(),
+            "a gaze sample more than 100 ms from frame time must not validate"
+        );
+
+        let mut invalid_flags = frame;
+        invalid_flags[400] = 2;
+        assert!(sequence(&invalid_flags).is_err());
+    }
+    #[test]
+    fn gaze_v3_without_a_valid_sample_is_uniform_and_bounded() {
+        let mut frame = frame();
+        frame.resize(FRAME_V3_BYTES, 0);
+        frame[4] = 3;
+        frame[16..24].copy_from_slice(&100_000_000u64.to_le_bytes());
+        assert_eq!(sequence(&frame).unwrap(), 1);
+        assert_eq!(gaze(&frame), None);
+        frame[404] = 1;
+        assert!(sequence(&frame).is_err());
     }
     #[test]
     fn accepts_lost_tracking_but_not_zero_sequence_or_wrong_sizes() {

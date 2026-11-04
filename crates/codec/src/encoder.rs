@@ -95,6 +95,11 @@ impl Encoder {
         self.config = next;
         Ok(())
     }
+    /// Mutable per-macroblock QP offsets, reused across frames without reallocating.
+    /// The H.264 implementation applies each offset to its rate-controller QP and clamps to 0..=51.
+    pub fn macroblock_qp_offsets_mut(&mut self) -> &mut [i8] {
+        self.kernel.macroblock_qp_offsets_mut()
+    }
     /// Convert borrowed packed pixels into the reusable planes. The caller may
     /// unmap its GPU staging resource before the actual encoding starts.
     pub fn prepare(&mut self, data: &[u8], pitch: usize, cancel: &AtomicBool) -> Result<()> {

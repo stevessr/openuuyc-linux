@@ -13,6 +13,12 @@ internal class UuPcvrSession {
         const val CONTROL="OPENUUYC_VR_CONTROL_V1"
         const val TRACKING="OPENUUYC_VR_TRACKING_V1"
         private val owner=AtomicReference<UuPcvrSession?>()
+        @Volatile private var runtimeGazeSupported=false
+        fun updateEyeGazeSupport(supported:Boolean) {runtimeGazeSupported=supported}
+        fun gazeEnabled():Boolean {
+            val current=owner.get() ?: return false
+            return UuPcvrTracking.gazeAllowed(runtimeGazeSupported,current.active,current.gazeConsent,current.gazeVersion)
+        }
         fun stereoTarget()=owner.get()
     }
     private var eyeCalibration: JSONObject?=null
@@ -106,6 +112,15 @@ internal class UuPcvrSession {
     private var poses: DataChannel?=null
     @Volatile var active=false;private set
     @Volatile var status="内置 VR 追踪诊断：未开启";private set
+    @Volatile var gazeConsent=false;private set
+    @Volatile private var gazeVersion=1
+    val gazeStatus:String get()=when {
+        !gazeConsent -> "关闭（默认）"
+        !runtimeGazeSupported -> "已同意；OpenXR 运行时未报告眼动支持"
+        gazeVersion<3 -> "已同意；远端不支持注视点扩展"
+        else -> "已同意；远端支持实时注视点编码"
+    }
+    @Synchronized fun setGazeConsent(enabled:Boolean) {gazeConsent=enabled}
     /** Host-reported attach liveness ("running"/"ended"/"none"): decides
      * between confirming a live SteamVR mirror and re-requesting a dead one. */
     @Volatile private var mirror="none"
@@ -175,6 +190,7 @@ internal class UuPcvrSession {
         if(start && owner.get()!==this && !owner.compareAndSet(null,this)) {
             status="另一个串流正在使用内置 VR，请先停止它的追踪";return false
         }
+        if(!start) {gazeConsent=false;gazeVersion=1}
         active=false;stopStereo()
         val id=state.request(start)
         if(!start) owner.compareAndSet(this,null)
@@ -189,6 +205,7 @@ internal class UuPcvrSession {
                 // reactivate based on a late start acknowledgement.
                 control?.takeIf {it.state()==DataChannel.State.OPEN}?.send(DataChannel.Buffer(
                     ByteBuffer.wrap(JSONObject().put("id",0).put("op","stop").toString().toByteArray()),false))
+                gazeConsent=false;gazeVersion=1
                 status="VR 确认超时，已撤销本地授权并请求释放远端"
             }
         }},8000)
@@ -205,6 +222,7 @@ internal class UuPcvrSession {
             if(value.optString("type")=="video-config") {configureStereo(value);return}
             if(value.optInt("version")!=1) {revoke();status="VR 协议不兼容";return}
             trackingVersion=if(value.optInt("tracking_version",1)>=2) 2 else 1
+            gazeVersion=if(value.optInt("gaze_version",1)>=3) 3 else 1
             mirror=value.optString("mirror","none")
             val ready=value.optBoolean("tracking") && control?.state()==DataChannel.State.OPEN && poses?.state()==DataChannel.State.OPEN
             if(!state.receive(value.optInt("id"),ready,!value.isNull("error"),value.optString("backend").takeIf {it.isNotBlank()})) return
@@ -212,7 +230,9 @@ internal class UuPcvrSession {
             controlGeneration=if(active) value.optInt("generation",0).coerceAtLeast(0) else 0
             if(!active) stopStereo()
             if(!state.desired) owner.compareAndSet(this,null)
-            val cadence=if(value.has("target_fps")) "目标 ${value.optDouble("target_fps")} Hz · ${if(value.isNull("send_fps")) "发送统计中" else "发送 ${String.format(java.util.Locale.ROOT,"%.1f",value.optDouble("send_fps"))} fps"} · " else ""
+            val targetBitrate=value.optInt("target_bitrate_bps",0).coerceAtLeast(0)
+            val bitrate=if(targetBitrate>0) "自适应码率 ${String.format(java.util.Locale.ROOT,"%.1f",targetBitrate/1_000_000.0)} Mbps · " else ""
+            val cadence=bitrate+if(value.has("target_fps")) "目标 ${value.optDouble("target_fps")} Hz · ${if(value.isNull("send_fps")) "发送统计中" else "发送 ${String.format(java.util.Locale.ROOT,"%.1f",value.optDouble("send_fps"))} fps"} · " else ""
             status=localFailure ?: if(!value.isNull("error")) value.optString("error") else
                 if(active) "${value.optString("backend","追踪")} · ${cadence}已转发 ${value.optLong("frames")} 帧 · ${if(value.optBoolean("fresh")) "近期发送" else "等待头显"} · ${if(lastDecoded.get()>0 && android.os.SystemClock.elapsedRealtime()-lastDecoded.get()<1000) "双眼解码输出 ${decodedFrames.get()} 帧" else if(value.optBoolean("stereo")) "远端正在发送双眼视频，等待本机解码输出" else if(!value.isNull("video_error")) value.optString("video_error") else if(!value.optBoolean("stage",true)) "未获得真实地面；请在 PICO 设置地面后重连，OpenVR 当前不可用" else if(!value.optBoolean("fresh") || !value.optBoolean("head_valid",true)) "等待有效头部追踪" else if(value.optLong("captured_frames")==0L) "等待合成器双眼画面" else if(value.optLong("encoded_frames")==0L) "等待双眼视频编码" else if(!value.optBoolean("decoder_ready")) "等待本机解码器就绪" else "等待双眼视频传输"}" else "内置 VR 追踪已停止"
         }.onFailure {revoke();status="VR 状态无效"}
@@ -221,9 +241,13 @@ internal class UuPcvrSession {
     @Synchronized fun frame(bytes: ByteArray) {
         val c=poses
         if(!active || c?.state()!=DataChannel.State.OPEN || c.bufferedAmount()>800) return
-        val packet=UuPcvrTracking.packet(bytes,trackingVersion) ?: return
+        val packet=UuPcvrTracking.packet(bytes,trackingVersion,gazeVersion) ?: return
         c.send(DataChannel.Buffer(ByteBuffer.wrap(packet),true))
     }
-    private fun revoke() {if(owner.get()===this) for(hand in 0..1) hapticNative?.invoke(hand,0f,0f,0);controlGeneration=0;trackingVersion=1;mirror="none";stopStereo();active=false;state.reset();owner.compareAndSet(this,null)}
+    private fun revoke() {
+        if(owner.get()===this) for(hand in 0..1) hapticNative?.invoke(hand,0f,0f,0)
+        controlGeneration=0;trackingVersion=1;gazeVersion=1;gazeConsent=false;mirror="none"
+        stopStereo();active=false;state.reset();owner.compareAndSet(this,null)
+    }
     @Synchronized fun close() {revoke();eyeCalibration=null;control=null;poses=null;status="VR 会话已结束"}
 }

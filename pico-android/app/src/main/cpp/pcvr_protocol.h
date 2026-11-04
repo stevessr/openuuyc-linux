@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <cstddef>
 // Little-endian v1. Metres, radians, OpenXR LOCAL right-handed coordinates.
 // xr_time is the *remote* predicted display time, never a Linux monotonic clock.
 struct OuvrDevice {
@@ -18,7 +19,7 @@ static_assert(sizeof(OuvrDevice)==64 && sizeof(OuvrFrame)==224);
 inline bool ouvr_valid(const OuvrFrame& f) {
     if(std::memcmp(f.magic,"OUVR",4) || (f.version!=1 && f.version!=2) || !f.sequence) return false;
     for(const auto& d:f.devices) {
-        if(d.flags>(f.version==2?63u:15u) || d.buttons>3 || d.reserved) return false;
+        if(d.flags>(f.version>=2?63u:15u) || d.buttons>3 || d.reserved) return false;
         float norm=0;
         for(float v:d.position) if(!std::isfinite(v) || std::fabs(v)>1000) return false;
         for(float v:d.orientation) {if(!std::isfinite(v)) return false;norm+=v*v;}
@@ -32,6 +33,35 @@ inline bool ouvr_valid(const OuvrFrame& f) {
 struct OuvrControls { uint32_t flags,buttons; float trigger,squeeze,x,y; };
 struct OuvrFrameV2 { OuvrFrame base; OuvrDevice aim[2]; OuvrControls controls[2]; };
 static_assert(sizeof(OuvrControls)==24 && sizeof(OuvrFrameV2)==400);
+inline bool ouvr_valid(const OuvrFrameV2& f);
+// The in-memory gaze struct has tail padding; the wire ends at the final pose float.
+struct OuvrGaze { uint32_t flags,reserved; uint64_t sample_time; float pose[7]; };
+struct OuvrFrameV3 { OuvrFrameV2 tracking; OuvrGaze gaze; };
+constexpr std::size_t OUVR_FRAME_V3_BYTES=444;
+static_assert(offsetof(OuvrFrameV3,gaze)==400 && offsetof(OuvrGaze,pose)==16);
+static_assert(OUVR_FRAME_V3_BYTES==400+16+sizeof(float)*7);
+inline bool ouvr_valid(const OuvrFrameV3& f) {
+    if(f.tracking.base.version!=3 || f.gaze.flags>1 || f.gaze.reserved) return false;
+    auto tracking=f.tracking;tracking.base.version=2;
+    if(!ouvr_valid(tracking))return false;
+    if(f.gaze.flags==0) {
+        if(f.gaze.sample_time) return false;
+        for(float value:f.gaze.pose) if(value!=0.f) return false;
+        return true;
+    }
+    if(!f.gaze.sample_time || !f.tracking.base.xr_time) return false;
+    const uint64_t delta=f.gaze.sample_time>f.tracking.base.xr_time
+        ? f.gaze.sample_time-f.tracking.base.xr_time
+        : f.tracking.base.xr_time-f.gaze.sample_time;
+    if(delta>100000000ULL) return false;
+    float norm=0;
+    for(int i=0;i<7;++i) {
+        const float value=f.gaze.pose[i];
+        if(!std::isfinite(value) || (i<3 && std::fabs(value)>1000.f)) return false;
+        if(i>=3) norm+=value*value;
+    }
+    return norm>=.98f && norm<=1.02f;
+}
 inline bool ouvr_valid(const OuvrFrameV2& f) {
     if(f.base.version!=2)return false;
     auto base=f.base;

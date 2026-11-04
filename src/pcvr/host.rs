@@ -115,6 +115,7 @@ struct State {
     head_valid: bool,
     /// Tracked head pose in the headset's LOCAL space, with `last` freshness.
     head: Option<[f32; 7]>,
+    gaze: Option<(protocol::GazeSample, Instant)>,
     /// Per-generation registration of an external compositor's space.
     align: Option<(u32, super::align::Align)>,
     /// The current generation's eyes come from an external compositor.
@@ -134,7 +135,8 @@ pub(crate) struct Session {
     control: Mutex<Option<std::sync::Weak<RTCDataChannel>>>,
     configured_video: Mutex<Option<(u32, u16, u16)>>,
     video_ack: AtomicU32,
-
+    video_bitrate: AtomicU32,
+    bitrate_feedback: Mutex<super::bitrate::Controller>,
     keyframe_requested: AtomicBool,
     video_send: tokio::sync::Mutex<()>,
     producer: tokio::sync::mpsc::Sender<super::stereo::Frame>,
@@ -153,6 +155,8 @@ impl Session {
             control: Mutex::new(None),
             configured_video: Mutex::new(None),
             video_ack: AtomicU32::new(0),
+            video_bitrate: AtomicU32::new(super::bitrate::INITIAL_BPS),
+            bitrate_feedback: Mutex::new(super::bitrate::Controller::default()),
             keyframe_requested: AtomicBool::new(true),
             video_send: tokio::sync::Mutex::new(()),
             producer,
@@ -178,7 +182,7 @@ impl Session {
             let mut last_export = Instant::now();
             while let Some(session) = weak.upgrade() {
                 let began = Instant::now();
-                let (rate, source, attach_failure, epoch, mirrored) = {
+                let (rate, source, attach_failure, epoch, mirrored, gaze) = {
                     let mut state = lock(&session.state);
                     // A dead helper reports its real failure; a live one that
                     // cannot produce frames yet reports why, instead of leaving
@@ -198,12 +202,17 @@ impl Session {
                         .and_then(|export| export.file.try_clone().ok())
                         .map(|f| (state.generation, f));
                     let mirrored = state.attach.is_some();
+                    let gaze = state
+                        .gaze
+                        .filter(|(_, received)| received.elapsed() <= Duration::from_millis(50))
+                        .map(|(sample, _)| super::foveation::Gaze { pose: sample.pose });
                     (
                         state.video_rate,
                         source,
                         attach_failure,
                         state.generation,
                         mirrored,
+                        gaze,
                     )
                 };
                 if let Some(reason) = attach_failure {
@@ -277,9 +286,22 @@ impl Session {
                             session.producer_status(epoch, None, true, false);
                             let cancel = Arc::new(AtomicBool::new(false));
                             if let Some(encoder) = encoder.as_mut() {
+                                if let Err(error) = encoder
+                                    .set_bitrate(session.video_bitrate.load(Ordering::Acquire))
+                                {
+                                    session.producer_status(
+                                        epoch,
+                                        Some("双眼编码器码率更新失败"),
+                                        false,
+                                        false,
+                                    );
+                                    tracing::debug!(%error,"stereo encoder bitrate update failed");
+                                    continue;
+                                }
                                 match encoder.encode(
                                     raw,
                                     session.stereo_keyframe_requested(),
+                                    gaze,
                                     &cancel,
                                 ) {
                                     Ok(Some(frame)) => {
@@ -354,6 +376,15 @@ impl Session {
         });
         session
     }
+    fn observe_video_queue(&self, queued_bytes: usize) -> u32 {
+        let rate = lock(&self.bitrate_feedback).observe(queued_bytes, Instant::now());
+        self.video_bitrate.store(rate, Ordering::Release);
+        rate
+    }
+    fn note_video_congestion(&self) {
+        let rate = lock(&self.bitrate_feedback).congested(Instant::now());
+        self.video_bitrate.store(rate, Ordering::Release);
+    }
     fn producer_status(
         &self,
         generation: u32,
@@ -407,6 +438,9 @@ impl Session {
         self.lease.app_launch_allowed() && self.connected.load(Ordering::Acquire)
     }
     fn stop(&self) {
+        *lock(&self.bitrate_feedback) = super::bitrate::Controller::default();
+        self.video_bitrate
+            .store(super::bitrate::INITIAL_BPS, Ordering::Release);
         *lock(&self.last_video) = None;
         *lock(&self.configured_video) = None;
         self.video_ack.store(0, Ordering::Release);
@@ -659,11 +693,20 @@ impl Session {
         let Ok(sequence) = protocol::sequence(data) else {
             return;
         };
+        let gaze_sample = protocol::gaze(data);
         let mut state = lock(&self.state);
         if sequence <= state.sequence {
             return;
         }
         let mut compatibility = [0u8; protocol::FRAME_BYTES];
+        let mut gaze_compatibility = [0u8; protocol::FRAME_V2_BYTES];
+        let data = if data.len() == protocol::FRAME_V3_BYTES {
+            gaze_compatibility.copy_from_slice(&data[..protocol::FRAME_V2_BYTES]);
+            gaze_compatibility[4..8].copy_from_slice(&2u32.to_le_bytes());
+            &gaze_compatibility[..]
+        } else {
+            data
+        };
         let data = if state.tracking_version < 2 && data.len() == protocol::FRAME_V2_BYTES {
             compatibility.copy_from_slice(&data[..protocol::FRAME_BYTES]);
             compatibility[4..8].copy_from_slice(&1u32.to_le_bytes());
@@ -703,7 +746,9 @@ impl Session {
         if accepted {
             state.sequence = sequence;
             state.frames += 1;
-            state.last = Some(Instant::now());
+            let received = Instant::now();
+            state.last = Some(received);
+            state.gaze = gaze_sample.map(|sample| (sample, received));
             state.head_valid = protocol::head_valid(data);
             state.head = protocol::head_pose(data);
         }
@@ -818,14 +863,21 @@ impl Session {
                 || !super::capture::fresh(frame.predicted_time)
                 || !live
                 || lock(&self.state).generation != frame.generation
-                || video.buffered_amount().await > 256 * 1024
             {
+                self.keyframe_requested.store(true, Ordering::Release);
+                anyhow::bail!("stereo deadline/backpressure drop");
+            }
+            let queued_bytes = video.buffered_amount().await;
+            self.observe_video_queue(queued_bytes);
+            if queued_bytes > 256 * 1024 {
+                self.note_video_congestion();
                 self.keyframe_requested.store(true, Ordering::Release);
                 anyhow::bail!("stereo deadline/backpressure drop");
             }
             match tokio::time::timeout_at(deadline, video.send(&bytes::Bytes::from(packet))).await {
                 Ok(Ok(_)) => {}
                 _ => {
+                    self.note_video_congestion();
                     self.keyframe_requested.store(true, Ordering::Release);
                     anyhow::bail!("stereo media send failed/deadline expired");
                 }
@@ -997,7 +1049,7 @@ impl Session {
                     // `stage` is a demand of the OpenXR device bridge only
                     // (xrizer needs a floor); the mirror backend never asks.
                     let stage = state.broker.as_ref().map_or(true, |b| b.has_stage());
-                    serde_json::json!({"version":1,"id":id,"send_fps":observed,"tracking":started(&state),"tracking_version":state.tracking_version.max(1),"stage":stage,"generation":state.generation,"backend":state.backend,"stereo":streaming,"video_frames":this.sent_video_frames.load(Ordering::Relaxed),"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"video_error":state.producer_error,"target_fps":state.video_rate.refresh_hz,"captured_frames":state.captured_frames,"encoded_frames":state.encoded_frames,"external":state.external,"scene_pid":state.attach.as_ref().map_or(0,|a|a.scene_pid()),"mirror":mirror,"decoder_ready":this.video_ack.load(Ordering::Acquire)==state.generation && state.generation>0,"head_valid":state.head_valid,"message":if streaming {"双眼编码帧正在发送；仍需头显确认解码与显示"} else {"等待真实合成器双眼编码帧；当前不能宣称 PCVR 可用"}})
+                    serde_json::json!({"version":1,"id":id,"send_fps":observed,"tracking":started(&state),"tracking_version":state.tracking_version.max(1),"gaze_version":3,"target_bitrate_bps":this.video_bitrate.load(Ordering::Acquire),"stage":stage,"generation":state.generation,"backend":state.backend,"stereo":streaming,"video_frames":this.sent_video_frames.load(Ordering::Relaxed),"frames":state.frames,"fresh":state.last.is_some_and(|t|t.elapsed()<Duration::from_millis(250)),"error":last_error,"video_error":state.producer_error,"target_fps":state.video_rate.refresh_hz,"captured_frames":state.captured_frames,"encoded_frames":state.encoded_frames,"external":state.external,"scene_pid":state.attach.as_ref().map_or(0,|a|a.scene_pid()),"mirror":mirror,"decoder_ready":this.video_ack.load(Ordering::Acquire)==state.generation && state.generation>0,"head_valid":state.head_valid,"message":if streaming {"双眼编码帧正在发送；仍需头显确认解码与显示"} else {"等待真实合成器双眼编码帧；当前不能宣称 PCVR 可用"}})
                 };
                 let Some(ch) = weak.upgrade() else { break };
                 if ch.ready_state()

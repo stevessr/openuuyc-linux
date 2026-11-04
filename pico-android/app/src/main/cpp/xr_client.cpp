@@ -223,11 +223,14 @@ struct Actions {
     XrAction nav_x = XR_NULL_HANDLE;
     XrAction quick_menu = XR_NULL_HANDLE;
     XrAction nav_click = XR_NULL_HANDLE;
+    XrAction eye_gaze = XR_NULL_HANDLE;
+    XrSpace eye_gaze_space = XR_NULL_HANDLE;
+    bool actions_synced = false;
     XrActionSpaceCreateInfo unused{}; // non-owning action reference
     XrSpace hands[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
     XrPath hand_paths[2] = {XR_NULL_PATH, XR_NULL_PATH};
 
-    bool create(XrInstance instance, XrSession session) {
+    bool create(XrInstance instance, XrSession session, bool eye_gaze_supported) {
         hand_paths[0] = path(instance, "/user/hand/left");
         hand_paths[1] = path(instance, "/user/hand/right");
         XrActionSetCreateInfo set_info{XR_TYPE_ACTION_SET_CREATE_INFO};
@@ -280,6 +283,13 @@ struct Actions {
         info.actionType=XR_ACTION_TYPE_VIBRATION_OUTPUT;
         std::strcpy(info.actionName,"pcvr_haptic");std::strcpy(info.localizedActionName,"PCVR vibration");
         if(!xr_ok(xrCreateAction(set,&info,&haptic),"create PCVR haptic output"))return false;
+        if(eye_gaze_supported) {
+            info.actionType=XR_ACTION_TYPE_POSE_INPUT;
+            info.countSubactionPaths=0;info.subactionPaths=nullptr;
+            std::strcpy(info.actionName,"eye_gaze");
+            std::strcpy(info.localizedActionName,"Eye gaze pose (opt-in)");
+            if(!xr_ok(xrCreateAction(set,&info,&eye_gaze),"create eye gaze action"))return false;
+        }
 
         // Try each PICO generation, then the Khronos simple controller.
         // Profiles unsupported by older runtimes are harmlessly ignored.
@@ -336,6 +346,16 @@ struct Actions {
 
             }
         }
+        if(eye_gaze!=XR_NULL_HANDLE) {
+            XrActionSuggestedBinding binding{eye_gaze,path(instance,"/user/eyes_ext/input/gaze_ext/pose")};
+            XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+            suggested.interactionProfile=path(instance,"/interaction_profiles/ext/eye_gaze_interaction");
+            suggested.suggestedBindings=&binding;suggested.countSuggestedBindings=1;
+            if(suggested.interactionProfile!=XR_NULL_PATH) {
+                const XrResult result=xrSuggestInteractionProfileBindings(instance,&suggested);
+                if(XR_FAILED(result))LOGE("Eye gaze binding unavailable: %d",int(result));
+            }
+        }
         XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
         attach.countActionSets = 1;
         attach.actionSets = &set;
@@ -349,10 +369,17 @@ struct Actions {
             space.action=tracked_grip;
             if(!xr_ok(xrCreateActionSpace(session,&space,&tracked_hands[i]),"controller tracked grip space")) return false;
         }
+        if(eye_gaze!=XR_NULL_HANDLE) {
+            XrActionSpaceCreateInfo space{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+            space.action=eye_gaze;space.subactionPath=XR_NULL_PATH;space.poseInActionSpace=identity_pose();
+            const XrResult result=xrCreateActionSpace(session,&space,&eye_gaze_space);
+            if(XR_FAILED(result))LOGE("Eye gaze action space unavailable: %d",int(result));
+        }
         return true;
     }
 
     void destroy() {
+        if(eye_gaze_space!=XR_NULL_HANDLE) xrDestroySpace(eye_gaze_space);
         for(auto hand:tracked_hands) if(hand!=XR_NULL_HANDLE) xrDestroySpace(hand);
         for (auto hand : hands) if (hand != XR_NULL_HANDLE) xrDestroySpace(hand);
         if (set != XR_NULL_HANDLE) xrDestroyActionSet(set);
@@ -387,13 +414,15 @@ Java_org_openuuyc_pico_PicoActivity_nativePcvrHaptic(JNIEnv*,jobject,jint hand,j
     std::lock_guard<std::mutex> lock(pcvr_haptic_mutex);auto& request=pcvr_haptic_requests[hand];request.pending=true;request.amplitude=amplitude;request.frequency=frequency;request.duration_ms=duration_ms;request.received=std::chrono::steady_clock::now();
 }
 
-static void emit_pcvr_tracking(JNIEnv* env,jobject activity,jmethodID enabled,jmethodID callback,
+static void emit_pcvr_tracking(JNIEnv* env,jobject activity,jmethodID enabled,jmethodID gaze_enabled_method,jmethodID callback,
                                XrSession session,XrSpace world,XrSpace view,Actions& actions,XrTime time,bool focused) {
     static bool controls_blocked[2]={true,true};
     const bool active=env->CallBooleanMethod(activity,enabled);pcvr_tracking_active.store(active);
     if(!active) {controls_blocked[0]=controls_blocked[1]=true;return;}
     static uint64_t sequence=0;
-    OuvrFrameV2 packet{};auto& frame=packet.base;std::memcpy(frame.magic,"OUVR",4);frame.version=2;frame.sequence=++sequence;
+    const bool use_gaze=env->CallBooleanMethod(activity,gaze_enabled_method) && actions.eye_gaze_space!=XR_NULL_HANDLE && actions.actions_synced;
+    OuvrFrameV3 gaze_packet{};auto& packet=gaze_packet.tracking;auto& frame=packet.base;
+    std::memcpy(frame.magic,"OUVR",4);frame.version=use_gaze?3:2;frame.sequence=++sequence;
     frame.xr_time=static_cast<uint64_t>(time);
     frame.sample_time=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     for(int i=0;i<5;++i) {
@@ -448,12 +477,40 @@ static void emit_pcvr_tracking(JNIEnv* env,jobject activity,jmethodID enabled,jm
         for(int i=0;i<4;i++) {query.action=buttons[i];XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
             if(XR_SUCCEEDED(xrGetActionStateBoolean(session,&query,&state)) && state.isActive) {control.flags|=1u<<(i+3);if(state.currentState)control.buttons|=1u<<i;}}
     }
+    if(use_gaze && focused) {
+        XrActionStateGetInfo query{XR_TYPE_ACTION_STATE_GET_INFO};query.action=actions.eye_gaze;
+        XrActionStatePose pose{XR_TYPE_ACTION_STATE_POSE};
+        if(XR_SUCCEEDED(xrGetActionStatePose(session,&query,&pose)) && pose.isActive) {
+            XrEyeGazeSampleTimeEXT sample{XR_TYPE_EYE_GAZE_SAMPLE_TIME_EXT};
+            XrSpaceLocation location{XR_TYPE_SPACE_LOCATION,&sample};
+            if(XR_SUCCEEDED(xrLocateSpace(actions.eye_gaze_space,world,time,&location))) {
+                const XrSpaceLocationFlags required=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT|
+                    XR_SPACE_LOCATION_POSITION_TRACKED_BIT|XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+                const uint64_t predicted=static_cast<uint64_t>(time);
+                const uint64_t sampled=sample.time>0?static_cast<uint64_t>(sample.time):0;
+                const uint64_t delta=sampled>predicted?sampled-predicted:predicted-sampled;
+                const auto& p=location.pose.position;const auto& q=location.pose.orientation;
+                const float norm=q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w;
+                const bool finite=std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z)&&
+                    std::isfinite(q.x)&&std::isfinite(q.y)&&std::isfinite(q.z)&&std::isfinite(q.w);
+                if((location.locationFlags&required)==required && sampled && delta<=100000000ULL && finite &&
+                   std::fabs(p.x)<=1000.f && std::fabs(p.y)<=1000.f && std::fabs(p.z)<=1000.f && norm>=.98f && norm<=1.02f) {
+                    gaze_packet.gaze.flags=1;gaze_packet.gaze.sample_time=sampled;
+                    gaze_packet.gaze.pose[0]=p.x;gaze_packet.gaze.pose[1]=p.y;gaze_packet.gaze.pose[2]=p.z;
+                    gaze_packet.gaze.pose[3]=q.x;gaze_packet.gaze.pose[4]=q.y;gaze_packet.gaze.pose[5]=q.z;gaze_packet.gaze.pose[6]=q.w;
+                }
+            }
+        }
+    }
     const bool local_ui=!focused || controller_menu_layout.load()!=4 || menu_host.load()>=0;
     ouvr_route_controls(packet,local_ui,controls_blocked);
-    if(!ouvr_valid(packet)) return;
-    auto bytes=env->NewByteArray(sizeof(packet));
+    if(use_gaze) {if(!ouvr_valid(gaze_packet))return;}
+    else if(!ouvr_valid(packet))return;
+    const jsize packet_size=static_cast<jsize>(use_gaze?OUVR_FRAME_V3_BYTES:sizeof(packet));
+    auto bytes=env->NewByteArray(packet_size);
     if(bytes) {
-        env->SetByteArrayRegion(bytes,0,sizeof(packet),reinterpret_cast<const jbyte*>(&packet));
+        const auto* source=reinterpret_cast<const jbyte*>(use_gaze?static_cast<const void*>(&gaze_packet):static_cast<const void*>(&packet));
+        env->SetByteArrayRegion(bytes,0,packet_size,source);
         env->CallVoidMethod(activity,callback,bytes);env->DeleteLocalRef(bytes);
     }
 }
@@ -506,10 +563,12 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
     XrPosef frame_aims[2]{};
     bool trigger_held[2]{};
     XrActiveActionSet active{actions.set, XR_NULL_PATH};
+    actions.actions_synced=false;
     XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
     sync.countActiveActionSets = 1;
     sync.activeActionSets = &active;
     if (XR_FAILED(xrSyncActions(session, &sync))) return;
+    actions.actions_synced=true;
     // In PCVR, individual X/A belong to the game. Both together summon the
     // local toolbar; one edge only, and held chords cannot repeatedly toggle it.
     bool quick_down[2]{},quick_edge[2]{};
@@ -988,6 +1047,8 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     jmethodID pointer_probe_report=env->GetMethodID(klass,"onXrPointerProbe","(IFFFFFF)V");
     jmethodID probe_report=env->GetMethodID(klass,"onXrStereoProbe","(JIIIIF)V");
     jmethodID tracking_enabled=env->GetMethodID(klass,"onXrTrackingEnabled","()Z");
+    jmethodID gaze_enabled_method=env->GetMethodID(klass,"onXrGazeEnabled","()Z");
+    jmethodID gaze_support_report=env->GetMethodID(klass,"onXrGazeSupport","(Z)V");
     jmethodID tracking_callback=env->GetMethodID(klass,"onXrTracking","([B)V");
     jmethodID ready = env->GetMethodID(klass, "onXrSurface", "(ILandroid/view/Surface;)V");
     jmethodID pointer = env->GetMethodID(klass, "onPointer", "(IFFZ)V");
@@ -1000,6 +1061,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     jmethodID hover_method = env->GetMethodID(klass,"onXrHover","(IFFZ)V");
     jmethodID scroll_method = env->GetMethodID(klass, "onScroll", "(II)V");
     jmethodID passthrough_report = env->GetMethodID(klass, "onPassthroughSupported", "(Z)V");
+    if(gaze_support_report)env->CallVoidMethod(activity,gaze_support_report,JNI_FALSE);
     JavaVM *vm = nullptr;
     env->GetJavaVM(&vm);
 
@@ -1072,9 +1134,16 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         }
         if (failure) break;
         std::vector<const char*> enabled_extensions(std::begin(extensions),std::end(extensions));
-        for(const auto& ext:supported) if(std::strcmp(ext.extensionName,"XR_BD_controller_interaction")==0) {
-            enabled_extensions.push_back("XR_BD_controller_interaction");
-            LOGE("Enabling runtime-supported PICO controller interaction extension");break;
+        bool eye_gaze_extension_enabled=false;
+        for(const auto& ext:supported) {
+            if(std::strcmp(ext.extensionName,"XR_BD_controller_interaction")==0) {
+                enabled_extensions.push_back("XR_BD_controller_interaction");
+                LOGE("Enabling runtime-supported PICO controller interaction extension");
+            }
+            if(std::strcmp(ext.extensionName,XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME)==0) {
+                enabled_extensions.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+                eye_gaze_extension_enabled=true;
+            }
         }
         XrInstanceCreateInfoAndroidKHR android_info{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
         android_info.applicationVM = vm;
@@ -1139,14 +1208,19 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
         XrReferenceSpaceCreateInfo view_info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         view_info.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_VIEW;view_info.poseInReferenceSpace=identity_pose();
         xrCreateReferenceSpace(session,&view_info,&view);
-        action_ready = actions.create(instance, session);
+        XrSystemEyeGazeInteractionPropertiesEXT gaze_properties{XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT};
         XrSystemProperties properties{XR_TYPE_SYSTEM_PROPERTIES};
+        if(eye_gaze_extension_enabled)properties.next=&gaze_properties;
         uint32_t max_layers = 1;
         uint32_t video_edge=1920;
+        bool eye_gaze_supported=false;
         if (XR_SUCCEEDED(xrGetSystemProperties(instance, system, &properties))) {
             max_layers = std::min(16u, properties.graphicsProperties.maxLayerCount);
             video_edge=xr_video_edge(properties.graphicsProperties.maxSwapchainImageWidth,properties.graphicsProperties.maxSwapchainImageHeight);
+            eye_gaze_supported=eye_gaze_extension_enabled && gaze_properties.supportsEyeGazeInteraction==XR_TRUE;
         }
+        if(gaze_support_report)env->CallVoidMethod(activity,gaze_support_report,eye_gaze_supported?JNI_TRUE:JNI_FALSE);
+        action_ready = actions.create(instance, session, eye_gaze_supported);
         if(video_edge==0) {failure="Runtime reports no usable video Surface size";break;}
         const uint32_t ray_budget=max_layers>4?std::min(2u,max_layers-4):0;
         const uint32_t panel_count=max_layers>=4?std::max(1u,std::min(6u,(max_layers-2-ray_budget)/2)):1u;
@@ -1387,7 +1461,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 }
             }
             if(tracking_enabled && tracking_callback && action_ready)
-                emit_pcvr_tracking(env,activity,tracking_enabled,tracking_callback,session,world,view,actions,state.predictedDisplayTime,input_focused && state.shouldRender);
+                emit_pcvr_tracking(env,activity,tracking_enabled,gaze_enabled_method,tracking_callback,session,world,view,actions,state.predictedDisplayTime,input_focused && state.shouldRender);
             if(action_ready)process_pcvr_haptics(session,actions,input_focused && state.shouldRender && pcvr_tracking_active.load() && stereo_presenting.load() && controller_menu_layout.load()==4 && menu_host.load()<0);
             if(!input_focused || !state.shouldRender) {ray_visible[0]=ray_visible[1]=false;controller_menu_available=false;}
             if(pointer_probe_requested.load() && pointer_probe_report) {

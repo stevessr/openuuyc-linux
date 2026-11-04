@@ -952,6 +952,10 @@ open class PicoActivity : Activity() {
     @Suppress("unused")
     // Called on the XR render thread. No network traffic or allocations when disabled.
     fun onXrTrackingEnabled(): Boolean = pcvrProbe || UuDirectSession.vrTrackingTarget()!=null
+    @Suppress("unused")
+    fun onXrGazeEnabled(): Boolean = org.openuuyc.pico.uu.UuPcvrSession.gazeEnabled()
+    @Suppress("unused")
+    fun onXrGazeSupport(supported:Boolean) = org.openuuyc.pico.uu.UuPcvrSession.updateEyeGazeSupport(supported)
     fun onXrTracking(bytes: ByteArray) {
         if(pcvrProbe) pcvrProbeStats.accept(bytes) else UuDirectSession.vrTrackingTarget()?.vr?.frame(bytes)
     }

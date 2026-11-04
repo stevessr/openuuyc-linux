@@ -2,6 +2,11 @@
 use anyhow::{Context, Result, ensure};
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
+mod bitrate;
+#[cfg(target_os = "linux")]
+mod foveation;
+
+#[cfg(target_os = "linux")]
 pub(crate) mod host;
 pub(crate) mod protocol;
 

@@ -150,6 +150,8 @@ pub struct Encoder {
     reference_idr: bool,
     analysis: analysis::Analysis,
     rate: rate::Rate,
+    /// Reused macroblock QP offsets. Values are clamped to the H.264 range at encode time.
+    qp_offsets: Vec<i8>,
     frame: u16,
     id: u16,
     ready: bool,
@@ -190,6 +192,7 @@ impl Encoder {
             reference_idr: true,
             analysis: analysis::Analysis::new(w, h),
             rate: rate::Rate::new(cfg),
+            qp_offsets: vec![0; (w / 16) * (h / 16)],
             frame: 0,
             id: 0,
             ready: false,
@@ -210,6 +213,11 @@ impl Encoder {
         self.cfg = c;
         self.rate.configure(c);
         Ok(())
+    }
+    /// Mutable, allocation-stable per-macroblock QP offsets for the next frame.
+    /// The map is in macroblock raster order and has `ceil(width/16) * ceil(height/16)` entries.
+    pub fn macroblock_qp_offsets_mut(&mut self) -> &mut [i8] {
+        &mut self.qp_offsets
     }
     pub fn encode(
         &mut self,
@@ -309,7 +317,9 @@ impl Encoder {
             for mx in 0..self.w / 16 {
                 let index = my * (self.w / 16) + mx;
                 let before = sw.position();
-                let qp = self.rate.mb_qp(index, before - slice_header_bits);
+                let qp = (self.rate.mb_qp(index, before - slice_header_bits)
+                    + i32::from(self.qp_offsets[index]))
+                .clamp(0, 51);
                 let motion_lambda = search::lambda(qp);
                 if idr {
                     self.macroblock::<true>(
@@ -1566,5 +1576,32 @@ mod accelerated {
         idr: bool,
     ) -> Result<Option<AccessUnit>> {
         e.encode_inner(y, u, v, timestamp, idr)
+    }
+}
+#[cfg(test)]
+mod qp_offset_tests {
+    use super::*;
+
+    #[test]
+    fn macroblock_qp_offsets_change_real_encoded_access_unit() {
+        let config = Config {
+            width: 64,
+            height: 64,
+            fps: 60,
+            bitrate: 2_000_000,
+        };
+        let y: Vec<u8> = (0..64 * 64)
+            .map(|pixel| ((pixel * 17 + pixel / 64 * 29) % 256) as u8)
+            .collect();
+        let u = vec![128; 64 * 64 / 4];
+        let v = vec![128; 64 * 64 / 4];
+
+        let mut uniform = Encoder::new(config).unwrap();
+        let baseline = uniform.encode(&y, &u, &v, 100, true).unwrap().unwrap();
+        let mut foveated = Encoder::new(config).unwrap();
+        assert_eq!(foveated.macroblock_qp_offsets_mut().len(), 16);
+        foveated.macroblock_qp_offsets_mut().fill(12);
+        let roi = foveated.encode(&y, &u, &v, 100, true).unwrap().unwrap();
+        assert_ne!(baseline.data, roi.data);
     }
 }

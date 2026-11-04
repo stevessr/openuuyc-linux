@@ -24,6 +24,9 @@ impl Encoder {
         self.core.configure(fps, bitrate)?;
         Ok(())
     }
+    pub fn macroblock_qp_offsets_mut(&mut self) -> &mut [i8] {
+        self.core.macroblock_qp_offsets_mut()
+    }
     pub fn prepare(&mut self, bgra: &[u8], pitch: usize) -> Result<()> {
         let (width, height) = self.size;
         ensure!(
