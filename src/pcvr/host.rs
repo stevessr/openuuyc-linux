@@ -286,38 +286,46 @@ impl Session {
                             session.producer_status(epoch, None, true, false);
                             let cancel = Arc::new(AtomicBool::new(false));
                             if let Some(encoder) = encoder.as_mut() {
-                                if let Err(error) = encoder
+                                match encoder
                                     .set_bitrate(session.video_bitrate.load(Ordering::Acquire))
                                 {
-                                    session.producer_status(
-                                        epoch,
-                                        Some("双眼编码器码率更新失败"),
-                                        false,
-                                        false,
-                                    );
-                                    tracing::debug!(%error,"stereo encoder bitrate update failed");
-                                    continue;
-                                }
-                                match encoder.encode(
-                                    raw,
-                                    session.stereo_keyframe_requested(),
-                                    gaze,
-                                    &cancel,
-                                ) {
-                                    Ok(Some(frame)) => {
-                                        session.producer_status(epoch, None, false, true);
-                                        let _ = session.submit_stereo(frame);
-                                    }
-                                    Ok(None) => {}
+                                    // A rejected reconfigure must not skip the
+                                    // frame pacing below: the producer loop would
+                                    // otherwise hot-spin on failed updates.
                                     Err(error) => {
-                                        session.keyframe_requested.store(true, Ordering::Release);
                                         session.producer_status(
                                             epoch,
-                                            Some("双眼视频编码失败"),
+                                            Some("双眼编码器码率更新失败"),
                                             false,
                                             false,
                                         );
-                                        tracing::debug!(%error,"stereo encode failed");
+                                        tracing::debug!(%error,"stereo encoder bitrate update failed");
+                                    }
+                                    Ok(()) => {
+                                        match encoder.encode(
+                                            raw,
+                                            session.stereo_keyframe_requested(),
+                                            gaze,
+                                            &cancel,
+                                        ) {
+                                            Ok(Some(frame)) => {
+                                                session.producer_status(epoch, None, false, true);
+                                                let _ = session.submit_stereo(frame);
+                                            }
+                                            Ok(None) => {}
+                                            Err(error) => {
+                                                session
+                                                    .keyframe_requested
+                                                    .store(true, Ordering::Release);
+                                                session.producer_status(
+                                                    epoch,
+                                                    Some("双眼视频编码失败"),
+                                                    false,
+                                                    false,
+                                                );
+                                                tracing::debug!(%error,"stereo encode failed");
+                                            }
+                                        }
                                     }
                                 }
                             }
