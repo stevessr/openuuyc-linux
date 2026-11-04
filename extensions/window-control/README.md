@@ -52,8 +52,9 @@ powershell -ExecutionPolicy Bypass -File extensions/window-control/install-windo
 （默认 `~/.local/share`）或 Windows
 `%LOCALAPPDATA%\OpenUUYC\private-window-control.enabled`。不要从网络共享运行
 安装脚本。标志由安装脚本本机创建，**单独标志不意味着已授权的远控连接**：每次执行
-还需当前主机连接合法、CONTROL 输入通道已绑定且未故障。撤销标志后下一次窗口请求
-会即时拒绝；命令拒绝、5 秒超时及 TEXT/CONTROL 通道断开都会清空主控端缓存。
+还需当前主机连接合法、CONTROL 输入通道已绑定且未故障；主控侧也必须保持
+CONTROL 与 TEXT 通道均打开。撤销标志后下一次窗口请求会即时拒绝；命令拒绝、5 秒超时及
+TEXT/CONTROL 通道断开都会清空主控端缓存。
 
 ## 安全边界
 

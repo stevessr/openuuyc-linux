@@ -91,6 +91,7 @@ impl StreamControlHandle {
         // Channel close takes this lock before clearing extension state, so a
         // request cannot pass the open check and enqueue after disconnect.
         let shared = lock(&self.shared);
+        ensure!(shared.control_channel_open, "远端 CONTROL 数据通道尚未连接");
         ensure!(shared.text_channel_open, "远端 TEXT 数据通道尚未连接");
         let mut state = lock(&self.window_extension);
         if state.pending.is_some() {
@@ -216,6 +217,7 @@ mod tests {
             profile,
             crate::diagnostics::performance::PerformanceMonitor::new("window extension test"),
         );
+        handle.set_data_channel_open("CONTROL_DATA_CHANNEL", true);
         handle.set_data_channel_open("TEXT_DATA_CHANNEL", true);
 
         let blocked_state = lock(&handle.window_extension);
@@ -247,5 +249,29 @@ mod tests {
         let snapshot = handle.window_snapshot();
         assert!(!snapshot.pending);
         assert!(snapshot.windows.is_empty());
+    }
+
+    #[test]
+    fn control_close_blocks_window_commands_while_text_remains_open() {
+        let profile = crate::media::ConnectionMediaOptions::default()
+            .resolve(crate::media::LocalDisplayInfo::FALLBACK)
+            .unwrap();
+        let (handle, _outgoing, _echo) = StreamControlHandle::new(
+            profile,
+            crate::diagnostics::performance::PerformanceMonitor::new("window extension test"),
+        );
+        handle.set_data_channel_open("CONTROL_DATA_CHANNEL", true);
+        handle.set_data_channel_open("TEXT_DATA_CHANNEL", true);
+        handle.request_remote_windows().unwrap();
+
+        handle.set_data_channel_open("CONTROL_DATA_CHANNEL", false);
+        {
+            let state = lock(&handle.shared);
+            assert!(!state.control_channel_open);
+            assert!(state.text_channel_open);
+        }
+        assert!(!handle.window_snapshot().pending);
+        assert!(handle.request_remote_windows().is_err());
+        assert!(!handle.window_snapshot().pending);
     }
 }
