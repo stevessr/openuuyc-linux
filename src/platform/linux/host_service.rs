@@ -104,7 +104,6 @@ pub(crate) mod activity {
 pub(crate) mod startup {
     use super::*;
     use std::path::Path;
-    use std::sync::OnceLock;
 
     /// The `app-<desktop id>` name lets xdg-desktop-portal identify the host
     /// process as `openuuyc` from its cgroup, the same as a launch from the
@@ -122,9 +121,6 @@ pub(crate) mod startup {
     ];
     /// 两种机制都要用户配置目录：XDG 条目写在那里，便携运行时的单元也写在那里。
     const NO_CONFIG_DIR: &str = "无法确定用户配置目录（HOME 与 XDG_CONFIG_HOME 都没有设置），写不了 systemd 用户单元，也写不了 XDG 自启动条目";
-    /// 本进程就在这个图形会话里跑，答案在运行期间不会变，所以只查一次。
-    static REACHABLE: OnceLock<bool> = OnceLock::new();
-
     fn config_dir() -> Result<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -133,16 +129,13 @@ pub(crate) mod startup {
             .context("无法确定用户配置目录")
     }
 
-    /// 桌面有没有把自己接进 `graphical-session.target`：接了用 systemd 单元，没接
-    /// 用 XDG 条目。
-    fn session_reachable() -> bool {
-        *REACHABLE.get_or_init(|| {
-            std::process::Command::new("systemctl")
-                .arg("--user")
-                .args(["is-active", "graphical-session.target"])
-                .output()
-                .is_ok_and(|output| output.status.success())
-        })
+    /// The graphical target can activate after launch; query whenever startup state is read or changed.
+    fn session_reachable(systemctl: &str) -> bool {
+        std::process::Command::new(systemctl)
+            .arg("--user")
+            .args(["is-active", "graphical-session.target"])
+            .output()
+            .is_ok_and(|output| output.status.success())
     }
 
     fn checked(args: &[&str], output: &std::process::Output) -> Result<()> {
@@ -207,11 +200,11 @@ pub(crate) mod startup {
         anyhow::ensure!(path.is_file(), "尚未部署自启动程序");
         let image = path.to_str().context("程序路径不是 UTF-8")?;
         anyhow::ensure!(!image.contains(['\n', '\r']), "程序路径含换行");
-        places.enable(image, session_reachable())
+        places.enable(image, session_reachable("systemctl"))
     }
 
     pub(crate) fn enabled() -> Result<bool> {
-        Places::current()?.enabled(session_reachable())
+        Places::current()?.enabled(session_reachable("systemctl"))
     }
 
     /// Moves login startup enabled by an earlier version from [`LEGACY_UNIT`]
@@ -221,7 +214,7 @@ pub(crate) mod startup {
     pub(crate) fn migrate() {
         let result = (|| -> Result<()> {
             let places = Places::current()?;
-            if !session_reachable() || !places.unit_name_enabled(LEGACY_UNIT)? {
+            if !session_reachable("systemctl") || !places.unit_name_enabled(LEGACY_UNIT)? {
                 return Ok(());
             }
             let image = std::env::current_exe()?;
@@ -582,6 +575,34 @@ pub(crate) mod startup {
             assert!(body.contains("WantedBy=graphical-session.target"));
             assert!(body.contains("PartOf=graphical-session.target"));
             assert!(body.contains("Restart=on-failure"));
+        }
+        /// A desktop may activate its graphical target just after the app starts.
+        #[test]
+        fn session_target_detection_observes_late_activation() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let config = std::env::temp_dir()
+                .join(format!("openuuyc-startup-{}-target", std::process::id()));
+            let _ = std::fs::remove_dir_all(&config);
+            std::fs::create_dir_all(&config).unwrap();
+            let systemctl = config.join("systemctl");
+            std::fs::write(
+                &systemctl,
+                "#!/bin/sh\n\
+                 [ \"$1\" = \"--user\" ] && [ \"$2\" = \"is-active\" ] && [ \"$3\" = \"graphical-session.target\" ] || exit 2\n\
+                 [ -f \"${0%/*}/active\" ]\n",
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&systemctl).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&systemctl, permissions).unwrap();
+            let systemctl = systemctl.to_str().unwrap();
+
+            assert!(!session_reachable(systemctl));
+            std::fs::write(config.join("active"), "").unwrap();
+            assert!(session_reachable(systemctl));
+
+            let _ = std::fs::remove_dir_all(config);
         }
 
         /// 临时配置目录、没有包装单元：碰不到真实的用户配置，也不会去问 systemctl。

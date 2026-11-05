@@ -310,6 +310,7 @@ sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-
 - **解码**：H.264 走 VA-API。AMD 用 `mesa`，Intel 用 `intel-media-driver`，NVIDIA 用 `libva-nvidia-driver`（Ubuntu 为 `nvidia-vaapi-driver`；并设 `NVD_BACKEND=direct`）；libva 2.15 以前认不出 NVIDIA 显卡对应的驱动，程序会自行指定，无需设置 `LIBVA_DRIVER_NAME`。
 - **编码**（被控）：Linux 已支持 NVIDIA NVENC（H.264 / H.265；AV1 需 RTX 40 系及以上），运行时直接加载 NVIDIA 驱动的 CUDA/NVENC 库，不需要 CUDA Toolkit。确保 NVIDIA 驱动正常（`nvidia-smi` 可用），混合显卡机器 NVENC 使用桌面所在的 NVIDIA GPU；AMD 与 Intel 经 VA-API 编码 H.264（Intel 需 `intel-media-driver` 或 `libva-intel-driver`，AMD 用 `mesa`），都不可用时回退软件编码。NVIDIA 解码目前依赖 VA-API 转接驱动 `libva-nvidia-driver`（Ubuntu 为 `nvidia-vaapi-driver`，设 `NVD_BACKEND=direct`）。
 - **老 Intel GPU / 虚拟机**：Haswell/Broadwell 的 Vulkan 驱动未通过一致性认证，程序仍会使用它（设 `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=0` 恢复 wgpu 默认的隐藏行为）；驱动无法向 Wayland surface 呈现时，可安装 `vulkan-swrast`（lavapipe）并用 `OPENUUYC_BACKEND=gl` 或 `OPENUUYC_BACKEND=vulkan` 指定界面后端。
+- **GPU 设备丢失**：Linux 控制中心会记录 wgpu 报告的原因并退出；失效设备不能原地恢复，重启后会重新创建设备。若问题只出现在 Vulkan，可尝试 `OPENUUYC_BACKEND=gl`；Haswell/Broadwell 也可设 `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=0` 避开未认证适配器。
 
 #### 运行前提与开关
 

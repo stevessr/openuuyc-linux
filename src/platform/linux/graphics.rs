@@ -4,7 +4,11 @@
 //! output deferred so a busy presentation never blocks the event loop, and a
 //! premultiplied-alpha surface where the compositor offers one.
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -57,6 +61,49 @@ pub(crate) fn split_output(
     )
 }
 
+#[derive(Default)]
+struct DeviceHealth(AtomicBool);
+
+impl DeviceHealth {
+    fn is_lost(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn mark_lost(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// wgpu 30 treats a lost parent device during poll as a fatal panic rather
+/// than a `PollError`. Catch only after its device-lost callback has fired;
+/// preserve all unrelated wgpu panics.
+fn with_device_health<T>(
+    health: &DeviceHealth,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if health.is_lost() {
+        anyhow::bail!("Linux UI GPU device was lost; restart OpenUUYC");
+    }
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(_) if health.is_lost() => {
+            anyhow::bail!("Linux UI GPU device was lost; restart OpenUUYC")
+        }
+        Ok(result) => result,
+        Err(_) if health.is_lost() => {
+            anyhow::bail!("Linux UI GPU device was lost; restart OpenUUYC")
+        }
+        Err(payload) => resume_unwind(payload),
+    }
+}
+
+/// A lost device cannot retire Vulkan swapchain acquire semaphores reliably.
+/// The process is shutting down, so keep only its Surface alive until exit.
+fn leak_surface_on_device_loss<T>(surface: T, device_lost: bool) {
+    if device_lost {
+        std::mem::forget(surface);
+    }
+}
+
 /// The process-wide wgpu device shared by every shell window.
 #[derive(Clone)]
 pub(crate) struct Graphics {
@@ -64,6 +111,7 @@ pub(crate) struct Graphics {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    device_health: Arc<DeviceHealth>,
     label: String,
 }
 
@@ -166,12 +214,19 @@ fn create_graphics(event_loop: &ActiveEventLoop, window: &Window) -> Result<Grap
         }
         Err(error) => return Err(error).context("创建 GPU 设备失败"),
     };
+    let device_health = Arc::new(DeviceHealth::default());
+    let callback_health = Arc::clone(&device_health);
+    device.set_device_lost_callback(move |reason, message| {
+        callback_health.mark_lost();
+        tracing::error!(?reason, %message, "Linux UI GPU device lost");
+    });
     let label = format!("{} · {:?}", info.name, info.backend);
     Ok(Graphics {
         instance,
         adapter,
         device,
         queue,
+        device_health,
         label,
     })
 }
@@ -182,6 +237,7 @@ pub(crate) struct UiPresenter {
     /// 等托盘再打开的窗口接上继续用。
     surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
+    device_health: Arc<DeviceHealth>,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     renderer: egui_wgpu::Renderer,
@@ -197,6 +253,11 @@ pub(crate) struct UiPresenter {
 
 impl UiPresenter {
     pub(crate) fn new(window: Arc<Window>, graphics: &Graphics) -> Result<Self> {
+        let device_health = Arc::clone(&graphics.device_health);
+        with_device_health(&device_health, || Self::new_inner(window, graphics))
+    }
+
+    fn new_inner(window: Arc<Window>, graphics: &Graphics) -> Result<Self> {
         let size = nonzero_size(window.inner_size());
         let (surface, config) = create_surface(&window, graphics)?;
         let renderer = egui_wgpu::Renderer::new(
@@ -213,6 +274,7 @@ impl UiPresenter {
         Ok(Self {
             surface: Some(surface),
             device: graphics.device.clone(),
+            device_health: Arc::clone(&graphics.device_health),
             queue: graphics.queue.clone(),
             config,
             renderer,
@@ -227,12 +289,23 @@ impl UiPresenter {
 
     /// 窗口要销毁了（主窗口收进托盘）：放掉 surface，绘制资源留下。
     pub(crate) fn detach(&mut self) {
-        self.surface = None;
+        self.release_surface();
         self.configured = false;
     }
 
-    /// 托盘再打开时的窗口接上：同一个设备、同一套表面格式，绘制资源原样用。
+    fn release_surface(&mut self) {
+        if let Some(surface) = self.surface.take() {
+            leak_surface_on_device_loss(surface, self.device_health.is_lost());
+        }
+    }
+
+    /// Reconnect the retained renderer to a new window after tray restore.
     pub(crate) fn attach(&mut self, window: Arc<Window>, graphics: &Graphics) -> Result<()> {
+        let device_health = Arc::clone(&self.device_health);
+        with_device_health(&device_health, || self.attach_inner(window, graphics))
+    }
+
+    fn attach_inner(&mut self, window: Arc<Window>, graphics: &Graphics) -> Result<()> {
         let (surface, config) = create_surface(&window, graphics)?;
         anyhow::ensure!(
             config.format == self.config.format,
@@ -247,9 +320,12 @@ impl UiPresenter {
 
     /// Replace the video frame drawn under the UI with packed RGBA8 pixels.
     pub(crate) fn upload_video(&mut self, width: u32, height: u32, pixels: &[u8]) -> Result<()> {
-        self.transform = None;
-        self.video
-            .upload_rgba(&self.device, &self.queue, width, height, pixels)
+        let device_health = Arc::clone(&self.device_health);
+        with_device_health(&device_health, || {
+            self.transform = None;
+            self.video
+                .upload_rgba(&self.device, &self.queue, width, height, pixels)
+        })
     }
 
     /// Replace it with packed NV12, converted to RGB by the fragment shader.
@@ -260,9 +336,12 @@ impl UiPresenter {
         data: &[u8],
         transform: [[f32; 4]; 3],
     ) -> Result<()> {
-        self.transform = Some(transform);
-        self.video
-            .upload_nv12(&self.device, &self.queue, width, height, data)
+        let device_health = Arc::clone(&self.device_health);
+        with_device_health(&device_health, || {
+            self.transform = Some(transform);
+            self.video
+                .upload_nv12(&self.device, &self.queue, width, height, data)
+        })
     }
 
     /// Binds an exported dmabuf as the video picture.
@@ -278,12 +357,15 @@ impl UiPresenter {
         frame: &crate::platform::linux::dmabuf::DmabufFrame,
         transform: [[f32; 4]; 3],
     ) -> Result<()> {
-        if !self.video.upload_dmabuf(&self.device, frame, width, height) {
-            crate::platform::linux::dmabuf::mark_unsupported();
-            return Ok(());
-        }
-        self.transform = Some(transform);
-        Ok(())
+        let device_health = Arc::clone(&self.device_health);
+        with_device_health(&device_health, || {
+            if !self.video.upload_dmabuf(&self.device, frame, width, height) {
+                crate::platform::linux::dmabuf::mark_unsupported();
+                return Ok(());
+            }
+            self.transform = Some(transform);
+            Ok(())
+        })
     }
 
     pub(crate) fn set_video_placement(
@@ -303,6 +385,11 @@ impl UiPresenter {
     }
 
     pub(crate) fn resize(&mut self, size: PhysicalSize<u32>) -> Result<()> {
+        let device_health = Arc::clone(&self.device_health);
+        with_device_health(&device_health, || self.resize_inner(size))
+    }
+
+    fn resize_inner(&mut self, size: PhysicalSize<u32>) -> Result<()> {
         if size.width == 0 || size.height == 0 || size == self.size {
             return Ok(());
         }
@@ -324,6 +411,11 @@ impl UiPresenter {
         transparent: bool,
     ) -> Result<UiFrame> {
         self.defer_output(output);
+        let device_health = Arc::clone(&self.device_health);
+        with_device_health(&device_health, || self.render_pending(context, transparent))
+    }
+
+    fn render_pending(&mut self, context: &egui::Context, transparent: bool) -> Result<UiFrame> {
         let Some(mut output) = self.pending_output.take() else {
             return Ok(UiFrame::Pending);
         };
@@ -487,6 +579,7 @@ impl Drop for UiPresenter {
         if let Some(mut pending) = self.pending_output.take() {
             pending.textures_delta.clear();
         }
+        self.release_surface();
     }
 }
 
@@ -591,5 +684,58 @@ fn alpha_mode(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaM
         wgpu::CompositeAlphaMode::PreMultiplied
     } else {
         wgpu::CompositeAlphaMode::Auto
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_loss_panics_become_errors_but_other_panics_escape() {
+        let lost = DeviceHealth::default();
+        let error = with_device_health(&lost, || -> Result<()> {
+            lost.mark_lost();
+            panic!("simulated parent device loss");
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("device was lost"));
+
+        let healthy = DeviceHealth::default();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            with_device_health(&healthy, || -> Result<()> {
+                panic!("unrelated validation failure");
+            })
+        }));
+        assert!(panic.is_err());
+    }
+
+    #[test]
+    fn known_lost_device_skips_gpu_operation() {
+        let health = DeviceHealth::default();
+        health.mark_lost();
+        let called = AtomicBool::new(false);
+        let result = with_device_health(&health, || {
+            called.store(true, Ordering::Release);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn only_lost_device_surfaces_are_retained_until_process_exit() {
+        struct DropFlag<'a>(&'a AtomicBool);
+
+        impl Drop for DropFlag<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = AtomicBool::new(false);
+        leak_surface_on_device_loss(DropFlag(&dropped), true);
+        assert!(!dropped.load(Ordering::Acquire));
+        leak_surface_on_device_loss(DropFlag(&dropped), false);
+        assert!(dropped.load(Ordering::Acquire));
     }
 }
