@@ -637,6 +637,49 @@ pub(crate) mod startup {
             places.disable().unwrap();
             let _ = std::fs::remove_dir_all(&places.config);
         }
+        /// Enabling the systemd route replaces XDG startup; disabling removes its generated unit.
+        #[test]
+        fn systemd_startup_enable_and_disable_track_unit_state() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut places = scratch("systemd");
+            std::fs::create_dir_all(&places.config).unwrap();
+            let systemctl_path = places.config.join("systemctl");
+            std::fs::write(
+                &systemctl_path,
+                "#!/bin/sh\n\
+                 [ \"$1\" = \"--user\" ] || exit 2\n\
+                 state=\"${0%/*}/enabled\"\n\
+                 case \"$2\" in\n\
+                 daemon-reload) exit 0 ;;\n\
+                 enable|disable|is-enabled)\n\
+                 [ \"$3\" = \"app-openuuyc.service\" ] || exit 2\n\
+                 if [ \"$2\" = \"enable\" ]; then printf enabled > \"$state\"; exit 0; fi\n\
+                 if [ \"$2\" = \"disable\" ]; then printf disabled > \"$state\"; exit 0; fi\n\
+                 if [ \"$(cat \"$state\" 2>/dev/null)\" = enabled ]; then printf 'enabled\\n'; exit 0; fi\n\
+                 printf 'disabled\\n'; exit 1 ;;\n\
+                 *) exit 2 ;;\n\
+                 esac\n",
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&systemctl_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&systemctl_path, permissions).unwrap();
+            let systemctl = systemctl_path.to_str().unwrap().to_owned();
+            places.systemctl = &systemctl;
+
+            places.write_entry("/opt/OpenUUYC").unwrap();
+            assert!(places.enabled(false).unwrap());
+            places.enable("/opt/OpenUUYC", true).unwrap();
+            assert!(!places.entry().exists());
+            assert!(places.generated_unit().is_file());
+            assert!(places.enabled(true).unwrap());
+
+            places.disable().unwrap();
+            assert!(!places.generated_unit().exists());
+            assert!(!places.enabled(true).unwrap());
+            let _ = std::fs::remove_dir_all(&places.config);
+        }
 
         /// 包里的单元文件在而 systemd 不在（或这个用户的管理器里没有它）时，读作关而
         /// 不是「无法读取」，XDG 条目照样能开能关。只读地问一次 `is-enabled`。
