@@ -87,7 +87,7 @@ class UuProtocolBoundaryTest {
         assertNotEquals(baseline, sign("POST", "/api/v1/qrcode/login/status", """{"login_status":1}""", 1770000000,
             platform = true))
         val platformHeaders = UuContract.headers(
-            "POST", "/api/v1/device/windows/init", ByteArray(0), 1770000000, id, platformOnly = true
+            "POST", UuContract.ANDROID_INIT, ByteArray(0), 1770000000, id, platformOnly = true
         )
         assertFalse(platformHeaders.containsKey("X-Param-device-id"))
         assertFalse(platformHeaders.containsKey("X-Param-user-id"))

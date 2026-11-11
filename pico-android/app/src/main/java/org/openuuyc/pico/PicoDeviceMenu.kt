@@ -18,10 +18,10 @@ internal object PicoDeviceMenu {
         rows.addView(TextView(activity).apply {text="切换设备                                  ⟳";textSize=16f;setTextColor(PicoTheme.MUTED);setPadding(dp(10),dp(8),dp(10),dp(14));setOnClickListener {popup.dismiss();refresh()}})
         if(devices.isEmpty()) rows.addView(TextView(activity).apply {text="暂无可用设备";setTextColor(PicoTheme.MUTED)})
         devices.forEach {device -> rows.addView(TextView(activity).apply {
-            text="▣  ${device.alias}       ${when {device.id==current -> "✓";!device.online -> "离线";!device.controllable -> "不可控";device.occupants>0 -> "使用中";else -> "在线"}}"
+            text="▣  ${device.alias}       ${when {device.id==current -> "✓";!device.online -> "离线";!device.controllable -> if(device.androidScreenShare) "未允许共享" else "不可控";device.occupants>0 -> "使用中";else -> if(device.androidScreenShare) "安卓共享" else "在线"}}"
             gravity=Gravity.CENTER_VERTICAL;textSize=17f;setTextColor(if(device.online || device.id==current) PicoTheme.TEXT else PicoTheme.MUTED)
             background=GradientDrawable().apply {setColor(if(device.id==current) PicoTheme.SURFACE else PicoTheme.BG);cornerRadius=dp(7).toFloat()}
-            setPadding(dp(12),0,dp(10),0);isEnabled=device.online && device.controllable && device.id!=current
+            setPadding(dp(12),0,dp(10),0);isEnabled=device.available && device.id!=current
             setOnClickListener {popup.dismiss();select(device)}
         },LinearLayout.LayoutParams(-1,dp(56)))}
         popup.showAsDropDown(anchor)

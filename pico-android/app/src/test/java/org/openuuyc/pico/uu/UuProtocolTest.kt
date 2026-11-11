@@ -5,14 +5,32 @@ import org.junit.Test
 import org.json.JSONObject
 
 class UuProtocolTest {
-    @Test fun signedRestMatchesDesktopHmac() {
+    @Test fun androidHeadersKeepIndependentCompatibilityHmacFixture() {
         val identity = UuIdentity("abc-client","abcdefghijklmnop","abc-system","m")
         val headers = UuContract.headers(
             "GET", "/api/v1/device/list", ByteArray(0), 1761459600, identity
         )
-        assertEquals("eddafad67a42a64b31b5833211d9420e7bddf7260a3fe7b9db6be883ecc13181",
+        // Independent Python hmac/hashlib fixture with a literal Android header map.
+        assertEquals("6dea6dfd8de863e4368af37494ef92cf9d310d5f3fab267c8c9d185de4a18da1",
             headers["X-Param-sign"])
-        assertEquals("4.41.2.2602", headers["X-Param-VN"])
+        assertEquals("2", headers["X-Param-PLAT"])
+        assertEquals("446000", headers["X-Param-VC"])
+        assertFalse(headers.containsKey("X-Param-VN"))
+        assertFalse(headers.containsKey("X-Param-system-id"))
+        assertFalse(headers.containsKey("X-Param-OPR"))
+        assertFalse(headers.containsKey("Authorization"))
+    }
+
+    @Test fun androidRegistrationCompatibilitySignatureIncludesAbiAndExactBody() {
+        val identity = UuIdentity("abc-client", "abcdefghijklmnop", "abc-system", "m", "arm64-v8a")
+        val headers = UuContract.headers("POST", UuContract.ANDROID_INIT,
+            """{"controllable":false}""".toByteArray(Charsets.UTF_8), 1761459600,
+            identity, UuAccount("unused-token", "unused-user", ""), platformOnly = true)
+        // Independent Python hmac/hashlib fixture, including ABI and literal body.
+        assertEquals("98e2d626c42ce004a32da80e871daff011c3f92790b88044beaf23107af39a19", headers["X-Param-sign"])
+        assertEquals("arm64-v8a", headers["X-Param-ABI"])
+        assertFalse(headers.containsKey("X-Param-device-id"))
+        assertFalse(headers.containsKey("X-Param-user-id"))
         assertFalse(headers.containsKey("Authorization"))
     }
 

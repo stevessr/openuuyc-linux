@@ -64,7 +64,7 @@ internal class UuNrdTransport(
         builder.method(method, if (method == "GET") null else payload)
 
         val operation = when (path) {
-            "/api/v1/device/windows/init" -> "device-init"
+            "/api/v1/device/windows/init", "/api/v1/device/android/init" -> "device-init"
             "/api/v1/qrcode/gen/login" -> "qr-create"
             "/api/v1/qrcode/login/status" -> "qr-status"
             "/api/v1/login/by_qrcode" -> "qr-exchange"

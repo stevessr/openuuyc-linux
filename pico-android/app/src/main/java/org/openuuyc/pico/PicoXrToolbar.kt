@@ -25,15 +25,17 @@ internal class PicoXrToolbar(
     private val disconnect: () -> Unit
 ) {
     private var terminalTarget: UuDirectSession?=null
+    private val terminalOwner=Any()
     private var terminalScreen=PicoTerminalScreen()
     private var terminalTextEntry: (org.openuuyc.pico.uu.UuTerminal)->Unit={}
     private var terminalHideInput: ()->Unit={}
     fun setTerminalInput(open: (org.openuuyc.pico.uu.UuTerminal)->Unit,close: ()->Unit) {terminalTextEntry=open;terminalHideInput=close}
-    private fun closeTerminal() {terminalTarget?.terminal?.endShell();terminalTarget=null;terminalHideInput()}
+    private fun closeTerminal() {terminalTarget?.terminal?.detach(terminalOwner);terminalTarget=null;terminalHideInput()}
     private fun openTerminal(direct: UuDirectSession) {
         closeTerminal();optionTitle=null;optionApply=null;keyboardPage=false;terminalTarget=direct;terminalScreen=PicoTerminalScreen()
-        direct.terminal.changed={notice=it;draw()};direct.terminal.output={terminalScreen.append(it);draw()}
-        notice="远端终端 · 点击打开 Shell；命令在所选设备执行";draw()
+        direct.terminal.attach(terminalOwner,{notice=it;draw()}) {terminalScreen.append(it);draw()}
+        notice="正在打开远端终端；命令在所选设备执行";draw()
+        direct.terminal.open()
     }
     private var codexVoice: ((()->Boolean,(String)->Unit)->Unit)?=null
     fun setCodexVoice(action: (()->Boolean,(String)->Unit)->Unit) {codexVoice=action}

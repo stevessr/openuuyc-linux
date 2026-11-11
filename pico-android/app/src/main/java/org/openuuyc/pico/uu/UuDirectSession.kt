@@ -53,6 +53,7 @@ internal class UuDirectSession(
     private val identity: UuIdentity,
     private val events: (String) -> Unit,
     private val onWindowVisibility: (Int, Boolean) -> Unit = { _, _ -> },
+    val androidScreenShare: Boolean = false,
     private val onUnexpectedDisconnect: () -> Unit = {}
 ) : AutoCloseable {
     val ended: Boolean get()=closed.get()
@@ -78,6 +79,7 @@ internal class UuDirectSession(
         write={text,done -> clipboardBinding.write(text,done)},rejected={clipboardBinding.enable(false);emit("远端拒绝文本剪贴板，已关闭同步")})
     val clipboardEnabled: Boolean get()=clipboardBinding.enabled
     fun setClipboardEnabled(value: Boolean) {
+        if(androidScreenShare) return
         if(!value) clipboardBinding.enable(false)
         postRtc {clipboardWire.reset();clipboardBinding.enable(value);emit(if(value) "文本剪贴板同步已开启（仅前台会话）" else "剪贴板同步已关闭")}
     }
@@ -142,6 +144,7 @@ internal class UuDirectSession(
     }
     val microphoneEnabled: Boolean get()=micState.requested
     fun setMicrophoneEnabled(value: Boolean) {
+        if(androidScreenShare) return
         if(!value) {audioModule?.setMicrophoneMute(true);micState.stop()}
         postRtc {
             if(value) {
@@ -240,7 +243,8 @@ internal class UuDirectSession(
     private fun postRtc(action: ()->Unit) {
         if(!closed.get() && !rtcCallbacks.post {if(!closed.get()) action()}) terminateUnexpectedly()
     }
-    private val health = UuSessionHealth()
+    // Phone sharing requires up to 60 seconds for consent, then system projection approval.
+    private val health = UuSessionHealth(signalTimeoutMs=if(androidScreenShare) 90_000L else 30_000L)
     @Volatile var onDisposed: (() -> Unit)?=null
     @Volatile var windowInfoListener: ((Int,Int?,String,Int,Int)->Unit)? = null
     @Volatile var videoSizeListener: ((Int, Int) -> Unit)? = null
@@ -287,15 +291,19 @@ internal class UuDirectSession(
     @Volatile private var nativeAudioClaimed=false
     @Volatile private var nativeAudioRttMs=Double.POSITIVE_INFINITY
     private val nativeAudio=UuNativeAudio(
-        eligible={rhythmAudio && appFocused.get() && audioFocusHeld && !closed.get()},
+        eligible={rhythmAudio && playbackEnabled && appFocused.get() && audioFocusHeld && !closed.get()},
         switchOutput={claimed,done->postRtc {
             nativeAudioClaimed=claimed
-            remoteAudio?.setEnabled(audioFocusHeld && !claimed)
+            remoteAudio?.setEnabled(playbackEnabled && audioFocusHeld && !claimed)
             done()
         }},
         report={message->emit(message)},
         pcmAllowed={nativeAudioRttMs<=12.0}
     )
+    @Volatile var playbackEnabled = !androidScreenShare;private set
+    fun setPlaybackEnabled(value: Boolean) {
+        postRtc {playbackEnabled=value;remoteAudio?.setEnabled(value && audioFocusHeld && !nativeAudioClaimed)}
+    }
     fun nativeAudioStatus(): String=nativeAudio.label
     private var audioFocusRequested = false
     private val audioManager =
@@ -303,7 +311,7 @@ internal class UuDirectSession(
     private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { focus ->
         synchronized(this) {
             audioFocusHeld = focus == AudioManager.AUDIOFOCUS_GAIN && !closed.get()
-            remoteAudio?.setEnabled(audioFocusHeld && !nativeAudioClaimed)
+            remoteAudio?.setEnabled(playbackEnabled && audioFocusHeld && !nativeAudioClaimed)
         }
     }
     private val audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -343,7 +351,7 @@ internal class UuDirectSession(
                 improvePortraitQuality()
                 when (health.check()) {
                     UuSessionHealth.Warning.SIGNAL_TIMEOUT -> {
-                        emit("UU 信令握手超过 30 秒，终止无效连接")
+                        emit(if(androidScreenShare) "安卓共享等待确认超时，请让对方同意连接并完成系统屏幕共享授权后重试" else "UU 信令握手超过 30 秒，终止无效连接")
                         terminateUnexpectedly()
                     }
                     UuSessionHealth.Warning.ICE_TIMEOUT -> {
@@ -469,7 +477,7 @@ internal class UuDirectSession(
             }
             is UuSocketIoWire.Packet.RoomAck -> {
                 if (!signalGate.roomAcknowledged()) return
-                val (header, bytes) = UuWire.controlEvent(identity.deviceId, appControlId, localProfiles,terminalOnly,applicationsOnly)
+                val (header, bytes) = UuWire.controlEvent(identity.deviceId, appControlId, localProfiles,terminalOnly,applicationsOnly,androidScreenShare)
                 socket?.send(header)
                 socket?.send(ByteString.of(*UuWire.attachment(bytes)))
                 emit("UU 房间已登录，发送原生控制握手")
@@ -852,7 +860,7 @@ internal class UuDirectSession(
         // Real recording is attached only after permission + remote policy gates.
         if(!applicationsOnly) {
         microphoneTransceiver=connection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
-            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV))
+            RtpTransceiver.RtpTransceiverInit(if(androidScreenShare) RtpTransceiver.RtpTransceiverDirection.RECV_ONLY else RtpTransceiver.RtpTransceiverDirection.SEND_RECV))
         microphoneTransceiver?.sender?.setStreams(listOf("audio_0"))
         repeat(5) {
             connection.addTransceiver(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO, options)
@@ -861,7 +869,7 @@ internal class UuDirectSession(
         for (label in listOf(
             "CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL",
             "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL", UuTerminal.CHANNEL, UuQuickApps.CHANNEL, UuPcvrSession.CONTROL, UuPcvrSession.TRACKING, UuStereoFrames.CHANNEL, UuNativeAudio.CHANNEL
-        ).filter { (it!=UuNativeAudio.CHANNEL || (!terminalOnly && !applicationsOnly && rhythmAudio)) && (!terminalOnly || it!=UuTerminal.CHANNEL) && (!applicationsOnly || it !in setOf("STREAMER_DATA_CHANNEL",UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL)) }) {
+        ).filter { (!androidScreenShare || it in setOf("CONTROL_DATA_CHANNEL","TEXT_DATA_CHANNEL","STREAMER_DATA_CHANNEL")) && (it!=UuNativeAudio.CHANNEL || (!terminalOnly && !applicationsOnly && rhythmAudio)) && (!terminalOnly || it!=UuTerminal.CHANNEL) && (!applicationsOnly || it !in setOf("STREAMER_DATA_CHANNEL",UuPcvrSession.CONTROL,UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL)) }) {
             val channel = connection.createDataChannel(label, DataChannel.Init().apply { ordered = label !in setOf(UuPcvrSession.TRACKING,UuStereoFrames.CHANNEL,UuNativeAudio.CHANNEL); if(!ordered) maxRetransmits=0 })
             if (channel != null) {
                 channels.add(channel)
@@ -921,7 +929,7 @@ internal class UuDirectSession(
                     AudioManager.AUDIOFOCUS_REQUEST_GRANTED
             }.getOrDefault(false)
             audioFocusHeld = granted
-            track.setEnabled(granted && !nativeAudioClaimed)
+            track.setEnabled(playbackEnabled && granted && !nativeAudioClaimed)
             emit(if (granted) "UU WebRTC 远端音轨已接入头显音频输出 · ${if(rhythmAudio) "音游：独立音频时钟" else "音画同步"}"
                  else "UU 远端音轨已接入，但 Android 音频焦点不可用")
         }
@@ -1156,6 +1164,7 @@ internal class UuDirectSession(
     }
 
     @Synchronized fun pointer(pane: Int, u: Float, v: Float, down: Boolean) {
+        if(androidScreenShare) return
         if (closed.get()) return
         val target = windowPlan.getOrNull(pane)
         val screen = target?.screen
@@ -1182,10 +1191,12 @@ internal class UuDirectSession(
         controlChannel?.state() == DataChannel.State.OPEN, textChannel?.state() == DataChannel.State.OPEN)
 
     @Synchronized fun text(value: String): Boolean {
+        if(androidScreenShare) return false
         if (!inputReady() || value.toByteArray(Charsets.UTF_8).size > 64 * 1024) return false
         return sendControl(UuInputWire.text(value))
     }
     @Synchronized fun key(vk: Int, down: Boolean): Boolean {
+        if(androidScreenShare) return false
         if (vk !in 1..254 || (!inputReady() && down)) return false
         if (!sendControl(UuInputWire.key(vk, down))) {
             if (!down && vk in heldKeys) terminateUnexpectedly()
@@ -1195,6 +1206,7 @@ internal class UuDirectSession(
         return true
     }
     @Synchronized fun pointerAsTouch(pane: Int,u: Float,v: Float,down: Boolean) {
+        if(androidScreenShare) return
         if(!down) { if(touchActive) touch(3,emptyList());return }
         if(!inputReady() || pane !in panesWithFrames || !UuPointerWire.valid(u,v)) return
         val target=windowPlan.getOrNull(pane) ?: return
@@ -1206,6 +1218,7 @@ internal class UuDirectSession(
     }
 
     @Synchronized fun touch(kind: Int, points: List<UuInputWire.Contact>): Boolean {
+        if(androidScreenShare) return false
         if (!inputReady() && kind < 3) return false
         if(kind==1 && !touchActive) {
             val first=points.firstOrNull() ?: return false
@@ -1266,6 +1279,7 @@ internal class UuDirectSession(
         return true
     }
     @Synchronized fun createVirtualDisplay(width: Int = 1920, height: Int = 1080): Boolean {
+        if(androidScreenShare) return false
         if (!inputReady()) return false
         require(remoteSettings.captureLevel >= 5) { "对端未开放虚拟显示器功能" }
         require(topologyPending == null) { "上一次虚拟屏创建仍在等待确认" }
@@ -1287,6 +1301,7 @@ internal class UuDirectSession(
     }
 
     @Synchronized fun applySettings(settings: UuCaptureSettings, physical: UuDisplayMode? = null, dpi: Int = 0, targetScreen: Int? = null,automatic: Boolean=false): Boolean {
+        if(androidScreenShare) return false
         if (!inputReady()) return false
         if(targetScreen==null) remoteSettings.validate(settings) else {
             require(remoteSettings.screens.any {it.id==targetScreen}) {"目标屏幕已移除"}
@@ -1315,6 +1330,7 @@ internal class UuDirectSession(
     }
 
     @Synchronized fun setRemoteCursorVisible(visible: Boolean): Boolean {
+        if(androidScreenShare) return false
         if(!inputReady()) return false
         remoteSettings.pending?.let {return it.second.cursor==visible}
         if(remoteSettings.current.cursor==visible) return true
@@ -1322,6 +1338,7 @@ internal class UuDirectSession(
     }
 
     @Synchronized fun scroll(delta: Int) {
+        if(androidScreenShare) return
         if (closed.get() || !captureGate.inputReady(
             controlChannel?.state() == DataChannel.State.OPEN,
             textChannel?.state() == DataChannel.State.OPEN

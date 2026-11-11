@@ -8,6 +8,7 @@ package org.openuuyc.pico.uu
  * session: remote hosts may temporarily pause capture or be locked.
  */
 internal class UuSessionHealth(
+    private val signalTimeoutMs: Long = 30_000L,
     private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }
 ) {
     enum class Warning { NONE, SIGNAL_TIMEOUT, ICE_TIMEOUT, TRACK_ACK_TIMEOUT, FIRST_FRAME_TIMEOUT }
@@ -65,7 +66,7 @@ internal class UuSessionHealth(
 
     @Synchronized fun check(): Warning {
         val now = nowMs()
-        if (!signalReady && started != null && now - started!! >= 30_000L)
+        if (!signalReady && started != null && now - started!! >= signalTimeoutMs)
             return Warning.SIGNAL_TIMEOUT
         val iceTimeoutMs = if (iceHasConnectedBefore) 15_000L else 35_000L
         if (!iceReady && iceDeadlineStart != null &&

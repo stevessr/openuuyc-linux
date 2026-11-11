@@ -5,6 +5,7 @@ import java.nio.charset.CodingErrorAction
 /** Bounded monochrome VT view; OSC clipboard/title/hyperlinks are never acted on. */
 internal class PicoTerminalScreen(private val cols: Int=80,private val rows: Int=24) {
  private var cells=Array(rows) {Array(cols) {" "}}
+ private val history=java.util.ArrayDeque<String>()
  private var x=0;private var y=0;private var savedX=0;private var savedY=0
  private var mode=0;private var sequence=StringBuilder();private var carry=byteArrayOf()
  private val decoder=Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPLACE).onUnmappableCharacter(CodingErrorAction.REPLACE)
@@ -13,8 +14,13 @@ internal class PicoTerminalScreen(private val cols: Int=80,private val rows: Int
   decoder.decode(input,output,false);carry=ByteArray(input.remaining()).also {input.get(it)}
   output.flip();output.toString().codePoints().forEach {accept(it)}
  }
- fun text()=cells.joinToString("\n") {it.joinToString("").trimEnd()}
- private fun scroll() {cells=Array(rows) {if(it==rows-1) Array(cols) {" "} else cells[it+1]};y=rows-1}
+ // The XR compositor consumes exactly the current screen; scrollback is opt-in for the dialog.
+ fun text(includeHistory: Boolean=false)=((if(includeHistory) history.toList() else emptyList())+cells.map {it.joinToString("").trimEnd()}).joinToString("\n")
+ private fun scroll() {
+  history.addLast(cells[0].joinToString("").trimEnd())
+  if(history.size>500) history.removeFirst()
+  cells=Array(rows) {if(it==rows-1) Array(cols) {" "} else cells[it+1]};y=rows-1
+ }
  private fun line() {y++;if(y>=rows) scroll()}
  private fun accept(cp: Int) {
   if(mode==3) {if(cp==7) mode=0 else if(cp==27) mode=4;return}
@@ -26,7 +32,7 @@ internal class PicoTerminalScreen(private val cols: Int=80,private val rows: Int
    return
   }
   when(cp) {27->mode=1;13->x=0;10->line();8->x=(x-1).coerceAtLeast(0);9->x=((x/8+1)*8).coerceAtMost(cols-1);in 0..31,127->Unit;else->{
-   if(Character.getType(cp) in listOf(Character.NON_SPACING_MARK.toInt(),Character.COMBINING_SPACING_MARK.toInt())) {if(x>0) cells[y][x-1]+=String(Character.toChars(cp));return}
+   if(Character.getType(cp) in listOf(Character.NON_SPACING_MARK.toInt(),Character.COMBINING_SPACING_MARK.toInt())) {if(x>0 && cells[y][x-1].length<32) cells[y][x-1]+=String(Character.toChars(cp));return}
    if(x>=cols) {x=0;line()}
    val wide=cp>=0x1100 && (cp in 0x2e80..0xa4cf || cp in 0xac00..0xd7af || cp in 0xff00..0xff60 || cp>=0x1f300)
    if(wide && x==cols-1) {x=0;line()}
@@ -37,6 +43,7 @@ internal class PicoTerminalScreen(private val cols: Int=80,private val rows: Int
  private fun csi(command: Char,value: String) {
   if(value.startsWith("?")) return
   val p=value.split(';').map {it.toIntOrNull() ?: 0};fun arg(i: Int,default: Int=1)=p.getOrNull(i)?.takeIf {it>0} ?: default
+  if(command=='J' && p[0]==3) history.clear()
   when(command) {
    'H','f'->{y=(arg(0)-1).coerceIn(0,rows-1);x=(arg(1)-1).coerceIn(0,cols-1)}
    'A'->y=(y-arg(0)).coerceAtLeast(0);'B'->y=(y+arg(0)).coerceAtMost(rows-1)

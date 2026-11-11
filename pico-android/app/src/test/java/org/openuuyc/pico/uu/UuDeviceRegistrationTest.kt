@@ -4,22 +4,38 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class UuDeviceRegistrationTest {
-    @Test fun realDeviceHardwareIsNotReplacedByPlaceholders() {
-        val body=deviceRegistrationBody(UuIdentity("client","abcdefghijklmnop","system","machine"),"Android 14","PICO actual board","Actual SoC",11000,listOf("Actual GPU"),"2160x2160","0.1.0")
-        assertEquals(11000L,body.getLong("memory"));assertEquals("Actual GPU",body.getJSONArray("video").getString(0))
-        assertEquals("Actual SoC",body.getString("cpu"));assertEquals("2160x2160",body.getString("screen"))
-        assertEquals("OpenUUYC PICO 0.1.0",body.getString("name"))
-    }
-    @Test fun windowsCompatibleEndpointUsesDesktopWirePlatformButRealHardware() {
-        val identity = UuIdentity("client", "abcdefghijklmnop", "system", "machine")
-        val body = deviceRegistrationBody(identity, "Android 14", "pico-board", "arm64-v8a")
-        assertEquals(1, body.getInt("platform"))
-        assertEquals("Android 14", body.getString("os"))
-        assertEquals("pico-board", body.getString("base_board"))
-        assertEquals("arm64-v8a", body.getString("cpu"))
+    private val identity = UuIdentity("client", "abcdefghijklmnop", "system", "install")
+    private val profile = UuAndroidRegistrationProfile(
+        34, "real/fingerprint", "PICO", "Actual manufacturer", "Actual model", "Actual product",
+        "Actual ROM", listOf("arm64-v8a", "armeabi-v7a"), "4320x2160", "2160x1080", 320
+    )
+
+    @Test fun androidInitUsesExactlyOfficialSeventeenFields() {
+        val body = deviceRegistrationBody(identity, profile)
+        assertEquals(setOf("name", "client_id", "system_id", "system_version", "gaid", "install_id",
+            "build_fingerprint", "brand", "manufacturer", "model", "product", "rom", "abi",
+            "resolution", "screen_size", "dpi", "controllable"), body.keys().asSequence().toSet())
+        assertEquals("/api/v1/device/android/init", UuContract.ANDROID_INIT)
+        assertEquals("client", body.getString("client_id"))
+        assertEquals("system", body.getString("system_id"))
+        assertEquals("install", body.getString("install_id"))
+        assertEquals("34", body.getString("system_version"))
+        assertEquals("", body.getString("gaid"))
         assertFalse(body.getBoolean("controllable"))
-        assertEquals(identity.clientId, body.getString("client_id"))
-        assertEquals(identity.systemId, body.getString("system_id"))
-        assertEquals(identity.machineGuid, body.getString("machine_guid"))
+    }
+
+    @Test fun actualAndroidHardwareRetainsOfficialFieldTypesAndFormats() {
+        val body = deviceRegistrationBody(identity, profile)
+        assertEquals("PICOActual model", body.getString("name"))
+        assertEquals("real/fingerprint", body.getString("build_fingerprint"))
+        assertEquals("Actual manufacturer", body.getString("manufacturer"))
+        assertEquals("Actual product", body.getString("product"))
+        assertEquals("Actual ROM", body.getString("rom"))
+        assertEquals("arm64-v8a, armeabi-v7a", body.getString("abi"))
+        assertEquals("4320x2160", body.getString("resolution"))
+        assertEquals("2160x1080", body.getString("screen_size"))
+        assertEquals(320, body.getInt("dpi"))
+        assertEquals("4320x2160", UuAndroidRegistrationProfile.landscapeSize(2160, 4320))
+        assertEquals(1080, UuAndroidRegistrationProfile.physicalPixels(2160, 320f))
     }
 }

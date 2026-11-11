@@ -298,7 +298,7 @@ internal class PicoLoginView(
                 background = box(T.SURFACE, stroke = T.LINE)
             }
             empty.addView(label(if (state.devices.isEmpty()) "暂无设备" else "没有匹配的设备", 18f, bold = true))
-            empty.gap(10); empty.addView(label("检查电脑是否已登录同一个 UU 账号，或调整搜索条件。", 13f, T.MUTED))
+            empty.gap(10); empty.addView(label("检查目标设备是否已登录同一个 UU 账号，或调整搜索条件。", 13f, T.MUTED))
             deviceGrid.addView(empty, LinearLayout.LayoutParams(-1, -2)); return
         }
         for(device in visible) {
@@ -328,14 +328,14 @@ internal class PicoLoginView(
         identity.addView(titles,LinearLayout.LayoutParams(0,-2,1f))
         addView(identity,if(wide) LinearLayout.LayoutParams(0,-2,1f) else LinearLayout.LayoutParams(-1,-2))
         val controls=row().apply {gravity=Gravity.CENTER_VERTICAL}
-        val reason=when {!device.online->"离线";!device.controllable->"未允许控制";device.occupants>0->"已占用";else->"在线"}
+        val reason=when {!device.online->"离线";!device.controllable->if(device.androidScreenShare) "未允许共享" else "未允许控制";device.occupants>0->"已占用";else->if(device.androidScreenShare) "安卓共享" else "在线"}
         controls.addView(label("● $reason",13f,if(!device.online) T.MUTED else if(!device.controllable || device.occupants>0) T.AMBER else T.GREEN).apply {
             setPadding(dp(12),dp(8),dp(12),dp(8));background=box(if(device.online) T.SELECTED else T.BG,8)
         },LinearLayout.LayoutParams(if(wide) dp(112) else 0,-2,if(wide) 0f else 1f).apply {marginEnd=dp(14)})
-        controls.addView(button(if(device.occupants>0) "抢占连接" else "连接") {onConnect(device)}.apply {
-            isEnabled=device.online && device.controllable;contentDescription="普通连接 ${device.alias}"
+        controls.addView(button(device.connectionLabel) {onConnect(device)}.apply {
+            isEnabled=device.available;contentDescription="${device.connectionLabel} ${device.alias}"
         },LinearLayout.LayoutParams(-2,dp(46)).apply {marginEnd=dp(10)})
-        onImmersiveConnect?.let {connect->controls.addView(button("沉浸式连接",true) {connect(device)}.apply {
+        if(!device.androidScreenShare) onImmersiveConnect?.let {connect->controls.addView(button("沉浸式连接",true) {connect(device)}.apply {
             isEnabled=device.online && device.controllable;contentDescription="沉浸式连接 ${device.alias}"
         },LinearLayout.LayoutParams(-2,dp(46)))}
         addView(controls,LinearLayout.LayoutParams(if(wide) -2 else -1,-2).apply {if(!wide) topMargin=dp(14)})
@@ -367,8 +367,16 @@ internal class PicoLoginView(
         titles.gap(8);titles.addView(label("设备 ID：${device.id}",12f,T.MUTED))
         identity.addView(titles,LinearLayout.LayoutParams(0,-2,1f))
         hero.addView(identity,if(wide) LinearLayout.LayoutParams(0,-2,1f) else LinearLayout.LayoutParams(-1,-2))
-        hero.addView(button(if(device.occupants>0) "抢占连接" else "连接设备",true) {onConnect(device)}.apply {isEnabled=device.online && device.controllable},LinearLayout.LayoutParams(if(wide) dp(160) else -1,dp(48)).apply {if(!wide) topMargin=dp(16)})
+        hero.addView(button(if(device.androidScreenShare) "查看共享屏幕" else if(device.occupants>0) "抢占连接" else "连接设备",true) {onConnect(device)}.apply {isEnabled=device.available},LinearLayout.LayoutParams(if(wide) dp(160) else -1,dp(48)).apply {if(!wide) topMargin=dp(16)})
         page.addView(hero);page.gap(14)
+        if(device.androidScreenShare) {
+            page.addView(label("安卓屏幕共享 · 仅查看",18f,bold=true));page.gap(12)
+            page.addView(label("请在对方手机 UU远程的「我的 → 设置」中开启「允许本机共享屏幕」。发起请求后，对方需在 60 秒内同意连接，再完成 Android 系统录屏授权。双方须登录同一账号。",14f,T.MUTED))
+            page.gap(12);page.addView(label("共享画面会按横竖屏比例显示。当前兼容接入仍需实机验证；不提供远程点击、键盘输入、语音通话或终端。",14f,T.MUTED))
+            page.gap(12);page.addView(label("建议双方使用 UU远程 4.35.0 或更新版本",13f,T.MUTED))
+            page.gap(16);page.addView(button("刷新设备") {onRefresh()})
+            return
+        }
         val actions=row()
         onImmersiveConnect?.let {connect ->actions.addView(button("沉浸式连接") {connect(device)}.apply {isEnabled=device.online && device.controllable},LinearLayout.LayoutParams(0,dp(46),1f))}
         onDeviceTerminal?.let {open->actions.addView(button("终端") {open(device)}.apply {isEnabled=device.online && device.controllable},LinearLayout.LayoutParams(0,dp(46),1f).apply {marginStart=dp(10)})}

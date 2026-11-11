@@ -25,6 +25,13 @@ internal class PicoPanelVideoView(
     }
     private var videoWidth = 1920
     private var videoHeight = 1080
+    var viewOnly = false
+        set(value) {
+            releasePointer();field=value;pointerVisible=false
+            if(hint.visibility!=GONE) hint.text=if(value) "等待对方同意连接并授权屏幕共享…" else "等待远端画面…"
+            video.contentDescription=if(value) "安卓共享屏幕：仅查看" else "远程桌面：触摸移动和点击，鼠标滚轮滚动"
+            invalidate()
+        }
     var touchMode = false
         set(value) { if (field != value) releasePointer(); field = value }
     var pointerStyle=4
@@ -34,7 +41,7 @@ internal class PicoPanelVideoView(
     private var pointerVisible=false
     override fun dispatchDraw(canvas: android.graphics.Canvas) {
         super.dispatchDraw(canvas)
-        if(!pointerVisible || !PicoPointerStyle.localCursor(pointerStyle,remoteTextCursor) || (pointerStyle in 0..1 && !pressed)) return
+        if(viewOnly || !pointerVisible || !PicoPointerStyle.localCursor(pointerStyle,remoteTextCursor) || (pointerStyle in 0..1 && !pressed)) return
         val x=video.left+u*video.width;val y=video.top+v*video.height
         val p=android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
         if(pointerStyle in 0..1) {
@@ -63,6 +70,7 @@ internal class PicoPanelVideoView(
             override fun surfaceDestroyed(holder: SurfaceHolder) { releasePointer(); detach() }
         })
         video.setOnTouchListener { _, event ->
+            if(viewOnly) return@setOnTouchListener true
             u = PanelViewport.coordinate(event.x, video.width)
             v = PanelViewport.coordinate(event.y, video.height)
             if (touchMode) {
@@ -88,6 +96,7 @@ internal class PicoPanelVideoView(
             true
         }
         video.setOnHoverListener { _, event ->
+            if(viewOnly) return@setOnHoverListener true
             pointerVisible=event.actionMasked!=MotionEvent.ACTION_HOVER_EXIT;invalidate()
             if (event.actionMasked == MotionEvent.ACTION_HOVER_MOVE) {
                 u = PanelViewport.coordinate(event.x, video.width)
@@ -97,6 +106,7 @@ internal class PicoPanelVideoView(
             true
         }
         video.setOnGenericMotionListener { _, event ->
+            if(viewOnly) return@setOnGenericMotionListener true
             if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
                 scroll((event.getAxisValue(MotionEvent.AXIS_VSCROLL) * 120).toInt().coerceIn(-1200, 1200)); true
             } else false

@@ -42,7 +42,7 @@ import java.util.concurrent.atomic.AtomicLong
 open class PicoActivity : Activity() {
     companion object {
         // One-use, process-local handoff: never put room credentials in Intents.
-        private data class ViewerLaunch(val room: UuRoom, val identity: UuIdentity, val passthrough: Boolean, val alias: String,val deviceId: String = "")
+        private data class ViewerLaunch(val room: UuRoom, val identity: UuIdentity, val passthrough: Boolean, val alias: String,val deviceId: String = "",val androidScreenShare: Boolean = false)
         private val pendingViewer = AtomicReference<ViewerLaunch?>(null)
         private const val CAMERA_REQUEST = 8341
         private const val XR_REQUEST = 1
@@ -154,6 +154,7 @@ open class PicoActivity : Activity() {
     private val worker = Executors.newSingleThreadExecutor()
     private val loginEpoch = AtomicLong(0L)
     private val joinGate = UuJoinGate()
+    private var pendingShareCancel: AtomicBoolean?=null
     private val running = AtomicBoolean(false)
     @Volatile private var session: UuDirectSession? = null
     private var xrThread: Thread? = null
@@ -192,7 +193,7 @@ open class PicoActivity : Activity() {
             if (this is XrActivity) {
                 nativeSetPassthroughEnabled(passthroughEnabled)
                 startXrSession(pending.room, pending.identity)
-            } else startPanelSession(pending.room, pending.identity, pending.alias)
+            } else startPanelSession(pending.room, pending.identity, pending.alias,pending.androidScreenShare)
             return
         }
         api = UuNrdApi(this)
@@ -345,7 +346,7 @@ open class PicoActivity : Activity() {
                     }
                     UuSavedLoginFlow.Result.NONE -> {
                         loginView?.setRestoreState(false)
-                        message("使用 UU 远程手机端扫码；登录后将安全保存在本机")
+                        message(if(api.needsAndroidLoginMigration) "已升级为安卓设备身份，请重新登录一次以使用手机共享；原登录数据已保留" else "使用 UU 远程手机端扫码；登录后将安全保存在本机")
                     }
                     UuSavedLoginFlow.Result.REVOKED -> {
                         loginView?.setRestoreState(false)
@@ -372,6 +373,7 @@ open class PicoActivity : Activity() {
             .setTitle("退出登录？").setMessage("将清除本机加密保存的登录凭证，不会移除电脑上的账号。")
             .setNegativeButton("取消", null).setPositiveButton("退出登录") { _, _ ->
                 loginEpoch.incrementAndGet()
+                pendingShareCancel?.set(true)
                 api.cancelPendingRequests()
                 joinGate.stop()
                 // Complete the local deletion before acknowledging logout, so
@@ -500,6 +502,7 @@ open class PicoActivity : Activity() {
     }
 
     private fun connect(device: UuDevice, mode: PicoViewerMode = PicoViewerMode.DEFAULT, forceJoin: Boolean = false) {
+        if(device.androidScreenShare && (!device.available || forceJoin)) {message("安卓设备离线、未允许共享或正在共享中，请先在对方手机开启允许本机共享屏幕");return}
         if (device.occupants > 0 && !forceJoin) {
             android.app.AlertDialog.Builder(this).setTitle("抢占连接")
                 .setMessage("${device.alias} 正在被控制。抢占会断开现有会话，是否继续？")
@@ -508,19 +511,31 @@ open class PicoActivity : Activity() {
         }
         closeAppDirectories()
         val ticket = joinGate.begin() ?: return
-        message("加入 UU 远控房间：${device.alias}")
+        val loginTicket=loginEpoch.get()
+        val cancelled=AtomicBoolean(false)
+        val prompt=if(device.androidScreenShare) android.app.AlertDialog.Builder(this)
+            .setTitle("请求查看 ${device.alias}").setMessage("正在连接共享请求服务…")
+            .setNegativeButton("取消") {_,_->cancelled.set(true)}.create().apply {
+                setOnCancelListener {cancelled.set(true)}
+                pendingShareCancel=cancelled;show()
+            } else null
+        message(if(device.androidScreenShare) "请求查看 ${device.alias}，请对方同意连接并完成系统屏幕共享授权" else "加入 UU 远控房间：${device.alias}")
         worker.submit {
             try {
                 // Only the network request runs off-thread. Adoption and
                 // Session/Surface ownership are serialized on the UI thread
                 // with Stop and Activity.onDestroy.
+                if(device.androidScreenShare) api.approveAndroidShare(device,
+                    cancelled={cancelled.get() || loginEpoch.get()!=loginTicket || isDestroyed || isFinishing},
+                    status={text->ui.post {if(!cancelled.get() && !isDestroyed && loginEpoch.get()==loginTicket) prompt?.setMessage(text)}})
+                if(cancelled.get() || loginEpoch.get()!=loginTicket || isDestroyed || isFinishing) throw java.io.IOException("共享请求已取消")
                 val room = api.join(device, forceJoin)
                 ui.post {
-                    if (isFinishing || isDestroyed || !joinGate.adopt(ticket)) {org.openuuyc.pico.uu.UuRoomRelease.cancel(room);return@post}
-                    pendingViewer.set(ViewerLaunch(room, api.identity.copy(), passthroughEnabled, device.alias,device.id))
+                    if (cancelled.get() || loginEpoch.get()!=loginTicket || isFinishing || isDestroyed || !joinGate.adopt(ticket)) {joinGate.failed(ticket);org.openuuyc.pico.uu.UuRoomRelease.cancel(room);return@post}
+                    pendingViewer.set(ViewerLaunch(room, api.identity.copy(), passthroughEnabled, device.alias,device.id,device.androidScreenShare))
                     cameraPreview.stop()
                     try {
-                        val viewer = if (mode == PicoViewerMode.IMMERSIVE) XrActivity::class.java else PanelViewerActivity::class.java
+                        val viewer = if (mode == PicoViewerMode.IMMERSIVE && !device.androidScreenShare) XrActivity::class.java else PanelViewerActivity::class.java
                         startActivityForResult(Intent(this, viewer), XR_REQUEST)
                     } catch (e: Exception) {
                         pendingViewer.set(null)
@@ -531,7 +546,11 @@ open class PicoActivity : Activity() {
                 }
             } catch (e: Exception) {
                 joinGate.failed(ticket)
-                if (!isDestroyed) message("UU 设备连接失败：${e.javaClass.simpleName}")
+                if (!isDestroyed && loginEpoch.get()==loginTicket) message(
+                    if(device.androidScreenShare && e is java.io.IOException && e !is UuNrdResponseException) e.message ?: "共享请求失败，请重试"
+                    else "UU 设备连接失败：${e.javaClass.simpleName}")
+            } finally {
+                ui.post {prompt?.dismiss();if(pendingShareCancel===cancelled) pendingShareCancel=null}
             }
         }
     }
@@ -554,7 +573,7 @@ open class PicoActivity : Activity() {
         }
     }
 
-    private fun startPanelSession(room: UuRoom, identity: UuIdentity, alias: String) {
+    private fun startPanelSession(room: UuRoom, identity: UuIdentity, alias: String,androidScreenShare: Boolean=false) {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(PicoTheme.BG)
         }
@@ -590,7 +609,7 @@ open class PicoActivity : Activity() {
         root.addView(status)
         try {
             val direct = UuDirectSession(applicationContext, room, identity, ::message,
-                onUnexpectedDisconnect = { ui.post { if (!isDestroyed) finishViewer() } })
+                onUnexpectedDisconnect = { ui.post { if (!isDestroyed) finishViewer() } },androidScreenShare=androidScreenShare)
             session = direct
             running.set(true)
             val keyboard = PicoRemoteKeyboard(this, direct::text, direct::key)
@@ -600,7 +619,7 @@ open class PicoActivity : Activity() {
             smartIme = getPreferences(MODE_PRIVATE).getBoolean("smart_ime", true)
             direct.textCursorListener = { text -> ui.post {
                 panelVideo?.let {view->view.remoteTextCursor=text;direct.setRemoteCursorVisible(PicoPointerStyle.remoteCursor(view.pointerStyle,text))}
-                if (text && smartIme && android.os.SystemClock.elapsedRealtime() - lastRemoteTap < 1500 && !isDestroyed) keyboard.show()
+                if (!androidScreenShare && text && smartIme && android.os.SystemClock.elapsedRealtime() - lastRemoteTap < 1500 && !isDestroyed) keyboard.show()
             } }
             fun action(label: String, run: () -> Unit): Button {
                 val button=Button(this).apply {
@@ -611,42 +630,56 @@ open class PicoActivity : Activity() {
                 controls.addAction(button,dp(100),dp(44))
                 return button
             }
-            lateinit var screenButton: Button
-            screenButton=action("屏幕") {
-                PicoScreenMenu.show(this,screenButton,direct,{
-                    panelVideo?.releasePointer();keyboard.releaseKeys();direct.releaseInputs()
-                },::message)
-            }
-            screenButton.layoutParams.width=dp(220)
-            direct.windowInfoListener={pane,_,name,_,_-> if(pane==0) ui.post {if(!isDestroyed) screenButton.text="▣ $name ▾"}}
-            action("＋") {
-                android.app.AlertDialog.Builder(this).setTitle("创建虚拟显示器？").setMessage("将在远端请求创建1920×1080显示器。")
-                    .setNegativeButton("取消",null).setPositiveButton("确认") {_,_-> try {check(direct.createVirtualDisplay());message("请求已发送，等待远端屏幕列表")} catch(error: Exception) {message(error.message ?: "虚拟屏未创建")} }.show()
-            }
-            action("终端") {PicoTerminalMenu.show(this,direct,"远端终端")}
-            action("文件管理") {PicoFilesMenu.show(this,direct,::message,::pickTransferDocument)}
-            action("游戏 / 应用") {PicoQuickAppsMenu.showConnections(this,quickAppConnections(),::message)}
-            action("设置") { PicoRemoteSettingsDialog.show(this, direct, smartIme, { enabled ->
-                smartIme = enabled; getPreferences(MODE_PRIVATE).edit().putBoolean("smart_ime", enabled).apply()
-            }, ::message) }
-            action("键盘") { keyboard.hide();PicoKeyboardPopup.show(this,toolbar,direct,keyboard::show,keyboard::showVoiceInput) }
-            panelMicButton=action("麦克风：关") {toggleMicrophone(direct)}
-            panelClipboardButton=action("剪贴板：关") {direct.setClipboardEnabled(!direct.clipboardEnabled)}
-            val inputMode = Button(this).apply {
-                text = "输入模式 ›"; setTextColor(PicoTheme.TEXT)
-                setOnClickListener {
-                    android.widget.PopupMenu(this@PicoActivity,this).apply {
-                        menu.addSubMenu("输入类型").apply {listOf("鼠标","触摸").forEachIndexed {i,label->add(label).setOnMenuItemClickListener {
-                            keyboard.releaseKeys();direct.releaseInputs();panelVideo?.touchMode=i==1;true
-                        }}}
-                        menu.addSubMenu("指针与触摸提示").apply {PicoPointerStyle.labels.forEachIndexed {i,label->add(label).setOnMenuItemClickListener {
-                            panelVideo?.pointerStyle=i;direct.setRemoteCursorVisible(PicoPointerStyle.remoteCursor(i,direct.textCursorVisible));true
-                        }}}
-                        show()
+            if(!androidScreenShare) {
+                lateinit var screenButton: Button
+                screenButton=action("屏幕") {
+                    PicoScreenMenu.show(this,screenButton,direct,{
+                        panelVideo?.releasePointer();keyboard.releaseKeys();direct.releaseInputs()
+                    },::message)
+                }
+                screenButton.layoutParams.width=dp(220)
+                direct.windowInfoListener={pane,_,name,_,_-> if(pane==0) ui.post {if(!isDestroyed) screenButton.text="▣ $name ▾"}}
+                action("＋") {
+                    android.app.AlertDialog.Builder(this).setTitle("创建虚拟显示器？").setMessage("将在远端请求创建1920×1080显示器。")
+                        .setNegativeButton("取消",null).setPositiveButton("确认") {_,_-> try {check(direct.createVirtualDisplay());message("请求已发送，等待远端屏幕列表")} catch(error: Exception) {message(error.message ?: "虚拟屏未创建")} }.show()
+                }
+                action("终端") {PicoTerminalMenu.show(this,direct,"远端终端")}
+                action("文件管理") {PicoFilesMenu.show(this,direct,::message,::pickTransferDocument)}
+                action("游戏 / 应用") {PicoQuickAppsMenu.showConnections(this,quickAppConnections(),::message)}
+                action("设置") { PicoRemoteSettingsDialog.show(this, direct, smartIme, { enabled ->
+                    smartIme = enabled; getPreferences(MODE_PRIVATE).edit().putBoolean("smart_ime", enabled).apply()
+                }, ::message) }
+                action("键盘") { keyboard.hide();PicoKeyboardPopup.show(this,toolbar,direct,keyboard::show,keyboard::showVoiceInput) }
+                panelMicButton=action("麦克风：关") {toggleMicrophone(direct)}
+                panelClipboardButton=action("剪贴板：关") {direct.setClipboardEnabled(!direct.clipboardEnabled)}
+                val inputMode = Button(this).apply {
+                    text = "输入模式 ›"; setTextColor(PicoTheme.TEXT)
+                    setOnClickListener {
+                        android.widget.PopupMenu(this@PicoActivity,this).apply {
+                            menu.addSubMenu("输入类型").apply {listOf("鼠标","触摸").forEachIndexed {i,label->add(label).setOnMenuItemClickListener {
+                                keyboard.releaseKeys();direct.releaseInputs();panelVideo?.touchMode=i==1;true
+                            }}}
+                            menu.addSubMenu("指针与触摸提示").apply {PicoPointerStyle.labels.forEachIndexed {i,label->add(label).setOnMenuItemClickListener {
+                                panelVideo?.pointerStyle=i;direct.setRemoteCursorVisible(PicoPointerStyle.remoteCursor(i,direct.textCursorVisible));true
+                            }}}
+                            show()
+                        }
                     }
                 }
+                controls.addAction(inputMode,dp(100),dp(44))
+            } else {
+                var sound=false
+                lateinit var soundButton: Button
+                soundButton=action("声音：关") {
+                    sound=!sound;direct.setPlaybackEnabled(sound)
+                    soundButton.text=if(sound) "声音：开" else "声音：关"
+                }
+                action("共享说明") {
+                    android.app.AlertDialog.Builder(this).setTitle("安卓共享屏幕 · 仅查看")
+                        .setMessage("请对方在 UU远程中开启允许本机共享屏幕，并同意本次连接与系统录屏授权。此页面只接收画面和声音，不支持点击、输入、麦克风通话或终端。锁屏或停止共享可能中断画面。")
+                        .setPositiveButton("知道了",null).show()
+                }
             }
-            controls.addAction(inputMode,dp(100),dp(44))
             lateinit var logButton: Button
             logButton=action("日志：关") {
                 val enabled=status.visibility!=android.view.View.VISIBLE
@@ -664,8 +697,9 @@ open class PicoActivity : Activity() {
                 { delta -> direct.scroll(delta) },
                 onTap = {
                     lastRemoteTap = android.os.SystemClock.elapsedRealtime()
-                    if (smartIme && direct.textCursorVisible) keyboard.show()
+                    if (!androidScreenShare && smartIme && direct.textCursorVisible) keyboard.show()
                 }, touch = direct::touch)
+            display.viewOnly=androidScreenShare
             panelVideo = display
             direct.videoSizeListener = { width, height -> ui.post { if (!isDestroyed) display.setVideoSize(width, height) } }
             root.addView(display, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -760,6 +794,7 @@ open class PicoActivity : Activity() {
     }
 
     private fun connectXrDevice(device: UuDevice,force: Boolean) {
+        if(device.androidScreenShare) {message("安卓共享请返回设备列表，点击查看共享屏幕并等待对方同意；暂不支持在 XR 中追加");return}
         if((xrMainAlive && device.id==xrDeviceId) || device.id in xrExtraDeviceIds.values) {message("该设备已经在沉浸模式中打开");return}
         val pane=PicoXrSlotPolicy.pick(xrMainAlive,(0..5).filter {xrPaneVisible.get(it)!=0}.toSet(),xrReservedSlots.toSet(),xrSurfaces.filterValues {it.isValid}.keys)
         if(pane==null) {message("可用空间窗口已满（应用最多6个），请先关闭一个窗口");return}
@@ -776,7 +811,7 @@ open class PicoActivity : Activity() {
                         lateinit var extra: UuDirectSession
                         extra=UuDirectSession(applicationContext,room,api.identity.copy(),{message("${device.alias} · $it")},
                             {index,visible->if(index==0) {xrPaneVisible.set(pane,if(visible) 1 else 0);nativeSetWindowVisible(pane,visible)}},
-                            {ui.post {xrExtraSessions[pane]?.close()}})
+                            onUnexpectedDisconnect={ui.post {xrExtraSessions[pane]?.close()}})
                         extra.immersiveRendering=true
                         extra.windowInfoListener={index,_,name,width,height->if(index==0) ui.post {
                             if(xrExtraSessions[pane]===extra) {nativeSetWindowAspect(pane,width,height);xrWindowFrame?.title(pane,"${device.alias} - $name")}
@@ -1054,6 +1089,7 @@ open class PicoActivity : Activity() {
     }
 
     private fun stopSession() {
+        pendingShareCancel?.set(true)
         hoverFrames.clear();remoteKeyboard?.hide();xrKeyboardTarget=null
         loginEpoch.incrementAndGet()
         joinGate.stop()

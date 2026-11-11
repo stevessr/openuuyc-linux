@@ -38,15 +38,17 @@ internal object UuWire {
      * Read-only feature flags from src/features/stream_control/wire.rs.
      * Protobuf zero-valued fields are omitted by prost.
      */
-    fun featureFlags() = message { out ->
+    fun featureFlags(androidScreenShare: Boolean=false) = message { out ->
         integer(out, 1, 6) // capture_setting
-        integer(out, 6, 2) // file_transfer_ftp
-        integer(out, 7, 2) // file_transfer_ftp2
-        integer(out, 8, 3) // clipboard
+        if(!androidScreenShare) {
+            integer(out, 6, 2) // file_transfer_ftp
+            integer(out, 7, 2) // file_transfer_ftp2
+            integer(out, 8, 3) // clipboard
+        }
         integer(out, 9, 1) // qos_stat
     }
 
-    fun connectOptions(controllerId: String, profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080)), terminal: Boolean=false,dataOnly: Boolean=false): ByteArray {
+    fun connectOptions(controllerId: String, profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080)), terminal: Boolean=false,dataOnly: Boolean=false,androidScreenShare: Boolean=false): ByteArray {
         require(controllerId.matches(Regex("[a-z0-9]{16}")))
         val capture = message { out ->
             integer(out, 1, 2) // 60fps tier
@@ -72,16 +74,16 @@ internal object UuWire {
                 integer(decoder, 4, profile.height.toLong())
                 integer(decoder, 5, 1)
             }) }
-            integer(out, 8, 3) // desktop controller ABI used by source
+            integer(out, 8, 2) // ConnectOptions.ClientType: actual Android controller
             bytes(out, 9, controllerId.utf8())
             integer(out, 10, 1) // normal connection
-            bytes(out, 11, featureFlags())
+            bytes(out, 11, featureFlags(androidScreenShare))
             bytes(out, 12, UuContract.VERSION.utf8())
         }
     }
 
     fun controlEvent(controllerId: String, appControlId: String = UUID.randomUUID().toString(),
-                     profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080)),terminal: Boolean=false,dataOnly: Boolean=false):
+                     profiles: List<UuCodecProfile> = listOf(UuCodecProfile(1, 1920, 1080)),terminal: Boolean=false,dataOnly: Boolean=false,androidScreenShare: Boolean=false):
         Pair<String, ByteArray> {
         val capability = JSONObject()
             .put("ice_id", "")
@@ -104,7 +106,7 @@ internal object UuWire {
             .put("app_control_id", appControlId)
             .put("app_data", JSONObject().put("_placeholder", true).put("num", 0))
             .put("streamer_data", streamer.toString())
-        return "451-2" + JSONArray().put("control").put(payload).toString() to connectOptions(controllerId, profiles,terminal,dataOnly)
+        return "451-2" + JSONArray().put("control").put(payload).toString() to connectOptions(controllerId, profiles,terminal,dataOnly,androidScreenShare)
     }
 
     /** Socket.IO binary attachment MUST start with an Engine.IO message byte. */

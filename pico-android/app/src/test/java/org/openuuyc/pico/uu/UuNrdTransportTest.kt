@@ -84,9 +84,20 @@ class UuNrdTransportTest {
 
     @Test fun registeredPlatformRequestOmitsDeviceAndAccountCredentials() {
         server.enqueue(ok("""{"device_id":"abcdefghijklmnop"}"""))
-        val body = JSONObject().put("platform", 2).put("controllable", false)
-        transport.request("POST", "/api/v1/device/windows/init", body, identity, account, platform = true)
+        val body = deviceRegistrationBody(identity, UuAndroidRegistrationProfile(
+            34, "actual/fingerprint", "PICO", "PICO", "PICO 4", "product", "rom",
+            listOf("arm64-v8a"), "4320x2160", "2160x1080", 320
+        ))
+        transport.request("POST", UuContract.ANDROID_INIT, body, identity, account, platform = true)
         val packet = requireNotNull(server.takeRequest(2, TimeUnit.SECONDS))
+        assertEquals("/api/v1/device/android/init", packet.path)
+        assertEquals("2", packet.getHeader("X-Param-PLAT"))
+        assertEquals("446000", packet.getHeader("X-Param-VC"))
+        assertEquals(identity.clientId, packet.getHeader("X-Param-client-id"))
+        val registered = JSONObject(packet.body.readUtf8())
+        assertEquals(17, registered.length())
+        assertFalse(registered.has("platform"))
+        assertFalse(registered.getBoolean("controllable"))
         assertNull(packet.getHeader("Authorization"))
         assertNull(packet.getHeader("X-Param-device-id"))
         assertNull(packet.getHeader("X-Param-user-id"))
