@@ -679,6 +679,8 @@ impl DeviceCenterApp {
                     &mut button_ui,
                     if own_session {
                         "打开观看窗口"
+                    } else if device.platform == 2 {
+                        "查看屏幕"
                     } else if self.needs_takeover(&device) {
                         "接管设备"
                     } else {

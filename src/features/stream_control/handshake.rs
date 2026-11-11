@@ -177,6 +177,14 @@ impl StreamControlHandle {
         Arc::clone(&self.protocol_changed)
     }
 
+    pub(crate) fn set_android_screen_share(&self, enabled: bool) {
+        lock(&self.shared).android_screen_share = enabled;
+    }
+
+    pub(crate) fn android_screen_share(&self) -> bool {
+        lock(&self.shared).android_screen_share
+    }
+
     pub(crate) fn set_viewing_enabled(&self, enabled: bool) {
         let mut state = lock(&self.shared);
         if enabled && !state.viewing_enabled {
@@ -271,7 +279,7 @@ impl StreamControlHandle {
                         }
                         if action.action == ACTION_TYPE_ECHO_REQUEST {
                             echo_response =
-                                Some(encode_pb_echo_response(message.seq, message.timestamp));
+                                Some(encode_pb_echo_response(message.seq, message.timestamp, state.android_screen_share));
                             tracing::debug!(
                                 request_sequence = message.seq,
                                 capture_setting_feature_level = state.peer_capture_setting,

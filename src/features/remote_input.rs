@@ -246,6 +246,8 @@ struct State {
     waiting_for_neutral: bool,
     keyboard_platform: i32,
     accept_host_input: bool,
+    /// 只读观看（Android 屏幕共享）：任何进入控制的尝试都被拒绝。
+    view_only: bool,
     queue: VecDeque<InputEvent>,
     touch: touch::Forwarder,
     in_flight: bool,
@@ -276,6 +278,20 @@ impl RemoteInput {
 
     pub(crate) fn accepts_host_input(&self) -> bool {
         self.lock().accept_host_input
+    }
+
+    /// 手机屏幕共享是只读的：置位后键鼠与手柄都进不了控制模式。
+    pub(crate) fn set_view_only(&self, view_only: bool) {
+        let mut state = self.lock();
+        if view_only {
+            Self::release_locked(&mut state);
+            state.mode = MouseMode::View;
+            state.waiting_for_neutral = false;
+        }
+        state.view_only = view_only;
+        drop(state);
+        self.wake.notify_one();
+        self.repaint();
     }
 
     pub fn owner_enabled(&self, owner: u64) -> bool {
@@ -752,6 +768,9 @@ impl RemoteInput {
         let mut s = self.lock();
         if !s.ready || s.stopping {
             bail!("控制连接尚未就绪");
+        }
+        if s.view_only && mode != MouseMode::View {
+            bail!("手机屏幕共享为只读观看，不能控制对方设备");
         }
         if s.transport_recovery.as_ref().is_some_and(|r| !r.confirmed) {
             bail!("键鼠通道正在恢复，请稍候");
@@ -1869,6 +1888,23 @@ impl Drop for DragHoldInner {
 #[cfg(test)]
 mod gamepad_tests {
     use super::*;
+
+    #[test]
+    fn android_view_only_blocks_control_even_after_transport_recovers() {
+        let input = RemoteInput::default();
+        input.set_ready(true);
+        input.set_view_only(true);
+        for mode in [MouseMode::Remote, MouseMode::Local, MouseMode::Smart] {
+            assert!(input.enable(mode, false).is_err());
+        }
+        assert_eq!(input.mode(), MouseMode::View);
+        assert!(!input.key(1, 0x41, true, None));
+        input.set_ready(false);
+        input.set_ready(true);
+        assert!(input.enable(MouseMode::Remote, false).is_err());
+        input.set_view_only(false);
+        assert!(input.enable(MouseMode::Remote, false).is_ok());
+    }
 
     fn controlling() -> RemoteInput {
         let input = RemoteInput::default();

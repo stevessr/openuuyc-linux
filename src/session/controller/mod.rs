@@ -211,6 +211,7 @@ impl ControllerConnection {
             None,
             cancel,
             purpose,
+            false,
         )
         .await?;
         shared::register(key, &connection.forwarder.session, client.ended());
@@ -347,6 +348,7 @@ impl ControllerConnection {
         reporter: Option<&ConnectionProgressReporter>,
         cancel: &CancellationToken,
         purpose: crate::session::negotiation::ControlPurpose,
+        android_screen_share: bool,
     ) -> Result<Self> {
         tracing::info!(?profile, ?transport, "establishing controller connection");
         report_progress(
@@ -382,6 +384,7 @@ impl ControllerConnection {
                 connect_type,
                 preferences,
                 purpose,
+                android_screen_share,
             ),
         )
         .await
@@ -440,6 +443,7 @@ impl ControllerConnection {
             }
         };
         peer.stream_control_handle().set_feature_policy(features);
+        peer.stream_control_handle().set_android_screen_share(android_screen_share);
         peer.stream_control_handle()
             .set_viewing_enabled(purpose == crate::session::negotiation::ControlPurpose::Viewing);
         peer.stream_control_handle()

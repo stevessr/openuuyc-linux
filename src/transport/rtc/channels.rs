@@ -383,7 +383,7 @@ pub(super) async fn send_official_control_messages(
                     continue;
                 }
                 attempts += 1;
-                match uu_kcp.send_control(&control_channel, encode_pb_echo_request()).await {
+                match uu_kcp.send_control(&control_channel, encode_pb_echo_request(stream_control.android_screen_share())).await {
                     Ok(bytes) => tracing::debug!(attempt = attempts, bytes, "sent official protobuf ECHO_REQUEST"),
                     Err(error) => tracing::warn!(attempt = attempts, %error, "protobuf ECHO_REQUEST send failed"),
                 }

@@ -288,6 +288,7 @@ impl SignalSession {
         connect_type: crate::session::negotiation::ControlConnectType,
         preferences: Option<crate::features::stream_control::StreamControlPreferences>,
         purpose: crate::session::negotiation::ControlPurpose,
+        android_screen_share: bool,
     ) -> Result<ControlSessionInfo> {
         tracing::debug!(?profile, "starting control handshake");
         let decoder_support =
@@ -306,6 +307,7 @@ impl SignalSession {
             connect_type,
             preferences,
             purpose,
+            android_screen_share,
         )?;
         let app_control_id = frames.app_control_id;
         self.send_binary_packet(frames.header, frames.attachment)?;

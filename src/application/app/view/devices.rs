@@ -70,6 +70,17 @@ impl DeviceCenterApp {
                     .filter(|(_, d)| self.show_in_watching_list(d))
                     .map(|(_, d)| (d, 0)),
             );
+            // Some UU versions list Android only in the account groups roster.
+            // Keep a single row when the viewing roster already contains it.
+            if let Some(catalog) = &self.catalog {
+                for device in &catalog.groups.mobile_devices {
+                    if self.show_in_watching_list(device)
+                        && !devices.iter().any(|(listed, _)| listed.device_id == device.device_id)
+                    {
+                        devices.push((device, 1));
+                    }
+                }
+            }
         }
         Some(
             devices
@@ -455,6 +466,8 @@ fn row(
                 "已打开"
             } else if entry.takeover {
                 "接管"
+            } else if device.platform == 2 {
+                "查看屏幕"
             } else {
                 "连接"
             }),

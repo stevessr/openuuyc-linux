@@ -291,6 +291,11 @@ pub(super) async fn run_viewer_connection_owner(
             // this desktop. Keep it out of an actual local loopback session.
             session_control.mouse().set_host_input_allowed(
                 resolved.target_device_id != resolved.client.device_id());
+            // Android 屏幕共享只有画面、没有远程输入：从输入层拒绝进入控制，
+            // 鼠标、键盘和手柄走同一条路径。
+            session_control
+                .mouse()
+                .set_view_only(resolved.target_platform == 2);
             session_control.request_audio_only(resolved.profile.audio_only);
             let mut modes = session_control.audio_mode_requests();
             let mut audio_only = resolved.profile.audio_only;

@@ -918,21 +918,21 @@ impl DeviceCenterApp {
     fn is_viewing_target(&self, id: &str) -> bool {
         self.devices.as_ref().is_some_and(|list| {
             all_devices(list).any(|(_, d)| d.device_id == id && self.show_in_watching_list(d))
+        }) || self.catalog.as_ref().is_some_and(|catalog| {
+            catalog.groups.mobile_devices.iter().any(|device| {
+                device.device_id == id && self.show_in_watching_list(device)
+            })
         })
     }
 
     fn show_in_watching_list(&self, device: &DeviceInfo) -> bool {
-        matches!(device.platform, 1 | 4)
+        screen_viewing_platform(device.platform)
             && self
                 .devices
                 .as_ref()
                 .is_some_and(|list| list.current_device.device_id != device.device_id)
             && !self.catalog.as_ref().is_some_and(|c| {
-                c.groups
-                    .mobile_devices
-                    .iter()
-                    .chain(&c.groups.tv_devices)
-                    .any(|d| d.device_id == device.device_id)
+                c.groups.tv_devices.iter().any(|d| d.device_id == device.device_id)
             })
     }
 
@@ -1065,6 +1065,11 @@ impl DeviceCenterApp {
     }
 
     fn connection_issue(&self, device: &DeviceInfo) -> std::result::Result<(), String> {
+        if device.platform == 2 && device.participant_count() > 0
+            && self.viewer_for_device(&device.device_id).is_none()
+        {
+            return Err("手机正在共享中，请先在手机上结束当前共享".into());
+        }
         if self.devices.as_ref().is_some_and(|list| {
             crate::session::controller::has_gui_connection(
                 &list.current_device.device_id,
@@ -1080,7 +1085,7 @@ impl DeviceCenterApp {
     }
 
     fn needs_takeover(&self, device: &DeviceInfo) -> bool {
-        device.participant_count() > 0
+        device.platform != 2 && device.participant_count() > 0
             && !self.devices.as_ref().is_some_and(|list| {
                 crate::session::controller::has_gui_connection(
                     &list.current_device.device_id,
@@ -1317,12 +1322,17 @@ fn all_devices(devices: &DeviceList) -> impl Iterator<Item = (&'static str, &Dev
         .map(|device| ("我的设备", device))
 }
 
+fn screen_viewing_platform(platform: i32) -> bool {
+    matches!(platform, 1 | 2 | 4)
+}
+
 fn connectability_error(device: &DeviceInfo) -> std::result::Result<(), String> {
     if !device.is_connected() {
         return Err(format!("{} 当前离线", display_alias(device)));
     }
-    if !device.controlled_support || !device.controllable {
-        return Err(format!("{} 当前没有开放远程控制", display_alias(device)));
+    if !device.controllable || (device.platform != 2 && !device.controlled_support) {
+        return Err(format!("{} 当前没有开放{}", display_alias(device),
+            if device.platform == 2 { "屏幕共享" } else { "远程控制" }));
     }
     Ok(())
 }
@@ -1357,3 +1367,36 @@ fn qr_texture(ctx: &egui::Context, content: &str) -> Result<egui::TextureHandle>
 mod messages;
 mod runtime;
 mod viewing;
+
+#[cfg(test)]
+mod mobile_viewing_tests {
+    use super::*;
+
+    fn mobile(status: &str, allowed: bool) -> DeviceInfo {
+        serde_json::from_value(serde_json::json!({
+            "device_id": "abcdefghijklmnop", "platform": 2,
+            "status": status, "controllable": allowed,
+            "controlled_support": false
+        })).unwrap()
+    }
+
+    #[test]
+    fn android_sharing_does_not_require_desktop_control_support() {
+        assert!(screen_viewing_platform(2));
+        assert!(connectability_error(&mobile("CONNECTED", true)).is_ok());
+        assert!(connectability_error(&mobile("DISCONNECTED", true)).is_err());
+        assert!(connectability_error(&mobile("CONNECTED", false)).is_err());
+    }
+
+    #[test]
+    fn desktop_control_permission_and_unsupported_platforms_stay_restricted() {
+        let mut device = mobile("CONNECTED", true);
+        device.platform = 1;
+        assert!(connectability_error(&device).is_err());
+        device.controlled_support = true;
+        assert!(connectability_error(&device).is_ok());
+        for platform in [0, 3, 5, 99] {
+            assert!(!screen_viewing_platform(platform));
+        }
+    }
+}

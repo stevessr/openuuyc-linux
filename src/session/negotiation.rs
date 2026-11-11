@@ -48,6 +48,7 @@ pub(crate) fn build_control_frames(
     connect_type: ControlConnectType,
     preferences: Option<crate::features::stream_control::StreamControlPreferences>,
     purpose: ControlPurpose,
+    android_screen_share: bool,
 ) -> Result<ControlFrames> {
     build_control_frames_with_id(
         controller_device_id,
@@ -58,6 +59,7 @@ pub(crate) fn build_control_frames(
         connect_type,
         preferences,
         purpose,
+        android_screen_share,
     )
 }
 
@@ -70,6 +72,7 @@ fn build_control_frames_with_id(
     connect_type: ControlConnectType,
     preferences: Option<crate::features::stream_control::StreamControlPreferences>,
     purpose: ControlPurpose,
+    android_screen_share: bool,
 ) -> Result<ControlFrames> {
     if controller_device_id.len() != 16
         || !controller_device_id
@@ -87,10 +90,10 @@ fn build_control_frames_with_id(
         "control_id": app_control_id,
         "openuuyc_audio_only": purpose == ControlPurpose::Audio,
         "openuuyc_audio_control": 1,
-        "openuuyc_annotation": 1,
-        "openuuyc_display_geometry": 1,
-        "openuuyc_diagnostics": 1,
-        "openuuyc_drag_drop": 1,
+        "openuuyc_annotation": if android_screen_share { 0 } else { 1 },
+        "openuuyc_display_geometry": if android_screen_share { 0 } else { 1 },
+        "openuuyc_diagnostics": if android_screen_share { 0 } else { 1 },
+        "openuuyc_drag_drop": if android_screen_share { 0 } else { 1 },
         "device_capability": decoder_support
     }))?;
     let event = json!([
@@ -111,6 +114,7 @@ fn build_control_frames_with_id(
             connect_type,
             preferences,
             purpose,
+            android_screen_share,
         )?,
         app_control_id: app_control_id.to_owned(),
     })
@@ -123,6 +127,7 @@ fn encode_connect_options(
     connect_type: ControlConnectType,
     preferences: Option<crate::features::stream_control::StreamControlPreferences>,
     purpose: ControlPurpose,
+    android_screen_share: bool,
 ) -> Result<Vec<u8>> {
     let mut capture = Vec::new();
     let fps_level = match profile.stream_fps {
@@ -244,7 +249,7 @@ fn encode_connect_options(
     // Keep initial ConnectOptions and both ECHO directions identical. Feature
     // levels are not harmless placeholders: the host reads private_screen
     // during display initialization, before the later ECHO replacement.
-    let feature_flag = crate::features::stream_control::encode_read_only_feature_flags();
+    let feature_flag = crate::features::stream_control::encode_read_only_feature_flags(android_screen_share);
     push_bytes_field(&mut options, 11, &feature_flag);
     push_bytes_field(&mut options, 12, PROTOCOL_VERSION.as_bytes());
     Ok(options)

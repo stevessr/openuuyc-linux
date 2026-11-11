@@ -6,24 +6,31 @@ use anyhow::Result;
 use prost::Message as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) fn encode_pb_echo_request() -> Vec<u8> {
-    encode_pb_echo(ACTION_TYPE_ECHO_REQUEST, String::new(), 0, 0)
+pub(crate) fn encode_pb_echo_request(android_screen_share: bool) -> Vec<u8> {
+    encode_pb_echo(ACTION_TYPE_ECHO_REQUEST, String::new(), 0, 0, android_screen_share)
 }
 
-pub(crate) fn encode_read_only_feature_flags() -> Vec<u8> {
-    PbFeatureFlag::read_only_viewer().encode_to_vec()
+pub(crate) fn encode_read_only_feature_flags(android_screen_share: bool) -> Vec<u8> {
+    PbFeatureFlag::read_only_viewer(android_screen_share).encode_to_vec()
 }
 
-pub(super) fn encode_pb_echo_response(sequence: i64, timestamp: i64) -> Vec<u8> {
+pub(super) fn encode_pb_echo_response(sequence: i64, timestamp: i64, android_screen_share: bool) -> Vec<u8> {
     encode_pb_echo(
         ACTION_TYPE_ECHO_RESPONSE,
         format!("{{ \"seq\" : {sequence} }}"),
         sequence,
         timestamp,
+        android_screen_share,
     )
 }
 
-pub(super) fn encode_pb_echo(action: i32, args: String, seq: i64, timestamp: i64) -> Vec<u8> {
+pub(super) fn encode_pb_echo(
+    action: i32,
+    args: String,
+    seq: i64,
+    timestamp: i64,
+    android_screen_share: bool,
+) -> Vec<u8> {
     PbControlMessage {
         seq,
         timestamp,
@@ -31,7 +38,7 @@ pub(super) fn encode_pb_echo(action: i32, args: String, seq: i64, timestamp: i64
             action,
             args,
             params: Some(PbSimpleActionParams::FeatureFlag(
-                PbFeatureFlag::read_only_viewer(),
+                PbFeatureFlag::read_only_viewer(android_screen_share),
             )),
         })),
     }
@@ -243,19 +250,48 @@ pub(super) struct ClipboardPermission {
 }
 
 impl PbFeatureFlag {
-    pub(super) fn read_only_viewer() -> Self {
+    pub(super) fn read_only_viewer(android_screen_share: bool) -> Self {
         Self {
             capture_setting: crate::protocol::official_version::CAPTURE_SETTING_LEVEL as i32,
             simple_action: 0,
             system_metrics: 0,
             private_screen: 0,
             update_acquire: 0,
-            file_transfer_ftp: 2,
-            file_transfer_ftp2: 2,
-            clipboard: 3,
+            file_transfer_ftp: if android_screen_share { 0 } else { 2 },
+            file_transfer_ftp2: if android_screen_share { 0 } else { 2 },
+            clipboard: if android_screen_share { 0 } else { 3 },
             qos_stat: 1,
             mumu_control: 0,
             virtual_mouse_device: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod android_share_flags_tests {
+    use super::PbFeatureFlag;
+
+    #[test]
+    fn android_screen_share_omits_clipboard_and_file_transfer_capabilities() {
+        let flags = PbFeatureFlag::read_only_viewer(true);
+        assert_eq!(flags.capture_setting, crate::protocol::official_version::CAPTURE_SETTING_LEVEL as i32);
+        assert_eq!(flags.file_transfer_ftp, 0);
+        assert_eq!(flags.file_transfer_ftp2, 0);
+        assert_eq!(flags.clipboard, 0);
+        assert_eq!(flags.qos_stat, 1);
+        let desktop = PbFeatureFlag::read_only_viewer(false);
+        assert_eq!(desktop.file_transfer_ftp, 2);
+        assert_eq!(desktop.file_transfer_ftp2, 2);
+        assert_eq!(desktop.clipboard, 3);
+
+        use prost::Message as _;
+        for echo in [super::encode_pb_echo_request(true), super::encode_pb_echo_response(9, 10, true)] {
+        let decoded = super::PbControlMessage::decode(echo.as_slice()).unwrap();
+        let Some(super::PbPayload::SimpleAction(action)) = decoded.payload else { panic!("expected ECHO action") };
+        let Some(super::PbSimpleActionParams::FeatureFlag(echo_flags)) = action.params else { panic!("expected ECHO feature flags") };
+        assert_eq!(echo_flags.file_transfer_ftp, 0);
+        assert_eq!(echo_flags.file_transfer_ftp2, 0);
+        assert_eq!(echo_flags.clipboard, 0);
         }
     }
 }

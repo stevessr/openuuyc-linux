@@ -176,6 +176,17 @@ impl ResolvedConnection {
             } else {
                 false
             };
+            if self.target_platform == 2 {
+                anyhow::ensure!(!force_join, "Android screen sharing does not support takeover");
+                report_progress(reporter, 3, "等待手机同意共享", "正在向 Android UU Remote 发送屏幕共享请求");
+                // This method owns cancellation cleanup and sends cancel_request
+                // before returning; wrapping it in cancellable would drop it early.
+                self.client.approve_android_share(
+                    &self.target_device_id,
+                    cancel,
+                    |message| report_progress(reporter, 3, "等待手机同意共享", message),
+                ).await?;
+            }
             loop {
                 match cancellable(
                     cancel,
@@ -338,6 +349,7 @@ impl ResolvedConnection {
             } else {
                 crate::session::negotiation::ControlPurpose::Viewing
             },
+            self.target_platform == 2,
         )
         .await?;
         let handle = connection.stream_control_handle();
@@ -437,9 +449,19 @@ pub(super) async fn resolve_connection_with_client(
         "恢复账号会话",
         format!("正在初始化本机设备、核验保存的登录态，然后检查 {alias} 的在线与可观看状态"),
     );
-    let devices = client.list_devices().await?;
+    let mut devices = client.list_devices().await?;
     if let Some(id) = target_id {
         crate::account::api::validate_device_id(id)?;
+        // /device/list is the connectable-device roster but may omit Android
+        // mobiles. The official account groups endpoint includes mobile/tablet
+        // devices; merge only the explicitly selected target if absent.
+        if !devices.my_binded_devices.iter().any(|device| device.device_id == id) {
+            if let Some(device) = client.device_groups().await?.mobile_devices.into_iter()
+                .find(|device| device.device_id == id)
+            {
+                devices.my_binded_devices.push(device);
+            }
+        }
     }
     if target_id.map_or(devices.current_device.alias == alias, |id| {
         devices.current_device.device_id == id
@@ -462,14 +484,17 @@ pub(super) async fn resolve_connection_with_client(
     if let Some(reporter) = reporter {
         reporter(ConnectionProgress::background(background.clone()));
     }
-    if !matches!(device.platform, 1 | 4) {
-        bail!("this device type is for account management only");
+    if !matches!(device.platform, 1 | 2 | 4) {
+        bail!("this device type does not support screen viewing");
     }
     if !device.is_connected() {
         bail!("device `{alias}` is offline");
     }
-    if !device.controlled_support || !device.controllable {
-        bail!("device `{alias}` does not currently allow control");
+    if (device.platform != 2 && !device.controlled_support) || !device.controllable {
+        bail!("device `{alias}` does not currently allow control or viewing");
+    }
+    if device.platform == 2 && device.participant_count() != 0 {
+        bail!("Android screen sharing is already in use; end the current share first");
     }
     let _gate = shared::connection_gate(&shared::key(&client.device_id(), &device.device_id))
         .lock_owned()

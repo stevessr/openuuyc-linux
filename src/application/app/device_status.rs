@@ -94,8 +94,8 @@ fn resolve(
         State::Unknown
     } else if device.participant_count() > 0 {
         State::OtherDevice
-    } else if matches!(device.platform, 1 | 4)
-        && (!device.controllable || !device.controlled_support)
+    } else if screen_viewing_platform(device.platform)
+        && (!device.controllable || (device.platform != 2 && !device.controlled_support))
     {
         State::Restricted
     } else {

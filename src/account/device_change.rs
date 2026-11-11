@@ -178,7 +178,7 @@ impl DeviceChange {
             }
             if !known
                 && let Some(device) = self.bound_device()
-                && matches!(device.platform, 1 | 4)
+                && matches!(device.platform, 1 | 2 | 4)
             {
                 list.my_binded_devices.push(device);
             }

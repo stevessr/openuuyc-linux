@@ -73,6 +73,54 @@ pub struct LogoutOutcome {
     pub local_error: Option<String>,
 }
 
+fn parse_android_share_result(
+    push: &serde_json::Value,
+    target_id: &str,
+) -> Option<std::result::Result<(), &'static str>> {
+    if push.get("type").and_then(serde_json::Value::as_str) != Some("transport_rpc")
+        || push.pointer("/data/p").and_then(serde_json::Value::as_str)
+            != Some("android_control_result")
+        || push.pointer("/data/data/device_info/device_id")
+            .and_then(serde_json::Value::as_str) != Some(target_id)
+    {
+        return None;
+    }
+    match push.pointer("/data/data/action").and_then(serde_json::Value::as_str) {
+        Some("accept_control") => Some(Ok(())),
+        Some("reject_request") => Some(Err("The Android user rejected screen sharing")),
+        Some("switch_is_off") => Some(Err("Screen sharing is disabled on the Android device")),
+        Some("not_foreground") => Some(Err("Open UU Remote on the Android device and keep it in the foreground")),
+        Some("during_control") => Some(Err("The Android device is already controlling or sharing")),
+        Some("during_request") => Some(Err("The Android device is handling another share request")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod android_share_tests {
+    use super::parse_android_share_result;
+    use serde_json::json;
+
+    fn reply(target: &str, action: &str) -> serde_json::Value {
+        json!({"type":"transport_rpc","data":{"p":"android_control_result","data":{
+            "action":action,"device_info":{"device_id":target}
+        }}})
+    }
+
+    #[test]
+    fn approval_requires_matching_explicit_push_reply() {
+        let accepted = reply("0123456789abcdef", "accept_control");
+        assert_eq!(parse_android_share_result(&accepted, "0123456789abcdef"), Some(Ok(())));
+        assert_eq!(parse_android_share_result(&accepted, "fedcba9876543210"), None);
+        assert_eq!(parse_android_share_result(&json!({}), "0123456789abcdef"), None);
+        // HTTP request acceptance is transport success, not user approval.
+        assert_eq!(parse_android_share_result(&json!({"code":0}), "0123456789abcdef"), None);
+        assert_eq!(parse_android_share_result(&reply("0123456789abcdef", "future_action"), "0123456789abcdef"), None);
+        assert_eq!(parse_android_share_result(&reply("0123456789abcdef", "reject_request"), "0123456789abcdef"),
+            Some(Err("The Android user rejected screen sharing")));
+    }
+}
+
 impl AuthenticatedClient {
     pub fn from_saved_session() -> Result<Self> {
         let runtime = DeviceRuntime::start()?;
@@ -581,6 +629,77 @@ impl AuthenticatedClient {
                 action.label()
             ),
         }
+    }
+
+    /// Ask an Android device for one screen-share approval over the official account push room.
+    /// The device room is account-only: no media negotiation or input channel is started.
+    pub async fn approve_android_share(
+        &self,
+        target_id: &str,
+        cancel: &CancellationToken,
+        mut progress: impl FnMut(String),
+    ) -> Result<()> {
+        crate::account::api::validate_device_id(target_id)?;
+        let local_id = self.device_id();
+        let alias = "OpenUUYC Desktop".to_owned();
+        let room = self.request(|api| async move { api.create_room(0).await }).await?;
+        let room = room.validate().map(|_| room)?;
+        const PUSH_QUEUE_CAPACITY: usize = 32;
+        let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(PUSH_QUEUE_CAPACITY);
+        let push_target = target_id.to_owned();
+        let handler: crate::transport::signal::SignalPushHandler = std::sync::Arc::new(move |value| {
+            if parse_android_share_result(value, &push_target).is_none() { return; }
+            // Never block the signal worker. Only matching approval outcomes
+            // enter the bounded queue, so unrelated account pushes cannot starve it.
+            let _ = push_tx.try_send(value.clone());
+        });
+        let signal = crate::transport::signal::SignalSession::connect_observed(
+            room, crate::transport::signal::SignalRole::Host, cancel, Some(handler),
+        ).await?;
+        let send = |action: &'static str| {
+            let target_id = target_id.to_owned();
+            let local_id = local_id.clone();
+            let alias = alias.clone();
+            self.request_envelope(move |api| async move { api.android_control_rpc(&target_id, action, &local_id, &alias).await })
+        };
+        let sent = match send("request_control").await {
+            Ok(sent) => sent,
+            Err(error) => {
+                let _ = signal.close().await;
+                return Err(error);
+            }
+        };
+        if sent.code != 0 {
+            let _ = signal.close().await;
+            return Err(crate::account::api::ApiFailure { code: sent.code, message: sent.msg }.into());
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let result = loop {
+            progress("Waiting for Android share approval".to_owned());
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() { break Err(anyhow::anyhow!("Android screen share approval timed out after 60 seconds")); }
+            let push = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break Err(anyhow::anyhow!("Android share request cancelled")),
+                _ = self.ended.cancelled() => break Err(anyhow::anyhow!("account session ended")),
+                value = tokio::time::timeout(remaining, push_rx.recv()) => match value {
+                    Ok(Some(value)) => value,
+                    Ok(None) => break Err(anyhow::anyhow!("Android share approval push ended")),
+                    Err(_) => break Err(anyhow::anyhow!("Android screen share approval timed out after 60 seconds")),
+                }
+            };
+            match parse_android_share_result(&push, target_id) {
+                None => continue,
+                Some(Ok(())) => break Ok(()),
+                Some(Err(message)) => break Err(anyhow::anyhow!(message)),
+            }
+        };
+        if result.is_err() {
+            // The approval protocol has no request identifier; cancellation only stops this pending request.
+            let _ = send("cancel_request").await;
+        }
+        let closed = signal.close().await;
+        result.and(closed)
     }
 
     pub async fn join_device(&self, device_id: &str, force_join: bool) -> Result<RoomSession> {
