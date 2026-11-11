@@ -59,6 +59,7 @@ pub(crate) enum Event {
         x: i32,
         y: i32,
     },
+    /// Already committed Unicode text (including mobile native paste), not keys.
     Text(String),
     Combination {
         down: bool,

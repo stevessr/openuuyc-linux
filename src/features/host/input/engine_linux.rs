@@ -542,10 +542,8 @@ impl Engine {
             Some((left, top, width, height)) => Ok(super::geometry::Rect {
                 left,
                 top,
-                right: left
-                    + i32::try_from(width).map_err(|_| anyhow::anyhow!("窗口宽度无效"))?,
-                bottom: top
-                    + i32::try_from(height).map_err(|_| anyhow::anyhow!("窗口高度无效"))?,
+                right: left + i32::try_from(width).map_err(|_| anyhow::anyhow!("窗口宽度无效"))?,
+                bottom: top + i32::try_from(height).map_err(|_| anyhow::anyhow!("窗口高度无效"))?,
             }),
             None => rect,
         };
@@ -748,6 +746,54 @@ impl Engine {
         }
         Ok(())
     }
+    /// Text events contain characters already committed by the controller's IME,
+    /// or an explicit mobile paste. Never feed them through the host IME again.
+    fn paste_text(&mut self, text: &str, permitted: &impl Fn() -> bool) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let shortcut = self.injector.paste_shortcut();
+        crate::features::clipboard::publish_input_text(text, permitted)?;
+        // These may still be held by the Ctrl+V that requested text on the peer.
+        // Use the engine's ownership set: X11 cannot see Wayland's uinput state.
+        let held: Vec<_> = self
+            .keys
+            .iter()
+            .copied()
+            .filter(|key| matches!(*key, 0x10..=0x12 | 0x5b | 0x5c | 0xa0..=0xa5))
+            .collect();
+        // Re-pressing a held V after restoring Ctrl would paste a second time.
+        // Park it until the peer releases it, just like an interrupted key.
+        if self.keys.contains(&0x56) {
+            self.key(0x56, false)?;
+            self.parked.insert(0x56);
+        }
+        for &key in &held {
+            self.key(key, false)?;
+        }
+        let result = (|| {
+            self.chord(shortcut, permitted)?;
+            self.injector.flush()?;
+            // Paste is asynchronous in the target. Keep this selection stable
+            // before a subsequent text_input can replace it (including one-char
+            // phone IME commits). Do not restore peer modifiers during the paste.
+            let until = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < until {
+                ensure!(permitted(), "文字粘贴已撤销");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        })();
+        // Failed chords remain owned until release(), so no key is lost on error.
+        if result.is_ok() && permitted() {
+            for key in held {
+                ensure!(permitted(), "文字粘贴已撤销");
+                self.key(key, true)?;
+            }
+        }
+        result
+    }
+
     pub fn apply(
         &mut self,
         event: Event,
@@ -845,7 +891,7 @@ impl Engine {
                     self.wheel(horizontal, delta)?;
                 }
             }
-            Event::Text(text) => self.injector.text(&text, permitted)?,
+            Event::Text(text) => self.paste_text(&text, permitted)?,
             Event::Combination { down, keys } => {
                 for item in keys {
                     ensure!(permitted(), "组合输入已取消");
@@ -981,6 +1027,125 @@ fn compositor_bounds(
 mod tests {
     use super::*;
     use crate::platform::{CompositorLayout, CompositorOutput};
+
+    /// Runs against an isolated X server so no real desktop receives input.
+    #[test]
+    #[ignore = "run under xvfb-run with WAYLAND_DISPLAY and XDG_SESSION_TYPE unset"]
+    fn committed_text_pastes_whole_without_character_keys() {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::Event as XEvent;
+        use x11rb::protocol::xproto::{
+            ConnectionExt, CreateWindowAux, EventMask, InputFocus, WindowClass,
+        };
+        let (connection, screen) = x11rb::connect(None).unwrap();
+        let root = connection.setup().roots[screen].root;
+        let window = connection.generate_id().unwrap();
+        connection
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                root,
+                0,
+                0,
+                200,
+                100,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new().event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        connection.map_window(window).unwrap().check().unwrap();
+        let atom = |name: &[u8]| {
+            connection
+                .intern_atom(false, name)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .atom
+        };
+        let clipboard = atom(b"CLIPBOARD");
+        let utf8 = atom(b"UTF8_STRING");
+        let property = atom(b"UU_TEST_PASTE");
+        let mut engine = Engine::new(false, super::super::wire::Policy::Mobile, 0, false).unwrap();
+        engine.key(0xa2, true).unwrap();
+        engine.key(0xa0, true).unwrap();
+        engine.key(0x56, true).unwrap();
+        connection
+            .set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        let samples = vec![
+            "完整的中文输入，不能只剩最后一个字。".to_owned(),
+            (0x4e00..0x4f00)
+                .map(|c| char::from_u32(c).unwrap())
+                .collect::<String>()
+                + &"
+中文😀 abc	END
+"
+                .repeat(800),
+            "中".to_owned(),
+            "文".to_owned(),
+        ];
+        let count = samples.len();
+        let target = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while received.len() < count {
+                assert!(Instant::now() < deadline, "paste target timed out");
+                match connection.poll_for_event().unwrap() {
+                    Some(XEvent::KeyPress(event)) => {
+                        // No character keys other than the paste shortcut may arrive.
+                        assert!(
+                            matches!(event.detail, 29 | 37 | 50 | 55 | 62 | 105),
+                            "unexpected character key {}",
+                            event.detail
+                        );
+                        if event.detail == 55 {
+                            assert_ne!(u16::from(event.state) & 4, 0, "Ctrl is required");
+                            assert_eq!(u16::from(event.state) & 1, 0, "peer Shift leaked");
+                            connection
+                                .convert_selection(
+                                    window,
+                                    clipboard,
+                                    utf8,
+                                    property,
+                                    x11rb::CURRENT_TIME,
+                                )
+                                .unwrap()
+                                .check()
+                                .unwrap();
+                        }
+                    }
+                    Some(XEvent::SelectionNotify(event)) => {
+                        assert_ne!(
+                            event.property, 0,
+                            "clipboard was not published before paste"
+                        );
+                        let reply = connection
+                            .get_property(true, window, property, utf8, 0, u32::MAX)
+                            .unwrap()
+                            .reply()
+                            .unwrap();
+                        received.push(String::from_utf8(reply.value).unwrap());
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+            received
+        });
+        for sample in &samples {
+            engine.paste_text(sample, &|| true).unwrap();
+            assert!(engine.keys.contains(&0xa2));
+            assert!(engine.keys.contains(&0xa0));
+            assert!(!engine.keys.contains(&0x56));
+        }
+        engine.release().unwrap();
+        assert_eq!(target.join().unwrap(), samples);
+    }
 
     fn output(
         name: Option<&str>,

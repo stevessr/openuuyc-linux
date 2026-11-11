@@ -17,6 +17,8 @@ mod x11_offer;
 #[path = "x11_read_linux.rs"]
 mod x11_read;
 use anyhow::{Result, anyhow, bail, ensure};
+#[cfg(not(windows))]
+pub(crate) use native::publish_input_text;
 pub(crate) use native::{FileOffer, FileSummary};
 use prost::Message;
 use protocol::*;

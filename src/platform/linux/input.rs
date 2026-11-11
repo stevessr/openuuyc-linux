@@ -10,8 +10,8 @@
 //! In a Wayland session XTest only reaches XWayland clients, so there keys,
 //! buttons and motion go through a uinput device, as Sunshine does (it needs
 //! write access to `/dev/uinput`, granted by the udev rule the packages
-//! ship), and text through `zwp_virtual_keyboard_v1`. X11 still reads the key
-//! map, the pointer and the lock keys. Xorg sessions keep XTest alone, which
+//! ship). Committed text is pasted by the host input engine instead of being
+//! reinterpreted as keyboard input. X11 still reads the key map, pointer and lock keys.
 //! needs no setup and positions the pointer absolutely. An absolute position
 //! in a Wayland session goes to a second, absolute uinput pointer that the
 //! compositor resolves in its own layout (xdg-output); without that layout it
@@ -20,7 +20,7 @@ use crate::platform::Rotation;
 use anyhow::{Context, Result, bail, ensure};
 use std::time::Duration;
 use x11rb::connection::{Connection, RequestConnection as _};
-use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Keycode, Keysym, Window};
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Keycode, Window};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
@@ -29,9 +29,6 @@ const KEY_RELEASE: u8 = 3;
 const BUTTON_PRESS: u8 = 4;
 const BUTTON_RELEASE: u8 = 5;
 const MOTION_NOTIFY: u8 = 6;
-const NO_SYMBOL: Keysym = 0;
-/// The pause after each typed character.
-const TEXT_PACE: Duration = Duration::from_millis(3);
 
 /// Lock keys whose state a controller can ask to match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1088,198 +1085,6 @@ fn screen_rect_maps() -> Vec<(String, (i32, i32, i32, i32), (i32, i32, i32, i32)
     maps
 }
 
-/// 通过 `zwp_virtual_keyboard_v1` 输入文本。
-///
-/// 与 uinput 不同，这条协议允许客户端**自带 xkb keymap**，因此可以输入键位表
-/// 里不存在的字符（中文等）。Hyprland 暴露 `zwp_virtual_keyboard_manager_v1`。
-///
-/// 注意：XWayland 客户端使用的是 X 自己的键位表，虚拟键盘的自定义 keymap 对它
-/// 无效，那类窗口仍走 XTest。
-mod virtual_keyboard {
-    use anyhow::{Context, Result};
-    use std::os::fd::AsFd;
-    use std::time::Duration;
-    use wayland_client::globals::{GlobalList, registry_queue_init};
-    use wayland_client::protocol::{wl_registry, wl_seat};
-    use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
-    use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
-        zwp_virtual_keyboard_manager_v1 as manager, zwp_virtual_keyboard_v1 as keyboard,
-    };
-
-    struct State;
-
-    impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for State {
-        fn event(
-            _: &mut Self,
-            _: &wl_registry::WlRegistry,
-            _: wl_registry::Event,
-            _: &wayland_client::globals::GlobalListContents,
-            _: &Connection,
-            _: &QueueHandle<Self>,
-        ) {
-        }
-    }
-    wayland_client::delegate_noop!(State: ignore manager::ZwpVirtualKeyboardManagerV1);
-    wayland_client::delegate_noop!(State: ignore keyboard::ZwpVirtualKeyboardV1);
-    wayland_client::delegate_noop!(State: ignore wl_seat::WlSeat);
-
-    /// 发送给合成器的第一个键码。协议里传的是 **evdev 风格**键码，合成器
-    /// 与客户端都会 `+8` 得到 xkb keycode（Hyprland `Keyboard.cpp`：
-    /// `updateXkbStateWithKey(event.key + 8, ...)`），所以 keymap 里声明的
-    /// 键码必须是 `FIRST_CODE + KEYCODE_OFFSET`。与 wtype 一致取 1。
-    const FIRST_CODE: u8 = 1;
-    /// evdev 键码到 xkb keycode 的固定偏移。
-    const KEYCODE_OFFSET: u8 = 8;
-
-    pub(crate) struct Keyboard {
-        /// Held so the queue and the globals registry stay connected.
-        connection: Connection,
-        globals: GlobalList,
-        queue: EventQueue<State>,
-    }
-
-    /// 生成只包含所需字符的 keymap，返回 (字节, 覆盖的字符数)。
-    fn keymap_for(text: &str) -> (String, usize) {
-        let mut chars: Vec<char> = Vec::new();
-        for c in text.chars() {
-            if !chars.contains(&c) && chars.len() < 56 {
-                chars.push(c);
-            }
-        }
-        let mut out = String::from("xkb_keymap {\n  xkb_keycodes \"vk\" {\n");
-        out.push_str(&format!("    minimum = {};\n", FIRST_CODE + KEYCODE_OFFSET));
-        out.push_str(&format!(
-            "    maximum = {};\n",
-            FIRST_CODE as usize + KEYCODE_OFFSET as usize + chars.len().saturating_sub(1)
-        ));
-        for index in 0..chars.len() {
-            out.push_str(&format!(
-                "    <VK{index:02}> = {};\n",
-                FIRST_CODE as usize + KEYCODE_OFFSET as usize + index
-            ));
-        }
-        out.push_str("  };\n  xkb_types \"vk\" { include \"complete\" };\n");
-        out.push_str("  xkb_compat \"vk\" { include \"complete\" };\n");
-        out.push_str("  xkb_symbols \"vk\" {\n");
-        for (index, c) in chars.iter().enumerate() {
-            let point = *c as u32;
-            let sym = if point < 0x100 {
-                point
-            } else {
-                0x0100_0000 | point
-            };
-            out.push_str(&format!("    key <VK{index:02}> {{ [ 0x{sym:08x} ] }};\n"));
-        }
-        out.push_str("  };\n};\n");
-        (out, chars.len())
-    }
-
-    fn keymap_fd(bytes: &[u8]) -> Result<std::os::fd::OwnedFd> {
-        use std::os::fd::FromRawFd;
-        let name = c"openuuyc-vk";
-        let raw = unsafe { libc::memfd_create(name.as_ptr(), 0) };
-        anyhow::ensure!(raw >= 0, "创建 keymap 内存文件失败");
-        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
-        use std::io::Write as _;
-        file.write_all(bytes).context("写入 keymap 失败")?;
-        Ok(std::os::fd::OwnedFd::from(file))
-    }
-
-    impl Keyboard {
-        pub(crate) fn connect() -> Result<Self> {
-            let connection = Connection::connect_to_env().context("连接 Wayland 失败")?;
-            let (globals, queue): (GlobalList, EventQueue<State>) =
-                registry_queue_init(&connection).context("枚举 Wayland 全局对象失败")?;
-            // Bind once up front so a desktop without the protocol is reported
-            // at startup rather than on the first keystroke.
-            {
-                let qh = queue.handle();
-                let _manager: manager::ZwpVirtualKeyboardManagerV1 =
-                    globals
-                        .bind(&qh, 1..=1, ())
-                        .context("桌面没有提供 zwp_virtual_keyboard_manager_v1")?;
-                let _seat: wl_seat::WlSeat =
-                    globals.bind(&qh, 1..=8, ()).context("没有 Wayland seat")?;
-            }
-            queue.flush().context("提交虚拟键盘请求失败")?;
-            Ok(Self {
-                connection,
-                globals,
-                queue,
-            })
-        }
-
-        /// 输入一段文本：新建一个虚拟键盘对象，上传含这些字符的 keymap，
-        /// 逐个按键，最后销毁该对象。
-        ///
-        /// **每次调用都必须新建对象。** Hyprland 只在对象第一次收到 keymap
-        /// 时建立键位映射，之后在同一对象上重新上传 keymap 不会生效；手机输入
-        /// 法逐字符发送（每次 `chars=1`），复用对象会让每个字符都按第一个字符
-        /// 的键位输入（输入 `XYZ` 得到 `XXX`）。wtype 同样每次新建对象。
-        pub(crate) fn text(&mut self, text: &str, permitted: &dyn Fn() -> bool) -> Result<()> {
-            let (keymap, bound) = keymap_for(text);
-            if bound == 0 {
-                return Ok(());
-            }
-            let qh = self.queue.handle();
-            let manager: manager::ZwpVirtualKeyboardManagerV1 =
-                self.globals
-                    .bind(&qh, 1..=1, ())
-                    .context("桌面没有提供 zwp_virtual_keyboard_manager_v1")?;
-            let seat: wl_seat::WlSeat = self
-                .globals
-                .bind(&qh, 1..=8, ())
-                .context("没有 Wayland seat")?;
-            let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
-            // keymap 必须在上报按键之前上传，且要等合成器处理完
-            // （否则合成器会报 NO_KEYMAP）。xkbcommon 的
-            // xkb_keymap_new_from_string 要求 NUL 结尾，长度也要算上。
-            let mut bytes = keymap.into_bytes();
-            bytes.push(0);
-            let fd = keymap_fd(&bytes)?;
-            keyboard.keymap(1, fd.as_fd(), bytes.len() as u32);
-            self.queue
-                .roundtrip(&mut State)
-                .context("等待虚拟键盘 keymap 生效失败")?;
-            // 清掉可能残留的修饰键状态。
-            keyboard.modifiers(0, 0, 0, 0);
-            let _ = self.queue.roundtrip(&mut State);
-
-            let mut index = 0u8;
-            let mut seen: Vec<char> = Vec::new();
-            for c in text.chars() {
-                if !permitted() {
-                    break;
-                }
-                let position = match seen.iter().position(|seen| *seen == c) {
-                    Some(found) => found as u8,
-                    None => {
-                        if seen.len() >= 56 {
-                            continue;
-                        }
-                        seen.push(c);
-                        let assigned = index;
-                        index += 1;
-                        assigned
-                    }
-                };
-                // 发送 evdev 风格键码；合成器与客户端会各自 +8 查 keymap。
-                let code = u32::from(FIRST_CODE + position);
-                keyboard.key(0, code, 1);
-                let _ = self.queue.roundtrip(&mut State);
-                keyboard.key(0, code, 0);
-                let _ = self.queue.roundtrip(&mut State);
-                // 输入法（IBus）会丢过快的按键。
-                std::thread::sleep(Duration::from_millis(4));
-            }
-            keyboard.destroy();
-            let _ = self.queue.roundtrip(&mut State);
-            let _ = &self.connection;
-            Ok(())
-        }
-    }
-}
-
 /// 绝对指针覆盖的区域：合成器全局布局的外接矩形，左上角加尺寸。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Desktop {
@@ -1482,8 +1287,6 @@ pub(crate) struct Injector {
     touchscreen_output: Option<String>,
     /// X11 矩形 → Hyprland 逻辑矩形的映射（按显示器名对齐）。
     screen_maps: Vec<(String, (i32, i32, i32, i32), (i32, i32, i32, i32))>,
-    /// 原生 Wayland 客户端的文字输入（可携带自定义 keymap）。
-    virtual_keyboard: Option<virtual_keyboard::Keyboard>,
 }
 
 impl Injector {
@@ -1579,20 +1382,6 @@ impl Injector {
         } else {
             Vec::new()
         };
-        let virtual_keyboard = if wayland {
-            match virtual_keyboard::Keyboard::connect() {
-                Ok(keyboard) => {
-                    tracing::info!("启用 zwp_virtual_keyboard 文字输入（支持任意 Unicode）");
-                    Some(keyboard)
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "虚拟键盘不可用，文字输入将回退 XTest");
-                    None
-                }
-            }
-        } else {
-            None
-        };
         Ok(Self {
             connection,
             root,
@@ -1604,7 +1393,6 @@ impl Injector {
             touchscreens_by_output,
             touchscreen_output: None,
             screen_maps,
-            virtual_keyboard,
         })
     }
 
@@ -1702,17 +1490,6 @@ impl Injector {
         if let Some(absolute) = &mut self.absolute {
             absolute.repeat = None;
         }
-    }
-
-    /// 当前焦点窗口是否跑在 XWayland 里。
-    fn foreground_is_xwayland(&self) -> bool {
-        let Some(reply) = hyprland_request("j/activewindow") else {
-            return false;
-        };
-        serde_json::from_str::<serde_json::Value>(&reply)
-            .ok()
-            .and_then(|value| value.get("xwayland").and_then(|v| v.as_bool()))
-            .unwrap_or(false)
     }
 
     /// 把程序给出的 X11 全局坐标换算到 Hyprland 的逻辑布局坐标。
@@ -1843,185 +1620,30 @@ impl Injector {
         Ok((reply.root_x.into(), reply.root_y.into()))
     }
 
-    /// Type text independently of the key layout, the way Windows' Unicode
-    /// keyboard input does: each character's keysym is found in the current
-    /// map, or bound for the moment to a spare keycode.
-    ///
-    /// Unicode input on Windows ignores the keys being held, so modifiers the
-    /// controller still holds (the Ctrl of the Ctrl+V that asked for a paste)
-    /// are released while typing and pressed again afterwards, and Caps Lock
-    /// does not change the case of a letter. A Windows line break (CR LF)
-    /// is one Enter.
-    pub fn text(&mut self, text: &str, permitted: impl Fn() -> bool) -> Result<()> {
-        // 原生 Wayland 客户端走虚拟键盘（XTest 到不了它们）；
-        // XWayland 客户端用 X 自己的键位表，自带 keymap 的虚拟键盘对它无效，
-        // 因此仍然走 XTest。焦点不在 Hyprland 的窗口上时按原生处理。
-        let xwayland = self.foreground_is_xwayland();
-        tracing::info!(
-            chars = text.chars().count(),
-            xwayland,
-            virtual_keyboard = self.virtual_keyboard.is_some(),
-            "文字输入"
-        );
-        // 输入法门户（Fcitx5 等）把整段文字交给当前聚焦的输入框：没有剪贴板、
-        // 不发按键，也不能被组合键打断。桌面有输入法在跑时它是最可靠的通路。
-        if permitted() {
-            match crate::platform::linux::fcitx::Context::open().and_then(|context| {
-                let result = context.commit(text);
-                let _ = context.destroy();
-                result
-            }) {
-                Ok(()) => {
-                    tracing::info!("文字输入：输入法门户提交完成");
-                    return Ok(());
-                }
-                Err(error) => {
-                    tracing::debug!(error = %format!("{error:#}"), "输入法门户不可用，尝试下一条路径");
-                }
-            }
-        }
-        if let Some(keyboard) = &mut self.virtual_keyboard
-            && !xwayland
-        {
-            match keyboard.text(text, &permitted) {
-                Ok(()) => {
-                    tracing::info!("文字输入：虚拟键盘路径完成");
-                    return Ok(());
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "虚拟键盘输入失败，回退 XTest");
-                }
-            }
-        } else {
-            tracing::info!("文字输入：使用 XTest 路径");
-        }
-        let count = self.max_keycode - self.min_keycode + 1;
-        let map = self
-            .connection
-            .get_keyboard_mapping(self.min_keycode, count)?
-            .reply()?;
-        let per = usize::from(map.keysyms_per_keycode);
-        ensure!(per > 0, "键盘映射无效");
-        let find = |sym: Keysym| -> Option<(Keycode, bool)> {
-            map.keysyms.chunks(per).enumerate().find_map(|(i, syms)| {
-                let code = self.min_keycode + i as u8;
-                if syms.first() == Some(&sym) {
-                    Some((code, false))
-                } else if syms.get(1) == Some(&sym) {
-                    Some((code, true))
-                } else {
-                    None
-                }
+    /// Terminals use Ctrl+Shift+V to request CLIPBOARD (Ctrl+V is terminal input).
+    pub fn paste_shortcut(&self) -> &'static [u16] {
+        let application = if std::env::var_os("NIRI_SOCKET").is_some() {
+            super::window_control::list().ok().and_then(|windows| {
+                windows
+                    .into_iter()
+                    .find(|window| window.focused)
+                    .map(|window| window.application)
             })
-        };
-        let spare = map
-            .keysyms
-            .chunks(per)
-            .rposition(|syms| syms.iter().all(|s| *s == NO_SYMBOL))
-            .map(|i| self.min_keycode + i as u8);
-        let shift = evdev(0xa0)
-            .map(|code| (code + 8) as u8)
-            .context("缺少 Shift 键")?;
-        let caps = self.toggled(Lock::Caps).unwrap_or(false);
-        let held = self.held_modifiers()?;
-        for code in &held {
-            self.fake(KEY_RELEASE, *code, 0, 0)?;
+        } else {
+            hyprland_request("j/activewindow").and_then(|reply| {
+                let value: serde_json::Value = serde_json::from_str(&reply).ok()?;
+                value
+                    .get("class")
+                    .and_then(|class| class.as_str())
+                    .map(str::to_owned)
+            })
         }
-        // Caps Lock changes the case of letters, including those bound to the
-        // spare keycode, so it is off while typing.
-        if caps {
-            self.tap(0x14)?;
-        }
-        let mut bound = false;
-        let result = (|| -> Result<()> {
-            let mut previous = None;
-            for c in text.chars() {
-                ensure!(permitted(), "文字输入已取消");
-                let after_cr = previous == Some('\r');
-                previous = Some(c);
-                if c == '\n' && after_cr {
-                    continue;
-                }
-                let sym = keysym(c);
-                let (code, shifted) = match find(sym) {
-                    Some(found) => found,
-                    None => {
-                        let spare = spare.context("没有空闲键码可用于输入该字符")?;
-                        let syms = vec![sym; per];
-                        self.connection
-                            .change_keyboard_mapping(1, spare, per as u8, &syms)?
-                            .check()?;
-                        bound = true;
-                        // Clients refresh their keymap on MappingNotify; give
-                        // the focused one a moment before the key arrives.
-                        self.connection.get_input_focus()?.reply()?;
-                        std::thread::sleep(Duration::from_millis(12));
-                        (spare, false)
-                    }
-                };
-                if shifted {
-                    self.fake(KEY_PRESS, shift, 0, 0)?;
-                }
-                let typed = self
-                    .fake(KEY_PRESS, code, 0, 0)
-                    .and_then(|()| self.fake(KEY_RELEASE, code, 0, 0));
-                if shifted {
-                    self.fake(KEY_RELEASE, shift, 0, 0)?;
-                }
-                typed?;
-                // Input methods (IBus) pass each key through another process
-                // and drop keys that arrive faster than they are handled.
-                std::thread::sleep(if bound {
-                    Duration::from_millis(12)
-                } else {
-                    TEXT_PACE
-                });
-            }
-            Ok(())
-        })();
-        if bound && let Some(spare) = spare {
-            let empty = vec![NO_SYMBOL; per];
-            let _ = self
-                .connection
-                .change_keyboard_mapping(1, spare, per as u8, &empty);
-            let _ = self.connection.flush();
-        }
-        if caps {
-            let _ = self.tap(0x14);
-        }
-        for code in &held {
-            let _ = self.fake(KEY_PRESS, *code, 0, 0);
-        }
-        result
-    }
-
-    /// Press and release a key by Windows virtual-key code.
-    fn tap(&self, key: u16) -> Result<()> {
-        self.key(key, true)?;
-        self.key(key, false)
-    }
-
-    /// Modifier keys other than the lock keys that are down right now.
-    fn held_modifiers(&self) -> Result<Vec<Keycode>> {
-        let mapping = self.connection.get_modifier_mapping()?.reply()?;
-        let keys = self.connection.query_keymap()?.reply()?.keys;
-        let per = usize::from(mapping.keycodes_per_modifier()).max(1);
-        let mut held = Vec::new();
-        for (index, codes) in mapping.keycodes.chunks(per).enumerate() {
-            // Lock (index 1) is a toggle: pressing it again would flip it.
-            if index == 1 {
-                continue;
-            }
-            for &code in codes {
-                if code != 0
-                    && keys[usize::from(code / 8)] & (1 << (code % 8)) != 0
-                    && !held.contains(&code)
-                {
-                    held.push(code);
-                }
-            }
-        }
-        Ok(held)
+        .or_else(|| {
+            let pid = self.foreground()?;
+            let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+            Some(executable.file_name()?.to_string_lossy().into_owned())
+        });
+        paste_shortcut_for(application.as_deref().unwrap_or(""))
     }
 
     /// The process that owns the active window, as the window manager reports.
@@ -2068,6 +1690,39 @@ impl Injector {
     }
 }
 
+fn paste_shortcut_for(application: &str) -> &'static [u16] {
+    let application = application.to_ascii_lowercase();
+    let name = application.rsplit('.').next().unwrap_or(&application);
+    if matches!(
+        name,
+        "kitty"
+            | "alacritty"
+            | "foot"
+            | "footclient"
+            | "konsole"
+            | "gnome-terminal"
+            | "gnome-terminal-server"
+            | "terminal"
+            | "xfce4-terminal"
+            | "mate-terminal"
+            | "tilix"
+            | "terminator"
+            | "terminology"
+            | "wezterm"
+            | "wezterm-gui"
+            | "ghostty"
+            | "cosmic-term"
+            | "kgx"
+            | "ptyxis"
+            | "xterm"
+            | "uxterm"
+    ) {
+        &[0x11, 0x10, 0x56]
+    } else {
+        &[0x11, 0x56]
+    }
+}
+
 /// Lock the session through logind, as Win+L does on Windows.
 ///
 /// A program the desktop starts runs in the user manager, outside any logind
@@ -2106,18 +1761,6 @@ pub(crate) fn system_monitor() -> Result<()> {
         }
     }
     bail!("没有找到系统监视器程序")
-}
-
-fn keysym(c: char) -> Keysym {
-    match c {
-        '\n' | '\r' => 0xff0d,
-        '\t' => 0xff09,
-        '\u{8}' => 0xff08,
-        // Latin-1 keysyms equal their code points; everything else uses the
-        // Unicode keysym range.
-        ' '..='~' | '\u{a0}'..='\u{ff}' => c as u32,
-        _ => 0x0100_0000 | c as u32,
-    }
 }
 
 /// Windows virtual-key code to evdev key code, by physical position (US
@@ -2252,6 +1895,22 @@ mod tests {
     use super::evdev;
 
     #[test]
+    fn paste_uses_clipboard_shortcuts_in_editors_and_terminals() {
+        for application in [
+            "kitty",
+            "Alacritty",
+            "org.gnome.Terminal",
+            "org.wezfurlong.wezterm",
+            "foot",
+        ] {
+            assert_eq!(super::paste_shortcut_for(application), &[0x11, 0x10, 0x56]);
+        }
+        for application in ["firefox", "org.kde.kate", "", "code"] {
+            assert_eq!(super::paste_shortcut_for(application), &[0x11, 0x56]);
+        }
+    }
+
+    #[test]
     fn letters_and_digits_follow_the_us_rows() {
         assert_eq!(evdev(b'Q'.into()), Some(16));
         assert_eq!(evdev(b'A'.into()), Some(30));
@@ -2358,17 +2017,6 @@ mod session_tests {
         println!("foreground pid: {:?}", injector.foreground());
         injector.move_to(before.0, before.1).unwrap();
         injector.flush().unwrap();
-    }
-
-    /// Types OPENUUYC_TYPE_TEXT into whatever has focus on DISPLAY.
-    #[test]
-    #[ignore = "types into the focused window of an X display"]
-    fn types_text() {
-        let text = std::env::var("OPENUUYC_TYPE_TEXT").unwrap();
-        super::Injector::open()
-            .unwrap()
-            .text(&text, || true)
-            .unwrap();
     }
 
     /// 需要真实会话和可写的 `/dev/uinput`：`cargo test -- --ignored`。

@@ -44,6 +44,7 @@ pub(super) enum Command {
     ),
     Request(Weak<Inner>, u64, i64, ClipboardRequestKind),
     Text(Weak<Inner>, u64, i64, String),
+    InputText(String, Arc<AtomicBool>, SyncSender<Result<(), String>>),
     PublishFiles(
         Weak<Inner>,
         u64,
@@ -759,6 +760,67 @@ pub(super) fn post(command: Command) -> Result<()> {
         .map_err(|_| anyhow!("剪贴板队列已满或已关闭"))
 }
 
+/// Publish text for input using input permission, independently of clipboard sync.
+/// The worker keeps ownership alive and acknowledges only after publication.
+pub(crate) fn publish_input_text(text: &str, permitted: impl Fn() -> bool) -> Result<()> {
+    publish_input_text_with(text, permitted, Duration::from_secs(2), post)
+}
+
+struct CancelInputText(Arc<AtomicBool>);
+
+impl Drop for CancelInputText {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+fn publish_input_text_with(
+    text: &str,
+    permitted: impl Fn() -> bool,
+    timeout: Duration,
+    submit: impl FnOnce(Command) -> Result<()>,
+) -> Result<()> {
+    ensure!(permitted(), "文本输入权限已撤销");
+    let deadline = Instant::now() + timeout;
+    let cancelled = CancelInputText(Arc::new(AtomicBool::new(false)));
+    let (reply, receiver) = sync_channel(1);
+    let command = Command::InputText(text.to_owned(), cancelled.0.clone(), reply);
+    ensure!(permitted(), "文本输入权限已撤销");
+    submit(command)?;
+    loop {
+        ensure!(permitted(), "文本输入权限已撤销");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "发布输入文本超时");
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(result) => {
+                ensure!(permitted(), "文本输入权限已撤销");
+                ensure!(Instant::now() < deadline, "发布输入文本超时");
+                return result.map_err(anyhow::Error::msg);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("输入文本发布线程已结束");
+            }
+        }
+    }
+}
+
+/// Check on the worker immediately before writing, so abandoned queued commands
+/// cannot overwrite a later local copy. An already running native write finishes
+/// on this worker; the caller must still recheck permission after its reply.
+fn complete_input_text(
+    cancelled: &AtomicBool,
+    reply: SyncSender<Result<(), String>>,
+    write: impl FnOnce() -> Result<()>,
+) {
+    let result = if cancelled.load(Ordering::Acquire) {
+        Err("文本输入已取消".to_owned())
+    } else {
+        write().map_err(|error| format!("{error:#}"))
+    };
+    let _ = reply.send(result);
+}
+
 /// The Windows adapter pumps its STA here. This worker is a plain thread, so
 /// callers waiting on a response simply keep waiting on their condvar.
 pub(super) fn pump() {}
@@ -976,6 +1038,9 @@ fn process(state: &mut State, command: Command) {
                 tracing::warn!(error = format!("{error:#}"), "接受远端剪贴板失败");
                 session.fail(error.to_string());
             }
+        }
+        Command::InputText(text, cancelled, reply) => {
+            complete_input_text(&cancelled, reply, || write_text(state, &text));
         }
         Command::Text(weak, epoch, id, text) => {
             if let Some(session) = weak.upgrade().filter(|session| session.valid(epoch)) {
@@ -2037,6 +2102,150 @@ pub(super) fn rgba_to_dib(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_text_denied_before_submission() {
+        assert!(
+            publish_input_text_with(
+                "secret",
+                || false,
+                Duration::from_secs(1),
+                |_| { panic!("denied text must not be queued") }
+            )
+            .is_err()
+        );
+    }
+
+    fn assert_input_text_cancelled(command: Command) {
+        let Command::InputText(_, cancelled, reply) = command else {
+            panic!("expected input text");
+        };
+        assert!(cancelled.load(Ordering::Acquire));
+        complete_input_text(&cancelled, reply, || {
+            panic!("cancelled queued text must not be written")
+        });
+    }
+
+    #[test]
+    fn input_text_timeout_prevents_late_queued_write() {
+        let queued = std::cell::RefCell::new(None);
+        let result = publish_input_text_with(
+            "late",
+            || true,
+            Duration::from_millis(1),
+            |command| {
+                *queued.borrow_mut() = Some(command);
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("超时"));
+        assert_input_text_cancelled(queued.into_inner().unwrap());
+    }
+
+    #[test]
+    fn input_text_revocation_while_waiting_prevents_late_write() {
+        let queued = std::cell::RefCell::new(None);
+        let checks = std::cell::Cell::new(0);
+        let result = publish_input_text_with(
+            "late",
+            || {
+                let check = checks.get();
+                checks.set(check + 1);
+                check < 3 // Revoke after the first receive timeout.
+            },
+            Duration::from_secs(1),
+            |command| {
+                *queued.borrow_mut() = Some(command);
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("权限"));
+        assert_input_text_cancelled(queued.into_inner().unwrap());
+    }
+
+    #[test]
+    fn input_text_checks_permission_after_acknowledgement() {
+        let checks = std::cell::Cell::new(0);
+        let result = publish_input_text_with(
+            "text",
+            || {
+                let check = checks.get();
+                checks.set(check + 1);
+                check < 3 // Initial check, before submission, before waiting.
+            },
+            Duration::from_secs(1),
+            |command| {
+                let Command::InputText(_, cancelled, reply) = command else {
+                    unreachable!()
+                };
+                complete_input_text(&cancelled, reply, || Ok(()));
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("权限"));
+        assert_eq!(checks.get(), 4);
+    }
+
+    #[test]
+    fn input_text_unwind_cancels_queued_write() {
+        let queued = std::cell::RefCell::new(None);
+        let checks = std::cell::Cell::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            publish_input_text_with(
+                "late",
+                || {
+                    let check = checks.get();
+                    checks.set(check + 1);
+                    assert!(check < 2, "permission callback panicked after submission");
+                    true
+                },
+                Duration::from_secs(1),
+                |command| {
+                    *queued.borrow_mut() = Some(command);
+                    Ok(())
+                },
+            )
+        }));
+        assert!(result.is_err());
+        assert_input_text_cancelled(queued.into_inner().unwrap());
+    }
+
+    #[test]
+    fn input_text_acknowledges_completed_write_and_propagates_errors() {
+        for succeeds in [true, false] {
+            let written = std::cell::Cell::new(false);
+            let result = publish_input_text_with(
+                "text",
+                || true,
+                Duration::from_secs(1),
+                |command| {
+                    let Command::InputText(text, cancelled, reply) = command else {
+                        unreachable!()
+                    };
+                    assert_eq!(text, "text");
+                    complete_input_text(&cancelled, reply, || {
+                        written.set(true);
+                        if succeeds {
+                            Ok(())
+                        } else {
+                            bail!("native write failed")
+                        }
+                    });
+                    Ok(())
+                },
+            );
+            assert!(written.get());
+            assert_eq!(result.is_ok(), succeeds);
+            if !succeeds {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("native write failed")
+                );
+            }
+        }
+    }
 
     fn local_text(text: &str) -> LocalSnapshot {
         LocalSnapshot {

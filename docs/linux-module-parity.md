@@ -13,7 +13,7 @@ UUWay 是 Wine 桥接被控端；本项目保留原生 Rust 架构，不直接�
 | 音频 | media/audio、linux/loopback | 同采样率减拷贝；录放设备切换、断线恢复 |
 | 虚拟麦克风 | linux/virtual_audio | 当前明确不支持，需实现 PipeWire source 与生命周期 |
 | 键鼠/触摸 | linux/input、features/remote_input | 权限拒绝、焦点、断开释放按键、多点触摸 |
-| 中文输入 | linux/input | 已接 Fcitx5 门户，连接复用并在断开后重建；每条文本用独立短时上下文，缺真实桌面提交验收 |
+| 中文输入 | host/input、features/clipboard | 已提交文本整段粘贴，键盘事件仍经过本机输入法；需验证原生 Wayland 与 XWayland 实际应用 |
 | 光标 | linux/cursor_shape、features/remote_cursor | 形状、热点、缩放、多屏边界 |
 | 剪贴板 | features/clipboard | 双向文本、循环抑制、Wayland 权限 |
 | 文件传输 | features/file_transfer、linux/transfer | 双向目录、取消、冲突、路径安全 |
@@ -46,26 +46,35 @@ Linux 被控端通过已认证的 `OPENUUYC_QUICK_APPS_V1` 扩展列出与启动
 
 ```bash
 cargo +1.95.0 test --lib features::host::quick_apps --offline -- --include-ignored --nocapture
-cargo +1.95.0 test --lib platform::linux::fcitx --offline
 ```
 
 2026-10-30 本机验证：应用专项 10 项通过（包含两个显式启用的本机测试），
 发现 133 个应用入口；GIO 临时 touch 入口创建文件成功，缺失程序入口正确返回失败。
 PTY 专项 10 项通过，连续 5 轮复测通过。尚未验证跨设备应用列表展示和真实窗口激活。
 
-### 输入法门户文字提交
+### 已提交文字与原生粘贴
 
-Linux 被控端的手机输入法文字（`Event::Text`）先经
-`org.freedesktop.portal.Fcitx`（fcitx5 / 深度输入法等实现）的门户通路。进程复用
-session D-Bus 连接，连接关闭后下次调用重建；每条文字都建立独立上下文，按
-`CreateInputContext` → `SetCapability(0)` → `FocusIn` → `CommitString` → `DestroyIC`
-提交。零能力位表示本客户端不提供预编辑、键盘事件或周边文本。落点由输入法决定：
-当前聚焦的输入框。这条通路不触碰剪贴板、不发合成按键、也不写日志；门户不可用时
-按序回退 `zwp_virtual_keyboard`（Wayland 原生窗口）与 XTest（XWayland / Xorg）。
+Linux 被控端将 `text_input`（`Event::Text`）视为控制端已提交的 Unicode 文本，
+包括手机输入法确认的中文和原生粘贴。整段文本由剪贴板工作线程发布，确认取得所有权后
+发送一次粘贴快捷键；不再逐字改写 X11 键位表、创建虚拟键盘或调用 Fcitx 上下文。
+物理键盘事件仍按键位注入，因此继续使用 Linux 本机的键盘布局与输入法。
 
-2026-10-30 本机验证：fcitx5 5.1.23 上门户生命周期及 `SetCapability(0)` 应答正常；
-Rust 单元测试覆盖缓存复用/失效与零文本拒绝（共 3 项）。尚未在真实远程会话中验证
-文字落入目标输入框、与合成类输入法（如 rime）的候选状态交互，及 KDE/GNOME 其他实现。
+默认快捷键为 Ctrl+V；能识别的终端使用 Ctrl+Shift+V，让终端按原生粘贴处理多行文本。
+此操作会更新本机剪贴板，只检查输入许可，不依赖自动剪贴板同步开关；应用需支持对应
+快捷键。通过既有工作线程保留 Wayland / X11 选择区所有权及循环抑制，取消或超时的
+排队写入会作废。每次粘贴后保留 100 ms 给目标应用读取选择区，再处理下一条输入。
+
+专项测试（最后一条使用隔离 X11 显示，不向当前桌面输入）：
+
+```bash
+cargo test --lib features::host::input
+cargo test --lib input_text_
+cargo test --lib paste_uses_clipboard_shortcuts
+xvfb-run -a env -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE -u NIRI_SOCKET -u HYPRLAND_INSTANCE_SIGNATURE cargo test --lib committed_text_pastes_whole_without_character_keys -- --ignored
+```
+
+仍需真实手机到 Linux 的原生 Wayland / XWayland 应用验收，尤其是自定义粘贴快捷键、
+输入法候选尚未确认及目标应用繁忙超过选择区保留时间的情况。
 
 ## MR 双向控制入口
 
