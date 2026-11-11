@@ -290,7 +290,10 @@ impl Terminal {
                 if !active && !pending {
                     open = ui.button("打开远端 Shell").clicked();
                 }
-                egui::ScrollArea::both().max_height(500.).show(ui, |ui| {
+                egui::ScrollArea::both()
+                    .max_height(500.)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
                     ui.add(
                         egui::Label::new(egui::RichText::new(contents).monospace())
                             .selectable(true),
