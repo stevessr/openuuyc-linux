@@ -8,7 +8,7 @@ use super::geometry::{Geometry, Rect, Screen};
 use super::wire::{Event, KeyOrButton};
 use crate::platform::linux::input::{self as native, Injector, Lock};
 use crate::platform::{CompositorLayout, Rotation};
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use std::{
     collections::BTreeSet,
     time::{Duration, Instant},
@@ -537,8 +537,13 @@ impl Engine {
         }
         self.aimed = false;
         // 窗口级源（waypipe 风格）不在合成器布局里，且目录矩形可能落后于
-        // 窗口的实际位置；注入前按采集循环缓存的实时几何换算。
-        let rect = match crate::platform::capture::window_rect(id) {
+        // 窗口的实际位置；注入前按采集循环缓存的实时几何换算。定位不到
+        // （Wayland 上窗口不在可见工作区）明确报错，不把点击投到过期位置。
+        let live = crate::platform::capture::window_rect(id);
+        if live.is_none() && crate::platform::capture::is_window_target(id) {
+            bail!("窗口位置未知（可能不在可见工作区），无法注入输入");
+        }
+        let rect = match live {
             Some((left, top, width, height)) => Ok(super::geometry::Rect {
                 left,
                 top,
