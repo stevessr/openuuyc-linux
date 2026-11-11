@@ -220,7 +220,7 @@ impl SliceParameterBufferVP9 {
     }
 }
 
-pub struct CodedBufferVP9Status(Box<bindings::VACodedBufferVP9Status>);
+pub struct CodedBufferVP9Status(#[allow(dead_code)] Box<bindings::VACodedBufferVP9Status>);
 
 impl CodedBufferVP9Status {
     pub fn new(
