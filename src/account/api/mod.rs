@@ -37,6 +37,7 @@ enum IdentityScope {
 
 type HmacSha256 = Hmac<Sha256>;
 mod assist;
+mod android_share;
 pub(crate) mod guest;
 mod host_assist;
 mod power;
@@ -577,7 +578,14 @@ impl DeviceInfo {
     }
 
     pub fn participant_count(&self) -> usize {
-        self.participants_info.len()
+        // 排除 kind = 8 的远程终端连接，它们不应计入主控参与者
+        self.participants_info.iter()
+            .filter(|p| {
+                p.get("kind")
+                    .and_then(|v| v.as_i64())
+                    .map_or(true, |kind| kind != 8)
+            })
+            .count()
     }
 
     pub fn platform_label(&self) -> String {

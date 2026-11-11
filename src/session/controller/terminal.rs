@@ -248,6 +248,7 @@ async fn interactive(terminal: &mut Terminal, id: u32) -> Result<()> {
     let _raw_mode = RawMode::enter()?;
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
+    eprintln!("[DEBUG] interactive: stdin and stdout ready, entering main loop");
     let mut input = [0u8; 16 * 1024];
     let mut last_size = (cols, rows);
     let mut tick = tokio::time::interval(Duration::from_millis(350));
@@ -264,7 +265,10 @@ async fn interactive(terminal: &mut Terminal, id: u32) -> Result<()> {
             }
             read = stdin.read(&mut input) => {
                 let count = read.context("reading local keyboard")?;
-                if count == 0 { break; }
+                if count == 0 {
+                    eprintln!("[DEBUG] stdin.read returned 0 (EOF), exiting interactive loop");
+                    break;
+                }
                 // Ctrl+] ends only the local attachment. Ctrl+C reaches the
                 // remote shell in POSIX raw mode, just like SSH.
                 if let Some(pos) = input[..count].iter().position(|b| *b == 0x1d) {
@@ -325,7 +329,7 @@ async fn run_with_client(
         room, &controller_id, profile, policy,
         ControlConnectType::Normal, TransportChoice::Auto, None,
         crate::media::audio::AudioSettings { volume: 0, muted: true },
-        None, &cancel, ControlPurpose::Terminal
+        None, &cancel, ControlPurpose::Terminal, false
     ).await.context("establish official UU terminal session")?;
     let operated = operate(&connection, list_only, attach).await;
     let closed = connection.close().await;
