@@ -166,8 +166,14 @@ fn create_graphics(event_loop: &ActiveEventLoop, window: &Window) -> Result<Grap
     let probe = instance
         .create_surface(window)
         .context("创建窗口绘制表面失败")?;
+    // The UI only composites decoded frames and is a poor reason to consume
+    // discrete-GPU memory on hybrid laptops. Prefer the integrated adapter;
+    // wgpu still falls back to a discrete GPU when that is the only adapter
+    // compatible with this window. WGPU_POWER_PREF=high opts back in.
+    let power_preference =
+        wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::LowPower);
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
+        power_preference,
         compatible_surface: Some(&probe),
         ..Default::default()
     }))
@@ -179,6 +185,7 @@ fn create_graphics(event_loop: &ActiveEventLoop, window: &Window) -> Result<Grap
         backend = ?info.backend,
         device_type = ?info.device_type,
         driver = %info.driver,
+        power_preference = ?power_preference,
         "UI GPU adapter selected"
     );
     // The zero-copy path imports VA-API dmabufs as Vulkan images; without the

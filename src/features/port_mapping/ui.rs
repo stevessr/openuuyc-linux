@@ -37,6 +37,8 @@ pub(crate) fn open(
                 alias: device.alias,
                 handle,
                 editor: Editor::default(),
+                #[cfg(target_os = "linux")]
+                camera: super::camera::Capture::default(),
             })
         }),
     })
@@ -46,6 +48,8 @@ struct PortWindow {
     alias: String,
     handle: Handle,
     editor: Editor,
+    #[cfg(target_os = "linux")]
+    camera: super::camera::Capture,
 }
 impl Drop for PortWindow {
     fn drop(&mut self) {
@@ -69,6 +73,8 @@ impl crate::ui::App for PortWindow {
                     .inner_margin(theme::MAPPING_MARGIN),
             )
             .show(ui, |ui| {
+                #[cfg(target_os = "linux")]
+                self.camera.show(ui, &self.handle);
                 self.editor.show(ui, &self.alias, &self.handle);
             });
         ui.ctx()
@@ -90,6 +96,7 @@ struct Form {
     remote: String,
     enabled: bool,
     protocol: super::Protocol,
+    udp_realtime: bool,
     new: bool,
 }
 impl From<&Rule> for Form {
@@ -103,6 +110,7 @@ impl From<&Rule> for Form {
             remote: r.remote_port.to_string(),
             enabled: r.enabled,
             protocol: r.protocol,
+            udp_realtime: r.udp_realtime,
             new: false,
         }
     }
@@ -126,12 +134,29 @@ impl Form {
             remote_port: self.remote.trim().parse().context("目标端口应为 1–65535")?,
             enabled: self.enabled,
             protocol: self.protocol,
+            udp_realtime: self.udp_realtime,
         };
         rule.validate()?;
         Ok(rule)
     }
 }
 impl Editor {
+    fn begin_camera(&mut self) {
+        self.begin_add();
+        let form = self.form.as_mut().unwrap();
+        form.name = "Linux 摄像头".into();
+        form.local = "19001".into();
+        form.remote = "19001".into();
+    }
+    fn begin_osc(&mut self) {
+        self.begin_add();
+        let form = self.form.as_mut().unwrap();
+        form.name = "VRChat OSC 追踪".into();
+        form.protocol = super::Protocol::Udp;
+        form.udp_realtime = true;
+        form.local = "9000".into();
+        form.remote = "9000".into();
+    }
     fn submit(&mut self, handle: &Handle, command: Command) -> bool {
         match handle.send(command) {
             Ok(()) => {
@@ -154,6 +179,7 @@ impl Editor {
             remote: String::new(),
             enabled: true,
             protocol: super::Protocol::Tcp,
+            udp_realtime: false,
             new: true,
         });
         self.error = None;
@@ -219,6 +245,18 @@ impl Editor {
                 if !snapshot.rules.is_empty() && ui.add(controls::primary("添加规则")).clicked()
                 {
                     self.begin_add();
+                }
+                if ui.add(controls::quiet_button("VRChat OSC"))
+                    .on_hover_text("创建 UDP 9000 转发草稿：将本机 OSC 追踪数据送到远端 VRChat。需在游戏内开启 OSC；不包含 OSCQuery 自动发现或 9001 回传。")
+                    .clicked()
+                {
+                    self.begin_osc();
+                }
+                if ui.add(controls::quiet_button("摄像头 TCP"))
+                    .on_hover_text("创建 TCP 19001 草稿，配合 devtools/camera-bridge.py 使用；需手动启动两端工具并准备远端虚拟摄像头。此按钮不会打开摄像头。")
+                    .clicked()
+                {
+                    self.begin_camera();
                 }
             });
         });
@@ -358,11 +396,14 @@ impl Editor {
                                             bytes(status.receive_rate.max(0.0) as u64)
                                         )
                                     };
-                                    let traffic = format!(
+                                    let mut traffic = format!(
                                         "↑ {}\n↓ {}",
                                         bytes(status.total_sent),
                                         bytes(status.total_received)
                                     );
+                                    if rule.protocol == super::Protocol::Udp {
+                                        traffic.push_str(&format!(" · 本地丢弃 {} 包", status.udp_dropped));
+                                    }
                                     match controls::mapping_row(
                                         ui,
                                         controls::MappingRow {
@@ -477,6 +518,8 @@ impl Editor {
                             });
                     });
                     if form.protocol == super::Protocol::Udp {
+                        ui.checkbox(&mut form.udp_realtime, "丢弃本地排队超过 100 ms 的 UDP 数据")
+                            .on_hover_text("适用于 OSC 追踪；不影响已经进入可靠传输通道的数据。普通 UDP 请求建议关闭。");
                         ui.label(
                             RichText::new("UDP 需要两端 OpenUUYC；弱网下可靠传输可能增加等待。")
                                 .color(theme::MUTED),
@@ -606,4 +649,40 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
         vec2(ui.available_width(), controls::HEIGHT),
         controls::singleline(value, controls::HEIGHT).hint_text(hint),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_preset_does_not_start_capture() {
+        let mut editor = Editor::default();
+        editor.begin_camera();
+        let form = editor.form.as_ref().unwrap();
+        assert!(form.new);
+        let rule = form.rule().unwrap();
+        assert_eq!(rule.protocol, super::super::Protocol::Tcp);
+        assert!(!rule.udp_realtime);
+        assert!(rule.local_addr.is_loopback());
+        assert!(rule.target.is_loopback());
+        assert_eq!((rule.local_port, rule.remote_port), (19001, 19001));
+    }
+
+    #[test]
+    fn osc_preset_is_an_editable_loopback_udp_draft() {
+        let mut editor = Editor::default();
+        editor.begin_osc();
+        let form = editor.form.as_mut().unwrap();
+        assert!(form.new);
+        let rule = form.rule().unwrap();
+        assert_eq!(rule.protocol, super::super::Protocol::Udp);
+        assert!(rule.udp_realtime);
+        assert!(Form::from(&rule).rule().unwrap().udp_realtime);
+        assert!(rule.local_addr.is_loopback());
+        assert!(rule.target.is_loopback());
+        assert_eq!((rule.local_port, rule.remote_port), (9000, 9000));
+        form.local = "19000".into();
+        assert_eq!(form.rule().unwrap().local_port, 19000);
+    }
 }

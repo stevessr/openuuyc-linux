@@ -34,8 +34,13 @@ fonts-noto-cjk | fonts-wqy-microhei | fonts-arphic-uming"""
 # gio (libglib2.0-bin) and rsvg-convert (librsvg2-bin) draw the host's drag
 # preview images; without them a drag goes out with no image.
 recommends = "libpulse0, libpipewire-0.3-0, gnome-keyring | kwalletmanager, libglib2.0-bin, librsvg2-bin, libsdl2-2.0-0"
-suggests = "ethtool, libopenxr-loader1"
+suggests = "ethtool, libopenxr-loader1, python3, ffmpeg, v4l2loopback-dkms"
 assets = [
+    ["target/release/openuuyc-tracker-source", "usr/bin/", "755"],
+    ["devtools/camera-bridge.py", "usr/bin/openuuyc-camera-bridge", "755"],
+    ["devtools/tracker-bridge.py", "usr/bin/openuuyc-tracker-bridge", "755"],
+    ["devtools/camera-bridge.md", "usr/share/doc/openuuyc/camera-bridge.md", "644"],
+    ["devtools/tracker-bridge.md", "usr/share/doc/openuuyc/tracker-bridge.md", "644"],
     ["target/release/OpenUUYC", "usr/bin/", "755"],
     # 被控端加虚拟屏要写 configfs，只有 root 能写，所以另有一个按需启动的系统服务。
     # 它的两个单元由下面的 systemd-units 装进 /usr/lib/systemd/system。

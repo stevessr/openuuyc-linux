@@ -25,6 +25,10 @@ depends=('gcc-libs' 'fuse3' 'libx11' 'libxcb' 'libxrandr' 'libxi' 'libxcursor'
          'libxfixes' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
          'vulkan-icd-loader' 'noto-fonts-cjk' 'gnome-keyring')
 optdepends=(
+    'python: optional camera bridge command'
+    'ffmpeg: optional camera bridge codec and V4L2 support'
+    'v4l2loopback-dkms: optional camera bridge receiving device'
+
     'openxr: loader for the optional integrated OpenXR PCVR components'
     'sdl2-compat: standard gamepad forwarding and rumble'
     'libva: H.264 hardware decoding'
@@ -54,7 +58,19 @@ sha256sums=('SKIP')
 
 package() {
     cd "$srcdir/$_dir"
+    if [[ -f openuuyc-tracker-source ]]; then
+        install -Dm755 openuuyc-tracker-source "$pkgdir/usr/bin/openuuyc-tracker-source"
+    fi
     install -Dm755 OpenUUYC "$pkgdir/usr/bin/OpenUUYC"
+    # Older pinned release archives predate this optional helper.
+    if [[ -f devtools/camera-bridge.py && -f devtools/camera-bridge.md ]]; then
+    install -Dm755 devtools/camera-bridge.py "$pkgdir/usr/bin/openuuyc-camera-bridge"
+    install -Dm644 devtools/camera-bridge.md "$pkgdir/usr/share/doc/openuuyc/camera-bridge.md"
+    fi
+    if [[ -f devtools/tracker-bridge.py && -f devtools/tracker-bridge.md ]]; then
+        install -Dm755 devtools/tracker-bridge.py "$pkgdir/usr/bin/openuuyc-tracker-bridge"
+        install -Dm644 devtools/tracker-bridge.md "$pkgdir/usr/share/doc/openuuyc/tracker-bridge.md"
+    fi
     install -Dm644 packaging/linux/openuuyc.desktop \
         "$pkgdir/usr/share/applications/openuuyc.desktop"
     install -Dm644 assets/icon-256.png \

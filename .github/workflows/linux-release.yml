@@ -51,6 +51,9 @@ jobs:
       - name: Build
         run: |
           cargo build --release --locked --bin OpenUUYC
+          c++ -std=c++17 -O2 -Wall -Wextra -Werror drivers/pcvr/tracker_source.cpp -ldl -pthread -o target/release/openuuyc-tracker-source
+          c++ -std=c++17 -Wall -Wextra -Werror drivers/pcvr/tests/tracker_source_test.cpp -o /tmp/tracker-source-test
+          /tmp/tracker-source-test
           # 虚拟显示器辅助程序是独立的 crate（自己的 workspace 与 Cargo.lock），
           # 产物落到同一个 target/，打包时只认一处。
           (cd crates/vkms && CARGO_TARGET_DIR=../../target cargo build --release --locked)
@@ -68,7 +71,12 @@ jobs:
           # binary package both read these paths from the unpacked archive.
           install -Dm755 target/release/OpenUUYC "$stage/OpenUUYC"
           install -Dm755 target/release/openuuyc-vkms "$stage/openuuyc-vkms"
+          install -Dm755 target/release/openuuyc-tracker-source "$stage/openuuyc-tracker-source"
           install -Dm755 install-omarchy.sh "$stage/install-omarchy.sh"
+          install -Dm755 devtools/camera-bridge.py "$stage/devtools/camera-bridge.py"
+          install -Dm755 devtools/tracker-bridge.py "$stage/devtools/tracker-bridge.py"
+          install -Dm644 devtools/camera-bridge.md "$stage/devtools/camera-bridge.md"
+          install -Dm644 devtools/tracker-bridge.md "$stage/devtools/tracker-bridge.md"
           for file in packaging/linux/openuuyc.desktop \
             packaging/linux/60-openuuyc-uinput.rules \
             packaging/linux/app-openuuyc.service \

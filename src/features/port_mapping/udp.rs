@@ -2,6 +2,23 @@
 //! This deliberately retains SCTP reliability; it is not an IP/UDP VPN.
 use super::*;
 use tokio::net::UdpSocket;
+use std::time::Instant;
+
+struct Datagram {
+    payload: Bytes,
+    queued_at: Instant,
+}
+impl Datagram {
+    fn expired(&self, realtime: bool, now: Instant) -> bool {
+        realtime && now.saturating_duration_since(self.queued_at) >= Duration::from_millis(100)
+    }
+}
+
+
+fn record_drop(stats: &Mutex<RuleStatus>) {
+    let mut stats = lock(stats);
+    stats.udp_dropped = stats.udp_dropped.saturating_add(1);
+}
 
 pub(super) async fn run_rule(
     rule: Rule,
@@ -13,7 +30,7 @@ pub(super) async fn run_rule(
         rule.validate()?;
         let socket=Arc::new(UdpSocket::bind(SocketAddr::new(rule.local_addr,rule.local_port)).await.context("无法监听 UDP 端口")?);
         lock(&stats).listening=true;
-        let mut flows=HashMap::<SocketAddr,mpsc::Sender<Bytes>>::new();
+        let mut flows=HashMap::<SocketAddr,mpsc::Sender<Datagram>>::new();
         let mut jobs=JoinSet::new();
         let mut buffer=vec![0;65_536];
         let outcome=loop {
@@ -23,9 +40,9 @@ pub(super) async fn run_rule(
                 Some(result)=jobs.join_next(), if !jobs.is_empty()=>{if let Ok(addr)=result {flows.remove(&addr);}},
                 packet=socket.recv_from(&mut buffer)=>{
                     let (size,source)=match packet {Ok(v)=>v,Err(e) if matches!(e.kind(),std::io::ErrorKind::ConnectionReset|std::io::ErrorKind::ConnectionRefused)=>continue,Err(e)=>break Err(e.into())};
-                    if size>65_507 {continue;}
+                    if size>65_507 {record_drop(&stats);continue;}
                     if !flows.contains_key(&source) {
-                        if flows.len()>=64 {continue;}
+                        if flows.len()>=64 {record_drop(&stats);continue;}
                         let (tx,rx)=mpsc::channel(8);
                         flows.insert(source,tx);
                         let transport=transport.clone();let rule=rule.clone();let socket=socket.clone();
@@ -33,7 +50,9 @@ pub(super) async fn run_rule(
                         jobs.spawn(async move {association(rule,transport,socket,source,rx,stop,stats).await;source});
                     }
                     // UDP overload drops a datagram, never truncates or splices it.
-                    let _=flows[&source].try_send(Bytes::copy_from_slice(&buffer[..size]));
+                    if flows[&source].try_send(Datagram { payload: Bytes::copy_from_slice(&buffer[..size]), queued_at: Instant::now() }).is_err() {
+                        record_drop(&stats);
+                    }
                 }
             }
         };
@@ -55,7 +74,7 @@ async fn association(
     transport: Arc<Transport>,
     socket: Arc<UdpSocket>,
     source: SocketAddr,
-    mut packets: mpsc::Receiver<Bytes>,
+    mut packets: mpsc::Receiver<Datagram>,
     parent: CancellationToken,
     stats: Arc<Mutex<RuleStatus>>,
 ) {
@@ -95,9 +114,15 @@ async fn association(
                     _=tokio::time::sleep(Duration::from_secs(60))=>return Ok(()),
                     packet=packets.recv()=>{
                         let packet=packet.context("UDP 监听已关闭")?;
+                        if packet.expired(rule.udp_realtime, Instant::now()) {record_drop(&stats);continue;}
+                        let deadline=rule.udp_realtime.then(|| tokio::time::Instant::from_std(packet.queued_at + Duration::from_millis(100)));
+                        let packet=packet.payload;
                         let size=packet.len();
-                        transport.send(rule.id,stream,18,packet).await?;
-                        lock(&stats).sent+=size as u64;
+                        if transport.send_until(rule.id,stream,18,packet,deadline).await? {
+                            lock(&stats).sent+=size as u64;
+                        } else {
+                            record_drop(&stats);
+                        }
                     },
                     message=incoming.recv()=>{
                         let message=message.context("UDP 通道已关闭")?;
@@ -127,5 +152,32 @@ async fn association(
     }
     if let Some(error) = lock(&fault).take() {
         state.error = Some(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_counter_never_wraps_or_changes_sent_bytes() {
+        let stats = Mutex::new(RuleStatus::default());
+        record_drop(&stats);
+        assert_eq!(lock(&stats).udp_dropped, 1);
+        lock(&stats).udp_dropped = u64::MAX;
+        record_drop(&stats);
+        assert_eq!(lock(&stats).udp_dropped, u64::MAX);
+        assert_eq!(lock(&stats).sent, 0);
+    }
+
+    #[test]
+    fn realtime_discards_old_samples_but_preserves_normal_udp() {
+        let now = Instant::now();
+        let packet = Datagram { payload: Bytes::from_static(b"osc"), queued_at: now };
+        assert!(!packet.expired(true, now + Duration::from_millis(99)));
+        assert!(packet.expired(true, now + Duration::from_millis(100)));
+        assert!(packet.expired(true, now + Duration::from_millis(101)));
+        assert!(!packet.expired(false, now + Duration::from_secs(30)));
+        assert_eq!(packet.payload.as_ref(), b"osc");
     }
 }

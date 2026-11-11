@@ -16,6 +16,10 @@ depends=('gcc-libs' 'fuse3' 'libx11' 'libxcb' 'libxrandr' 'libxi' 'libxcursor'
          'libxfixes' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
          'vulkan-icd-loader' 'noto-fonts-cjk' 'gnome-keyring')
 optdepends=(
+    'python: optional camera bridge command'
+    'ffmpeg: optional camera bridge codec and V4L2 support'
+    'v4l2loopback-dkms: optional camera bridge receiving device'
+
     'openxr: loader for the optional integrated OpenXR PCVR components'
     'sdl2-compat: standard gamepad forwarding and rumble'
     'libva: H.264 hardware decoding'
@@ -60,6 +64,7 @@ build() {
     cd "$pkgname"
     export CARGO_HOME="$srcdir/cargo"
     cargo build --release --locked --bin OpenUUYC
+    c++ -std=c++17 -O2 -Wall -Wextra -Werror drivers/pcvr/tracker_source.cpp -ldl -pthread -o target/release/openuuyc-tracker-source
     # 虚拟显示器辅助程序是独立的 crate（自己的 workspace 与 Cargo.lock），产物落到
     # 同一个 target/，打包时只认一处。
     ( cd crates/vkms && CARGO_TARGET_DIR="$srcdir/$pkgname/target" cargo build --release --locked )
@@ -67,7 +72,12 @@ build() {
 
 package() {
     cd "$pkgname"
+    install -Dm755 target/release/openuuyc-tracker-source "$pkgdir/usr/bin/openuuyc-tracker-source"
     install -Dm755 target/release/OpenUUYC "$pkgdir/usr/bin/OpenUUYC"
+    install -Dm755 devtools/camera-bridge.py "$pkgdir/usr/bin/openuuyc-camera-bridge"
+    install -Dm755 devtools/tracker-bridge.py "$pkgdir/usr/bin/openuuyc-tracker-bridge"
+    install -Dm644 devtools/camera-bridge.md "$pkgdir/usr/share/doc/openuuyc/camera-bridge.md"
+    install -Dm644 devtools/tracker-bridge.md "$pkgdir/usr/share/doc/openuuyc/tracker-bridge.md"
     install -Dm644 packaging/linux/openuuyc.desktop \
         "$pkgdir/usr/share/applications/openuuyc.desktop"
     install -Dm644 assets/icon-256.png \

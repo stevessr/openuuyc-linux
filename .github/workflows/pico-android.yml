@@ -165,6 +165,15 @@ jobs:
           c++ -std=c++17 -Wall -Wextra -Werror \
             drivers/pcvr/tests/mirror_extent_test.cpp -o /tmp/openuuyc-pcvr-mirror-extent-test
           /tmp/openuuyc-pcvr-mirror-extent-test
+          c++ -std=c++17 -Wall -Wextra -Werror \
+            drivers/pcvr/tests/mirror_pose_test.cpp -o /tmp/openuuyc-pcvr-mirror-pose-test
+          /tmp/openuuyc-pcvr-mirror-pose-test
+          c++ -std=c++17 -Wall -Wextra -Werror drivers/pcvr/tracker_source.cpp \
+            -ldl -pthread -o /tmp/openuuyc-tracker-source
+          if /tmp/openuuyc-tracker-source /nonexistent/libopenvr_api.so; then
+            echo "tracker source must reject an unavailable runtime" >&2
+            exit 1
+          fi
       - name: Validate PICO bridge authentication and protocol
         run: cargo test --locked --lib pico_bridge -- --nocapture
 

@@ -138,7 +138,16 @@ if [[ -e /dev/uinput ]]; then
 fi
 
 say "安装程序文件"
+if [[ -f openuuyc-tracker-source ]]; then
+    "${SUDO[@]}" install -Dm755 openuuyc-tracker-source "$PREFIX/bin/openuuyc-tracker-source"
+elif [[ -f target/release/openuuyc-tracker-source ]]; then
+    "${SUDO[@]}" install -Dm755 target/release/openuuyc-tracker-source "$PREFIX/bin/openuuyc-tracker-source"
+fi
 "${SUDO[@]}" install -Dm755 "$BINARY" "$PREFIX/bin/OpenUUYC"
+"${SUDO[@]}" install -Dm755 devtools/camera-bridge.py "$PREFIX/bin/openuuyc-camera-bridge"
+"${SUDO[@]}" install -Dm755 devtools/tracker-bridge.py "$PREFIX/bin/openuuyc-tracker-bridge"
+"${SUDO[@]}" install -Dm644 devtools/camera-bridge.md "$PREFIX/share/doc/openuuyc/camera-bridge.md"
+"${SUDO[@]}" install -Dm644 devtools/tracker-bridge.md "$PREFIX/share/doc/openuuyc/tracker-bridge.md"
 "${SUDO[@]}" install -Dm644 packaging/linux/openuuyc.desktop \
     "$PREFIX/share/applications/openuuyc.desktop"
 "${SUDO[@]}" install -Dm644 assets/icon-256.png \

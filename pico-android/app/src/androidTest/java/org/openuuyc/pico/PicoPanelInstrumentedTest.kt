@@ -63,7 +63,10 @@ class PicoPanelInstrumentation : Instrumentation() {
             while(android.os.SystemClock.elapsedRealtime()<deadline) {
                 check(!error.exists()) {error.readText()}
                 if(report.exists()) {
-                    value=runCatching {org.json.JSONObject(report.readText())}.getOrNull()
+                    value=runCatching {org.json.JSONObject(report.readText())}.getOrNull()?.takeIf {
+                        PicoDiagnosticStamp.current(it, activity.diagnosticSession, android.os.Process.myPid(),
+                            android.os.SystemClock.elapsedRealtime(), if(initialization) 75000 else 5000)
+                    }
                     if(initialization && value?.optBoolean("surfaceAttempted")==true && android.os.SystemClock.elapsedRealtime()>=minimum)break
                     if((value?.optLong(if(pointer) "samples" else "projectionFrames") ?: 0)>=120 && android.os.SystemClock.elapsedRealtime()>=minimum) break
                 }

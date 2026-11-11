@@ -24,6 +24,8 @@ pub(crate) mod host;
 pub(crate) mod service;
 pub(crate) mod store;
 mod udp;
+#[cfg(target_os = "linux")]
+mod camera;
 pub(crate) mod ui;
 
 const CHUNK: usize = 524_160;
@@ -78,6 +80,13 @@ impl Default for Transport {
         }
     }
 }
+async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -125,7 +134,7 @@ impl Transport {
         .context("端口转发数据通道未就绪")
     }
     pub(crate) fn receive(&self, bytes: &[u8]) -> Result<()> {
-        ensure!(bytes.len() < WIRE_LIMIT, "端口转发消息过大");
+        ensure!(bytes.len() <= WIRE_LIMIT, "端口转发消息过大");
         let Some(frame) = crate::features::stream_control::decode_port_mapping(bytes)? else {
             return Ok(());
         };
@@ -170,6 +179,16 @@ impl Transport {
         Ok(())
     }
     async fn send(&self, rule: u64, stream: u64, kind: i32, payload: Bytes) -> Result<()> {
+        self.send_until(rule, stream, kind, payload, None).await?;
+        Ok(())
+    }
+
+    /// A false result means an optional local deadline expired before submission.
+    /// Once SCTP accepts a datagram it cannot be withdrawn by this transport.
+    async fn send_until(
+        &self, rule: u64, stream: u64, kind: i32, payload: Bytes,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<bool> {
         let frame = Frame {
             session_id: 1,
             rule_id: rule,
@@ -186,8 +205,12 @@ impl Transport {
             .context("端口转发连接已关闭")?;
         // Serialize the per-device budget check with submission. Stop reading
         // TCP while full; the SCTP association also has its own bounded budget.
-        tokio::time::timeout(TIMEOUT, async {
-            let _guard = self.send_lock.lock().await;
+        let submitted = tokio::time::timeout(TIMEOUT, async {
+            let _guard = tokio::select! {
+                biased;
+                _ = wait_deadline(deadline) => return Ok(false),
+                guard = self.send_lock.lock() => guard,
+            };
             loop {
                 let wake = self.changed.notified();
                 tokio::pin!(wake);
@@ -199,14 +222,21 @@ impl Transport {
                 if channel.buffered_amount().await + bytes.len() <= BUFFER {
                     break;
                 }
-                wake.await;
+                tokio::select! {
+                    biased;
+                    _ = wait_deadline(deadline) => return Ok(false),
+                    _ = wake => {},
+                }
+            }
+            if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                return Ok(false);
             }
             channel.send(&bytes).await?;
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(true)
         })
         .await
         .context("端口转发发送超时")??;
-        Ok(())
+        Ok(submitted)
     }
     async fn handshake(
         &self,
@@ -432,6 +462,9 @@ pub(crate) struct Rule {
     pub enabled: bool,
     #[serde(default)]
     pub protocol: Protocol,
+    /// Discard unsent local UDP samples older than 100 ms (OSC tracking).
+    #[serde(default)]
+    pub udp_realtime: bool,
 }
 impl Rule {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -468,6 +501,8 @@ pub(crate) struct RuleStatus {
     pub probe: ProbeStatus,
     pub total_sent: u64,
     pub total_received: u64,
+    /// Local UDP queue admission / expiry drops, not network loss.
+    pub udp_dropped: u64,
     pub send_rate: f64,
     pub receive_rate: f64,
 }
@@ -540,3 +575,99 @@ async fn probe_loop(
         tokio::select! {biased;_=stop.cancelled()=>break,_=requested.notified()=>{},_=tokio::time::sleep(Duration::from_secs(30))=>{}}
     }
 }
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deadline_interrupts_a_busy_lock_without_acquiring_it() {
+        let lock = tokio::sync::Mutex::new(());
+        let held = lock.lock().await;
+        let acquired = tokio::select! {
+            biased;
+            _ = wait_deadline(Some(tokio::time::Instant::now())) => false,
+            _ = lock.lock() => true,
+        };
+        assert!(!acquired);
+        drop(held);
+        assert!(lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn no_deadline_does_not_expire() {
+        let expired = tokio::select! {
+            biased;
+            _ = wait_deadline(None) => true,
+            _ = std::future::ready(()) => false,
+        };
+        assert!(!expired);
+    }
+
+    #[test]
+    fn legacy_rules_do_not_enable_realtime_drops() {
+        let rule: Rule = serde_json::from_value(serde_json::json!({
+            "id": 1, "name": "legacy", "local_addr": "127.0.0.1",
+            "local_port": 9000, "target": "127.0.0.1", "remote_port": 9000,
+            "enabled": true, "protocol": "Udp"
+        })).unwrap();
+        assert!(!rule.udp_realtime);
+        rule.validate().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod datagram_transport_tests {
+    use super::*;
+
+    fn frame(kind: i32, payload: Bytes) -> Frame {
+        Frame { session_id: 1, rule_id: 42, stream_id: 7, kind, payload }
+    }
+
+    #[test]
+    fn unknown_streams_and_syn_never_allocate_routes() {
+        let transport = Transport::default();
+        for kind in [0, 16, 18, 19, 99] {
+            transport.deliver(frame(kind, Bytes::new())).unwrap();
+        }
+        assert!(lock(&transport.routes).is_empty());
+        assert_eq!(transport.budget.available_permits(), 32 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn datagrams_keep_boundaries_and_release_their_memory_budget() {
+        let transport = Transport::default();
+        let (sender, mut input) = mpsc::channel(8);
+        let budget = Arc::new(Semaphore::new(131_072));
+        let remote_fin = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = CancellationToken::new();
+        transport.register((42, 7), Route {
+            sender, budget: budget.clone(), stop: stop.clone(),
+            remote_fin: remote_fin.clone(), fault: Arc::default(),
+        }).unwrap();
+        // Includes empty UDP and maximum IPv4 UDP payloads, not just text OSC.
+        let packets = [Bytes::new(), Bytes::from_static(b"/tracking\0\0\0"),
+            Bytes::from(vec![0xa5; 65_507])];
+        for packet in &packets {
+            let encoded = crate::features::stream_control::encode_port_mapping(
+                frame(18, packet.clone()).encode_to_vec());
+            transport.receive(&encoded).unwrap();
+        }
+        assert!(budget.available_permits() < 131_072);
+        for expected in packets {
+            let received = input.try_recv().unwrap();
+            assert_eq!(received.frame.payload, expected);
+            assert_eq!(received.frame.kind, 18);
+            drop(received);
+        }
+        assert_eq!(budget.available_permits(), 131_072);
+        assert_eq!(transport.budget.available_permits(), 32 * 1024 * 1024);
+        assert!(!stop.is_cancelled());
+        transport.deliver(frame(19, Bytes::new())).unwrap();
+        assert!(remote_fin.load(Ordering::Acquire));
+        assert_eq!(input.try_recv().unwrap().frame.kind, 19);
+    }
+}
+
+#[cfg(test)]
+mod transport_tests;

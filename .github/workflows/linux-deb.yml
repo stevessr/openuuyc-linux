@@ -50,6 +50,9 @@ jobs:
       - name: Build
         run: |
           cargo build --release --locked --bin OpenUUYC
+          c++ -std=c++17 -O2 -Wall -Wextra -Werror drivers/pcvr/tracker_source.cpp -ldl -pthread -o target/release/openuuyc-tracker-source
+          c++ -std=c++17 -Wall -Wextra -Werror drivers/pcvr/tests/tracker_source_test.cpp -o /tmp/tracker-source-test
+          /tmp/tracker-source-test
           # 虚拟显示器辅助程序是独立的 crate（自己的 workspace 与 Cargo.lock），
           # 产物落到同一个 target/ 里，打包时只认一处。
           (cd crates/vkms && CARGO_TARGET_DIR=../../target cargo build --release --locked)
@@ -58,6 +61,12 @@ jobs:
         run: cargo test --release --locked --lib session::controller::terminal::tests
       - name: Test private window control (including niri IPC parser)
         run: cargo test --locked --lib window_control
+
+      - name: Test peripheral forwarding and PCVR packet validation
+        run: |
+          cargo test --locked --lib features::port_mapping
+          cargo test --locked --lib gamepad
+          cargo test --locked --lib pcvr::protocol
 
       - name: Test the virtual display helper
         # 它有自己的 workspace，根目录的 cargo fmt 与 cargo test 都管不到它。
@@ -83,6 +92,9 @@ jobs:
         run: |
           sudo apt-get install -y ./target/debian/*.deb
           OpenUUYC --version
+          openuuyc-camera-bridge --help
+          openuuyc-tracker-bridge --help
+          openuuyc-camera-bridge send --device /dev/video0 --dry-run
           dpkg-deb --info target/debian/*.deb
 
       - uses: actions/upload-artifact@v7

@@ -1,0 +1,31 @@
+name: Linux camera bridge
+on:
+  push:
+    paths:
+      - 'devtools/camera-bridge.py'
+      - 'devtools/test_camera*.py'
+      - 'devtools/tracker-bridge.py'
+      - 'devtools/test_tracker_bridge.py'
+      - '.github/workflows/camera-bridge.yml'
+  pull_request:
+    paths:
+      - 'devtools/camera-bridge.py'
+      - 'devtools/test_camera*.py'
+      - 'devtools/tracker-bridge.py'
+      - 'devtools/test_tracker_bridge.py'
+      - '.github/workflows/camera-bridge.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  media:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Validate arguments and synthetic TCP media (no camera access)
+        run: python3 -m unittest discover -s devtools -p 'test_camera*.py'
+      - name: Validate normalized tracker OSC and local UDP delivery
+        run: python3 -m unittest discover -s devtools -p test_tracker_bridge.py

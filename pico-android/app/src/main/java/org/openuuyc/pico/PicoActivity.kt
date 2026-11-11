@@ -961,12 +961,15 @@ open class PicoActivity : Activity() {
     }
     private val inputDiagnostics=java.util.concurrent.ThreadPoolExecutor(1,1,0L,java.util.concurrent.TimeUnit.MILLISECONDS,
         java.util.concurrent.ArrayBlockingQueue<Runnable>(1),java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy())
+    val diagnosticSession: String = java.util.UUID.randomUUID().toString()
+    private fun stampedDiagnostic(report: org.json.JSONObject) = PicoDiagnosticStamp.attach(
+        report, diagnosticSession, android.os.Process.myPid(), android.os.SystemClock.elapsedRealtime())
     private var menuClicksHandled=0L
     fun onXrInputDiagnostics(json: String) {
         if(json.length>2048 || inputDiagnostics.isShutdown) return
         runCatching {inputDiagnostics.execute {
             runCatching {
-                val report=org.json.JSONObject(json).put("menuClicksHandled",menuClicksHandled)
+                val report=stampedDiagnostic(org.json.JSONObject(json).put("menuClicksHandled",menuClicksHandled))
                 val tmp=java.io.File(filesDir,"xr-input-diagnostics.tmp")
                 tmp.writeText(report.toString());tmp.renameTo(java.io.File(filesDir,"xr-input-diagnostics.json"))
             }
@@ -980,7 +983,7 @@ open class PicoActivity : Activity() {
         pointerProbeStats.accept(mask,floatArrayOf(lx,ly,lz,rx,ry,rz))
         if(pointerProbeStats.samples%60==0L) {
             val temporary=java.io.File(filesDir,"pointer-probe.json.tmp")
-            runCatching {temporary.writeText(pointerProbeStats.report().toString());check(temporary.renameTo(java.io.File(filesDir,"pointer-probe.json")))}
+            runCatching {temporary.writeText(stampedDiagnostic(pointerProbeStats.report()).toString());check(temporary.renameTo(java.io.File(filesDir,"pointer-probe.json")))}
         }
     }
     fun onXrSurfaceProbeSurface(surface:Surface?,width:Int,height:Int) {
@@ -992,11 +995,11 @@ open class PicoActivity : Activity() {
     }
     private fun writePcvrInitializationProbe() {
         val tmp=java.io.File(filesDir,"pcvr-init-probe.tmp")
-        runCatching {tmp.writeText(pcvrProbeStats.initialization().toString());check(tmp.renameTo(java.io.File(filesDir,"pcvr-init-probe.json")))}
+        runCatching {tmp.writeText(stampedDiagnostic(pcvrProbeStats.initialization()).toString());check(tmp.renameTo(java.io.File(filesDir,"pcvr-init-probe.json")))}
     }
     fun onXrStereoProbe(frames: Long,lw: Int,lh: Int,rw: Int,rh: Int,ipd: Float) {
         if(!pcvrProbe) return
-        val report=pcvrProbeStats.report(frames,lw,lh,rw,rh,ipd)
+        val report=stampedDiagnostic(pcvrProbeStats.report(frames,lw,lh,rw,rh,ipd))
         val temporary=java.io.File(filesDir,"pcvr-probe.json.tmp")
         runCatching {
             temporary.writeText(report.toString());check(temporary.renameTo(java.io.File(filesDir,"pcvr-probe.json")))

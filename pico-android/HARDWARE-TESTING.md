@@ -474,3 +474,16 @@ and reachability still require headset validation.
 - Pending decoder metadata remains bounded at eight entries. Capacity/duplicate checks precede input-buffer acquisition, avoiding an acquired-but-unqueued input buffer when metadata is full. Stale output requests a fresh keyframe instead of publishing old views as newly rendered.
 - Encoder wire sequence now counts produced encoded access units, not capture publications. Latest-only capture skips are legitimate before encoding and no longer trigger false receiver loss/IDR recovery. Actual lost encoded units still create a wire gap and require recovery.
 - Focused tests cover stale/late callbacks, queue bounds, metadata reset, first-fragment timestamp preservation and nonconsecutive capture IDs producing consecutive encoded IDs. Physical decoder stall/recovery and VRChat playback still require headset verification.
+
+## 2026-11-06 本地诊断实测（不是远端游戏验收）
+
+- 设备：PICO A9210，Android API 34；休眠时内部 XR Activity 未在 10 秒内启动。
+  确认设备 Awake 后，覆盖安装当前工作树的应用和 instrumentation APK，重测通过。
+- APK SHA-256：`2ebd8e3dca582836f449267dd12d2cf4c7a119f969bae4404195523b2a708c57`。
+- `vault-phase=pcvr-stereo`：180 个投影帧，181 个追踪样本，头部、左右手有效样本各 180；
+  左右眼均 1920×1920，IPD 0.07198 m。报告明确 `remoteVideo=false, probeOnly=true`。
+- `vault-phase=xr-pointer`：180 个样本，左右有效各 179；左右 grip active 各 178，
+  右手范围约 0.79957 m，左手范围 0；grip held 与 menu drag 均为 0，不能据此验收按钮或拖动。
+- 两个报告包含与当前 Activity/进程匹配的诊断标识和单调时间戳，测试检查新鲜度后通过。
+- 本次未登录 UU、未接入远端 VRChat，也没有采集摄像头或麦克风。
+  双眼真实佩戴观感、游戏帧、远端输入回传、全身追踪校准、抖动和延迟仍需另外验收。

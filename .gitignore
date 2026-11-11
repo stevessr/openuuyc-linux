@@ -14,6 +14,7 @@ captures/
 *.md
 *.markdown
 !/README.md
+!/devtools/camera-bridge.md
 !/crates/codec/README.md
 !/crates/codec/kernels/h264/README.md
 !/crates/codec/kernels/av1/README.md
@@ -103,3 +104,5 @@ pico-android/.gradle/
 pico-android/local.properties
 pico-android/**/build/
 pico-android/**/.cxx/
+
+!/devtools/tracker-bridge.md

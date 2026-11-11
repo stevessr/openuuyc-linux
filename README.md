@@ -145,6 +145,23 @@ niri 原生窗口（`NIRI_SOCKET`）。该功能经现有已授权会话的私�
 | 安装服务 / 驱动 | ✅ | ✅ 服务、输入与显示驱动 | ❌ 用 deb / AUR 包 | ❌ | ❌ |
 | 更新 | ✅ 提醒、更新并打开、命令行 | ✅ 同左 | ⚠️ 仅提醒，指向上游 Release | ⚠️ 同左 | ⚠️ 同左 |
 
+## 摄像头与体感辅助通路（实验性）
+
+端口转发窗口提供「摄像头 TCP」和「VRChat OSC」规则草稿；点击预设不会启动采集，
+保存规则、开启服务后才监听。OSC 预设默认丢弃本地等待超过 100 ms 的旧 UDP 数据，
+规则流量栏显示本地丢弃数；这不是网络丢包率，也不能消除 SCTP 内的积压。
+
+- **Linux 摄像头**：`openuuyc-camera-bridge` 将 V4L2 采集经 TCP 转发送到远端
+  v4l2loopback，需手动准备虚拟设备、选择源并启动两端工具。
+  [安装、命令与边界](devtools/camera-bridge.md)。不支持 Windows 虚拟摄像头或 PICO 透视相机。
+- **体感姿态**：已有 OSC 输出的追踪程序可直接使用 UDP 预设；其他程序可将标准化
+  JSONL 接到 `openuuyc-tracker-bridge`，输出 VRChat OSC。
+  [坐标约定、时间戳与使用方式](devtools/tracker-bridge.md)。不包含硬件驱动、骨骼估计或自动校准。
+
+以上命令随包含这些改动的新 Linux 安装包交付；旧包可从 `devtools` 用 Python 3 运行。
+已验证本机合成媒体、UDP 和 WebRTC 数据通道；真实摄像头跨机器、全身体感及 VRChat
+远端双眼游戏画面仍待验收，不能将辅助通路视为完整 PCVR 支持。
+
 ## 安装与服务
 
 主页“安装服务”会将程序安装到 `Program Files\OpenUUYC`，安装后台服务、输入和显示驱动，创建快捷方式并配置托盘自启动。安装需管理员授权及驱动证书信任；关闭主窗口进入托盘，托盘“退出”结束运行。
@@ -310,7 +327,7 @@ sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-
 - **解码**：H.264 走 VA-API。AMD 用 `mesa`，Intel 用 `intel-media-driver`，NVIDIA 用 `libva-nvidia-driver`（Ubuntu 为 `nvidia-vaapi-driver`；并设 `NVD_BACKEND=direct`）；libva 2.15 以前认不出 NVIDIA 显卡对应的驱动，程序会自行指定，无需设置 `LIBVA_DRIVER_NAME`。
 - **编码**（被控）：Linux 已支持 NVIDIA NVENC（H.264 / H.265；AV1 需 RTX 40 系及以上），运行时直接加载 NVIDIA 驱动的 CUDA/NVENC 库，不需要 CUDA Toolkit。确保 NVIDIA 驱动正常（`nvidia-smi` 可用），混合显卡机器 NVENC 使用桌面所在的 NVIDIA GPU；AMD 与 Intel 经 VA-API 编码 H.264（Intel 需 `intel-media-driver` 或 `libva-intel-driver`，AMD 用 `mesa`），都不可用时回退软件编码。NVIDIA 解码目前依赖 VA-API 转接驱动 `libva-nvidia-driver`（Ubuntu 为 `nvidia-vaapi-driver`，设 `NVD_BACKEND=direct`）。
 - **老 Intel GPU / 虚拟机**：Haswell/Broadwell 的 Vulkan 驱动未通过一致性认证，程序仍会使用它（设 `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=0` 恢复 wgpu 默认的隐藏行为）；驱动无法向 Wayland surface 呈现时，可安装 `vulkan-swrast`（lavapipe）并用 `OPENUUYC_BACKEND=gl` 或 `OPENUUYC_BACKEND=vulkan` 指定界面后端。
-- **GPU 设备丢失**：Linux 控制中心会记录 wgpu 报告的原因并退出；失效设备不能原地恢复，重启后会重新创建设备。若问题只出现在 Vulkan，可尝试 `OPENUUYC_BACKEND=gl`；Haswell/Broadwell 也可设 `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=0` 避开未认证适配器。
+- **GPU 设备选择 / 丢失**：Linux UI 默认优先低功耗适配器，在混合显卡机器上通常是集显，以免 UI 占用独显显存；`WGPU_POWER_PREF=high` 可请求高性能适配器。集显不可用或不支持当前窗口时仍会回退到独显。设备丢失时程序会记录 wgpu 报告的原因并退出；失效设备不能原地恢复，重启后会重新创建设备。若问题只出现在 Vulkan，可尝试 `OPENUUYC_BACKEND=gl`；Haswell/Broadwell 也可设 `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=0` 避开未认证适配器。
 
 #### 运行前提与开关
 
@@ -324,7 +341,7 @@ sudo pacman -S --needed xdg-desktop-portal-gnome   # KDE 为 xdg-desktop-portal-
 - **更新**：「关于」页的更新提醒指向上游的 Windows Release；Linux 版请从本 fork 的 Release 或 deb / AUR 包更新。下面的「命令行更新」只适用于 Windows。
 - **Gamescope**：在 SteamOS 游戏模式中，将原生程序添加为非 Steam 游戏即可，无需指定兼容性工具。启动时处理显示连接与缩放，控制中心匹配当前屏幕尺寸；保留手动设置的缩放比例。登录凭据使用系统配置的 Secret Service，锁定时先请求解锁；KWallet 解锁窗口会关联到当前 Steam 应用。
 - **手柄**：Linux 主控通过系统 SDL2 2.0.6 及以上读取标准手柄（Arch 安装 `sdl2-compat`，Debian / Ubuntu 安装 `libsdl2-2.0-0`），支持双摇杆、十字键、按钮和双扳机，震动回传还需要 SDL2 2.0.9 及以上版本和兼容手柄。SteamDeck 的 Steam Input 选择手柄布局（例如「支持视角控制的手柄」）。开启远控输入、将焦点留在播放窗口并松开已有按键后开始转发；失焦、操作本地菜单、拔出或断开连接时释放远端状态并停止震动。
-- **环境变量**：`OPENUUYC_CAPTURE` 指定采集后端顺序（如 `nvfbc`、`wlr`、`x11,portal`）；VA-API 解码默认尝试通过 DMA-BUF 直接交给渲染器；不支持导入或导出失败时自动回退 CPU 回读，`OPENUUYC_ZEROCOPY=0` 可强制关闭（驱动接受导入但画面异常时也可使用）；`OPENUUYC_CAPTURE_DMABUF=1` 与 `OPENUUYC_GPU_CONVERT=1` 是门户采集的试验开关；`OPENUUYC_BACKEND=gl|vulkan` 指定界面后端。
+- **环境变量**：`OPENUUYC_CAPTURE` 指定采集后端顺序（如 `nvfbc`、`wlr`、`x11,portal`）；VA-API 解码默认尝试通过 DMA-BUF 直接交给渲染器；不支持导入或导出失败时自动回退 CPU 回读，`OPENUUYC_ZEROCOPY=0` 可强制关闭（驱动接受导入但画面异常时也可使用）；`OPENUUYC_CAPTURE_DMABUF=1` 与 `OPENUUYC_GPU_CONVERT=1` 是门户采集的试验开关；`OPENUUYC_BACKEND=gl|vulkan` 指定界面后端；`WGPU_POWER_PREF=low|high|none` 控制适配器选择偏好（默认 `low`）。
 
 `cargo dist` 只用于 Windows 打包，Linux 直接用 `cargo build`。
 
