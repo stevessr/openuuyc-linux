@@ -89,6 +89,29 @@ pub(crate) async fn discover() -> Result<Vec<Device>> {
     );
     Ok(parse_devices(&String::from_utf8_lossy(&output.stdout)))
 }
+/// 检查投屏依赖的命令行工具是否在 PATH 中；名称是静态列表，不经用户输入。
+/// 返回值与入参顺序一致，供设置页提示缺哪个、怎么装。
+pub(crate) async fn tool_check() -> Vec<(&'static str, bool)> {
+    let mut found = Vec::new();
+    for tool in ["adb", "scrcpy"] {
+        let ok = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("command -v {tool}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .map(|status| status.success())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
+        found.push((tool, ok));
+    }
+    found
+}
 pub(crate) async fn mirror(serial: &str, display: u32, control: bool) -> Result<()> {
     ensure!(valid_serial(serial), "无效设备标识");
     ensure!(
@@ -171,5 +194,15 @@ mod tests {
         let devices = discover().await.unwrap();
         assert!(devices.iter().any(|d| d.state == "device"));
         eprintln!("ADB inventory: {devices:?}");
+    }
+    #[tokio::test]
+    #[ignore = "depends on the local PATH contents"]
+    async fn tool_probe_lists_both_dependencies() {
+        let tools = tool_check().await;
+        assert_eq!(
+            tools.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec!["adb", "scrcpy"]
+        );
+        eprintln!("tool check: {tools:?}");
     }
 }

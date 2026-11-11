@@ -47,6 +47,7 @@ enum Page {
     Logs,
     Plugins,
     TerminalSessions,
+    MrDevices,
     About,
 }
 impl Page {
@@ -63,6 +64,7 @@ impl Page {
             Self::Logs => "日志设置",
             Self::Plugins => "插件管理",
             Self::TerminalSessions => "终端会话",
+            Self::MrDevices => "MR 与头显",
             Self::About => "关于",
         }
     }
@@ -149,6 +151,7 @@ enum Icon {
     Keyboard,
     Diagnostics,
     Terminal,
+    Headset,
 }
 
 pub(super) fn configure_visuals(ctx: &egui::Context) {
@@ -290,6 +293,18 @@ fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
                 vec![q(5.0, -4.0), q(9.0, 0.0), q(5.0, 4.0)],
                 s,
             ));
+        }
+        Icon::Headset => {
+            p.rect_stroke(
+                egui::Rect::from_center_size(c, vec2(20.0, 13.0)),
+                4.0,
+                s,
+                egui::StrokeKind::Inside,
+            );
+            p.circle_stroke(q(-4.5, 0.0), 2.5, s);
+            p.circle_stroke(q(4.5, 0.0), 2.5, s);
+            p.line_segment([q(-10.0, -3.0), q(-14.0, -5.0)], s);
+            p.line_segment([q(10.0, -3.0), q(14.0, -5.0)], s);
         }
     }
 }
@@ -677,6 +692,13 @@ impl DeviceCenterApp {
                     self.management_page(ui);
                 } else if self.center_ui.page == Page::TerminalSessions {
                     self.terminal_sessions_page(ui);
+                } else if self.center_ui.page == Page::MrDevices {
+                    // The MR page only exists on Linux; the nav entry above is
+                    // hidden elsewhere, so this branch stays empty there.
+                    #[cfg(target_os = "linux")]
+                    self.mr_devices_page(ui);
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = ui;
                 } else if matches!(self.center_ui.page, Page::Assist | Page::Favorites) {
                     self.assist_page(ui, self.center_ui.page == Page::Favorites);
                 } else {
@@ -795,6 +817,20 @@ impl DeviceCenterApp {
                 ) {
                     self.center_ui.page = Page::Favorites;
                     self.request_assist_refresh();
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("头显与 MR").small().color(MUTED));
+                    if nav_item(
+                        ui,
+                        Icon::Headset,
+                        "MR 设备",
+                        None,
+                        self.center_ui.page == Page::MrDevices,
+                    ) {
+                        self.center_ui.page = Page::MrDevices;
+                    }
                 }
                 ui.add_space(14.0);
                 ui.separator();
