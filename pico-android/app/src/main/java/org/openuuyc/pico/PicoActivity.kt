@@ -16,7 +16,6 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.HorizontalScrollView
 import android.widget.ScrollView
 import android.widget.TextView
 import com.google.zxing.BarcodeFormat
@@ -564,13 +563,19 @@ open class PicoActivity : Activity() {
             gravity = android.view.Gravity.CENTER_VERTICAL
             setPadding(dp(16), dp(8), dp(16), dp(8)); setBackgroundColor(PicoTheme.SIDEBAR)
         }
-        toolbar.addView(Button(this).apply {
+        val deviceButton=Button(this).apply {
             text="$alias ▾";textSize=16f;isAllCaps=false;setTextColor(PicoTheme.TEXT)
             maxLines=1;ellipsize=android.text.TextUtils.TruncateAt.END
+            minimumWidth=0
             setOnClickListener {openPanelDeviceMenu(this)}
-        },LinearLayout.LayoutParams(minOf(dp(220),resources.displayMetrics.widthPixels/3),dp(44)))
-        val controls=LinearLayout(this).apply {gravity=android.view.Gravity.CENTER_VERTICAL}
-        toolbar.addView(HorizontalScrollView(this).apply {isHorizontalScrollBarEnabled=false;addView(controls)},LinearLayout.LayoutParams(0,-2,1f))
+        }
+        toolbar.addView(deviceButton,LinearLayout.LayoutParams(dp(120),dp(44)))
+        toolbar.addOnLayoutChangeListener { _,left,_,right,_,_,_,_,_ ->
+            val width=minOf(dp(220),(right-left-toolbar.paddingLeft-toolbar.paddingRight).coerceAtLeast(0)/3)
+            if(deviceButton.layoutParams.width!=width) {deviceButton.layoutParams=deviceButton.layoutParams.apply {this.width=width}}
+        }
+        val controls=PicoPanelActions(this)
+        toolbar.addView(controls,LinearLayout.LayoutParams(0,dp(44),1f))
         toolbar.addView(Button(this).apply {
             text = "断开"; setTextColor(PicoTheme.TEXT)
             setOnClickListener { panelVideo?.releasePointer(); stopSession(); finish() }
@@ -579,6 +584,8 @@ open class PicoActivity : Activity() {
         status = TextView(this).apply {
             text = "正在建立连接…"; textSize = 13f; setTextColor(PicoTheme.MUTED)
             setPadding(dp(16), dp(8), dp(16), dp(8))
+            maxLines=4;ellipsize=android.text.TextUtils.TruncateAt.END
+            visibility=android.view.View.GONE
         }
         root.addView(status)
         try {
@@ -596,8 +603,12 @@ open class PicoActivity : Activity() {
                 if (text && smartIme && android.os.SystemClock.elapsedRealtime() - lastRemoteTap < 1500 && !isDestroyed) keyboard.show()
             } }
             fun action(label: String, run: () -> Unit): Button {
-                val button=Button(this).apply { text=label;setTextColor(PicoTheme.TEXT);setOnClickListener { run() } }
-                controls.addView(button,LinearLayout.LayoutParams(dp(84),dp(44)))
+                val button=Button(this).apply {
+                    text=label;setTextColor(PicoTheme.TEXT);isAllCaps=false
+                    maxLines=1;ellipsize=android.text.TextUtils.TruncateAt.END
+                    setOnClickListener { run() }
+                }
+                controls.addAction(button,dp(100),dp(44))
                 return button
             }
             lateinit var screenButton: Button
@@ -635,7 +646,13 @@ open class PicoActivity : Activity() {
                     }
                 }
             }
-            controls.addView(inputMode, LinearLayout.LayoutParams(dp(100), dp(44)))
+            controls.addAction(inputMode,dp(100),dp(44))
+            lateinit var logButton: Button
+            logButton=action("日志：关") {
+                val enabled=status.visibility!=android.view.View.VISIBLE
+                status.visibility=if(enabled) android.view.View.VISIBLE else android.view.View.GONE
+                logButton.text=if(enabled) "日志：开" else "日志：关"
+            }
             root.addView(keyboard, LinearLayout.LayoutParams(1, 1))
             val display = PicoPanelVideoView(this,
                 { surface -> if (running.get()) direct.attachMainSurface(surface) },

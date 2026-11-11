@@ -104,7 +104,6 @@ internal class PicoPanelVideoView(
     }
     fun showStatus(text: String) {
         if (text.contains("第一帧")) hint.visibility = GONE
-        else if (hint.visibility != GONE && !text.startsWith("媒体诊断")) hint.text = "等待远端画面\n$text"
     }
     fun setVideoSize(width: Int, height: Int) {
         if (width <= 0 || height <= 0 || (width == videoWidth && height == videoHeight)) return
