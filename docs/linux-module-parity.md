@@ -93,6 +93,24 @@ scrcpy 参数依据：
 https://github.com/Genymobile/scrcpy/blob/master/doc/connection.md
 https://github.com/Genymobile/scrcpy/blob/master/doc/control.md
 
+## 窗口级取流（waypipe 风格）
+
+Linux 被控（Xorg）新增 `capture/x11_window.rs`：用 XComposite
+`NameWindowPixmap` 按窗口读取客户区缓冲（MIT-SHM `GetImage`，失败退普通
+GetImage），窗口作为普通 `Screen` 条目（identity `x11-window/<XID>`）注入
+`Inventory::read` 的屏幕目录，于是按屏视频轨、切屏菜单与 PICO 空间窗口
+零协议改动即可选择应用窗口。窗口缩放后 X 更换 backing pixmap，采集按
+`SourceGone` 同级的失败重命名一次再抓；窗口关闭走既有"源已消失"恢复路径。
+
+输入注入：`engine_linux::absolute` 对窗口源优先用采集循环缓存的实时窗口
+矩形（每帧更新），目录快照只作兜底；Wayland 上合成器布局不含窗口，
+`logical` 为空自然落到 X 矩形分支。
+
+边界：Wayland 无免授权窗口抓取协议，不支持；依赖显示目标的 RPC（分辨率/
+DPI/拓扑）对窗口源明确报错；目录最多 16 个窗口（输入几何上限 32 块屏）。
+单元测试覆盖 identity 解析与上限约束；实机枚举/抓取测试标记 ignore，
+尚未在真实 Xorg 会话验收。
+
 ### 应用列表空白的实机修复
 
 2026-10-30：将当前已授权、非访客设备的只读应用目录与终端执行权限分离。

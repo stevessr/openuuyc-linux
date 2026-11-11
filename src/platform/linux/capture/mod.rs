@@ -21,12 +21,36 @@ mod pipewire;
 mod portal;
 mod wlr_screencopy;
 mod x11;
+mod x11_window;
 
 use anyhow::{Context, Result, bail, ensure};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(crate) use crate::media::capture::{Screen, SourceGone};
+
+/// 窗口级源（waypipe 风格）的 identity 前缀；一个应用窗口就是一块"屏幕"。
+pub(crate) const WINDOW_IDENTITY_PREFIX: &str = "x11-window/";
+
+/// 当前可见的应用窗口，按协议目录的屏幕形态列出。只在实际能免授权抓取的
+/// 会话（X11）返回条目；其他会话返回空或错误，由调用方决定是否展示。
+pub(crate) fn window_screens() -> Result<Vec<Screen>> {
+    x11_window::screens()
+}
+
+/// 一个窗口源当前在桌面上的矩形（left, top, width, height），供输入注入
+/// 换算用。窗口随采集循环每帧更新，比目录里的快照新。非窗口 ID 返回 None。
+pub(crate) fn window_rect(id: i32) -> Option<(i32, i32, u32, u32)> {
+    x11_window::live_rect(id)
+}
+
+/// 窗口源是否是这个 identity。
+pub(crate) fn is_window_source(screen: &Screen) -> bool {
+    screen
+        .identity
+        .as_deref()
+        .is_some_and(x11_window::is_window_identity)
+}
 
 /// An X11 capture has no GPU device. The one value stands for the CPU path
 /// that capture and the software encoder share, so the loop's "same device,
@@ -217,6 +241,10 @@ pub(crate) fn wayland_session() -> bool {
 
 /// The same physical output as `selected`, as it is now.
 pub(crate) fn refresh(selected: &Screen) -> Result<Screen> {
+    if is_window_source(selected) {
+        // 窗口不在输出拓扑里：直接按它的窗口 ID 查实时几何与标题。
+        return x11_window::refresh(selected);
+    }
     let mut found = screens()?
         .into_iter()
         .find(|screen| screen.identity == selected.identity)
@@ -231,6 +259,7 @@ enum Kind {
     X11,
     Wlr,
     Portal,
+    Window,
 }
 impl Kind {
     fn label(self) -> &'static str {
@@ -239,6 +268,7 @@ impl Kind {
             Self::X11 => "X11",
             Self::Wlr => "wlr-screencopy",
             Self::Portal => "XDG 门户",
+            Self::Window => "X11 窗口",
         }
     }
 }
@@ -302,6 +332,7 @@ enum Backend {
     X11(x11::Grab),
     Wlr(wlr_screencopy::Grab),
     Portal(portal::Grab),
+    Window(x11_window::Grab),
 }
 impl Backend {
     /// `size` is the frame size for backends that scale while capturing.
@@ -311,6 +342,7 @@ impl Backend {
             Kind::X11 => Self::X11(x11::Grab::open(screen)?),
             Kind::Wlr => Self::Wlr(wlr_screencopy::Grab::open(screen, cursor)?),
             Kind::Portal => Self::Portal(portal::Grab::open(screen, cursor)?),
+            Kind::Window => Self::Window(x11_window::Grab::open(screen)?),
         })
     }
     fn kind(&self) -> Kind {
@@ -319,10 +351,15 @@ impl Backend {
             Self::X11(_) => Kind::X11,
             Self::Wlr(_) => Kind::Wlr,
             Self::Portal(_) => Kind::Portal,
+            Self::Window(_) => Kind::Window,
         }
     }
     /// Open the first capture method that works for `screen`.
     fn select(screen: &Screen, cursor: bool, size: (u32, u32)) -> Result<Self> {
+        // 窗口源不走整屏候选链：它只有一个后端，成败都一目了然。
+        if is_window_source(screen) {
+            return Self::open(Kind::Window, screen, cursor, size);
+        }
         let mut failures = Vec::new();
         for kind in candidates()? {
             match Self::open(kind, screen, cursor, size) {
@@ -348,6 +385,7 @@ impl Backend {
             Self::X11(grab) => grab.name(),
             Self::Wlr(grab) => grab.name(),
             Self::Portal(grab) => grab.name(),
+            Self::Window(grab) => grab.name(),
         }
     }
 }
@@ -506,6 +544,29 @@ impl Desktop {
                 let size = output(self.screen.width, self.screen.height, quality, maximum);
                 let image = scale(grab.pixels(), (self.screen.width, self.screen.height), size);
                 // X11 cannot say whether anything changed; compare.
+                if self.last_size != size
+                    || self
+                        .last
+                        .as_deref()
+                        .is_none_or(|last| last.as_slice() != image.as_slice())
+                {
+                    break Ok(Some((size, image)));
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break Ok(None);
+                }
+                std::thread::sleep((deadline - now).min(Duration::from_millis(8)));
+            },
+            // 窗口缓冲以它自己的实际尺寸为准：窗口缩放后不用等目录刷新，
+            // 下一帧就跟随新比例。
+            Backend::Window(grab) => loop {
+                let grabbed = match grab.grab(cursor) {
+                    Ok(size) => size,
+                    Err(error) => break Err(error),
+                };
+                let size = output(grabbed.0, grabbed.1, quality, maximum);
+                let image = scale(grab.pixels(), grabbed, size);
                 if self.last_size != size
                     || self
                         .last
@@ -883,6 +944,34 @@ mod session_tests {
         let started = std::time::Instant::now();
         let (mut frames, mut size) = (0, None);
         while started.elapsed() < std::time::Duration::from_secs(4) {
+            if let Some(frame) = desktop.next(50, 4, false, false, (3840, 2160)).unwrap() {
+                frames += 1;
+                size = Some((frame.width, frame.height));
+            }
+        }
+        println!("frames: {frames} size: {size:?}");
+        assert!(frames > 0);
+    }
+
+    /// Needs an Xorg session with a mapped window (Xvfb also works):
+    /// `cargo test --lib session_tests::captures_window_frames -- --ignored --nocapture`.
+    /// 走通目录注入 → Backend::Window → 抓取/缩放/去重 → 秒级 refresh 的整条管线。
+    #[test]
+    #[ignore]
+    fn captures_window_frames() {
+        let windows = super::window_screens().expect("window sources");
+        assert!(!windows.is_empty(), "no window sources listed");
+        let mut desktop = super::Desktop::open_selected(&windows[0]).unwrap();
+        println!(
+            "backend: {} · {} ({}x{})",
+            desktop.backend_name(),
+            desktop.screen.display_name,
+            desktop.screen.width,
+            desktop.screen.height
+        );
+        let started = std::time::Instant::now();
+        let (mut frames, mut size) = (0, None);
+        while started.elapsed() < std::time::Duration::from_secs(2) {
             if let Some(frame) = desktop.next(50, 4, false, false, (3840, 2160)).unwrap() {
                 frames += 1;
                 size = Some((frame.width, frame.height));

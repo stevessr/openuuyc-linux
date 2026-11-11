@@ -536,6 +536,19 @@ impl Engine {
             return result;
         }
         self.aimed = false;
+        // 窗口级源（waypipe 风格）不在合成器布局里，且目录矩形可能落后于
+        // 窗口的实际位置；注入前按采集循环缓存的实时几何换算。
+        let rect = match crate::platform::capture::window_rect(id) {
+            Some((left, top, width, height)) => Ok(super::geometry::Rect {
+                left,
+                top,
+                right: left
+                    + i32::try_from(width).map_err(|_| anyhow::anyhow!("窗口宽度无效"))?,
+                bottom: top
+                    + i32::try_from(height).map_err(|_| anyhow::anyhow!("窗口高度无效"))?,
+            }),
+            None => rect,
+        };
         let (px, py) = point_in(rect?, x, y);
         self.injector.move_to(px, py)
     }

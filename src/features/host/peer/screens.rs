@@ -39,10 +39,25 @@ impl Inventory {
         #[cfg(windows)]
         let screens = capture::screens()?;
         #[cfg(not(windows))]
-        let screens = match capture::screens() {
-            Ok(screens) => screens,
-            Err(_) if targets.iter().all(|t| !t.active) => Vec::new(),
-            Err(error) => return Err(error),
+        let screens = {
+            let mut screens = match capture::screens() {
+                Ok(screens) => screens,
+                Err(_) if targets.iter().all(|t| !t.active) => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            // Waypipe 风格的窗口级源（X11）：应用窗口作为可选"屏幕"与显示器
+            // 并列。枚举失败不算目录失败——窗口源只是缺席，不是不可用。
+            match capture::window_screens() {
+                Ok(windows) => {
+                    // 输入几何与协议目录都把清单限制在 32 块屏内。
+                    let room = 32usize.saturating_sub(screens.len());
+                    screens.extend(windows.into_iter().take(room));
+                }
+                Err(error) => {
+                    tracing::debug!(error = %format!("{error:#}"), "window sources unavailable")
+                }
+            }
+            screens
         };
         Ok(Self {
             targets,

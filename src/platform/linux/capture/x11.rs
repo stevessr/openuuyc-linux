@@ -14,7 +14,7 @@ use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, Window};
 use x11rb::rust_connection::RustConnection;
 
 /// A shared-memory segment the X server writes captured pixels into.
-struct Segment {
+pub(super) struct Segment {
     id: u32,
     address: *mut u8,
     size: usize,
@@ -24,7 +24,7 @@ struct Segment {
 unsafe impl Send for Segment {}
 
 impl Segment {
-    fn new(connection: &RustConnection, size: usize) -> Result<Self> {
+    pub(super) fn new(connection: &RustConnection, size: usize) -> Result<Self> {
         // SAFETY: plain SysV shared memory calls; every failure is checked and
         // the segment is marked for removal as soon as the server holds it, so
         // it cannot outlive this process.
@@ -52,16 +52,26 @@ impl Segment {
         })
     }
 
-    fn pixels(&self) -> &[u8] {
+    pub(super) fn pixels(&self) -> &[u8] {
         // SAFETY: the mapping stays valid until drop, and it is only read after
         // the server has answered the request that filled it.
         unsafe { std::slice::from_raw_parts(self.address, self.size) }
     }
 
-    fn pixels_mut(&mut self) -> &mut [u8] {
+    pub(super) fn pixels_mut(&mut self) -> &mut [u8] {
         // SAFETY: as above; the server writes only while a request is pending,
         // and the cursor is drawn after the reply.
         unsafe { std::slice::from_raw_parts_mut(self.address, self.size) }
+    }
+
+    /// The X resource ID to attach as a SHM segment.
+    pub(super) fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// The byte capacity the segment was allocated with.
+    pub(super) fn capacity(&self) -> usize {
+        self.size
     }
 }
 
