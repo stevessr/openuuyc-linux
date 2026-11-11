@@ -5,6 +5,20 @@ import android.graphics.RectF
 
 internal object PicoKeyboardCanvas {
     fun draw(c: Canvas,mode: PicoKeyboardMode,keys: PicoKeyboardKeys,u: Float,v: Float,voiceActive: Boolean=false) {
+        // This Surface is shared with the XR menus. Repaint the entire frame:
+        // translucent keys must never blend with a previous menu or hover frame.
+        val height=PicoKeyboardLayout.height(mode)
+        PicoXrMaterial.panel(c,1200f,height)
+        val title=when(mode) {
+            PicoKeyboardMode.FULL->"全键盘 · 104 键"
+            PicoKeyboardMode.CUSTOM->"自定义键盘"
+            PicoKeyboardMode.SYSTEM->"系统键盘"
+            PicoKeyboardMode.VOICE->"语音输入"
+        }
+        PicoXrMaterial.label(c,title,20f,32f,1160f,22f,medium=true)
+        if(mode==PicoKeyboardMode.FULL || mode==PicoKeyboardMode.CUSTOM) {
+            PicoXrMaterial.label(c,"点按输入 · Ctrl / Shift / Alt / Win 点按锁定，再点释放",25f,height-18f,1150f,18f,muted=true)
+        }
         val p=Paint(Paint.ANTI_ALIAS_FLAG).apply {textSize=25f}
         val header=PicoKeyboardLayout.headerAt(mode,u,v)
         listOf(Triple("输入方式 ›",7f,383f),Triple("Codex 语音 · F8",393f,953f),Triple("返回",967f,1193f)).forEachIndexed {i,(label,left,right) ->

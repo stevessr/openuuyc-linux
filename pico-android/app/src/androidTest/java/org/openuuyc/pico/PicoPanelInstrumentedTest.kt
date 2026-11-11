@@ -102,9 +102,24 @@ class PicoPanelInstrumentation : Instrumentation() {
         val state=PicoKeyboardKeys {key,down->events.add(key to down);true}
         state.pressed("RCtrl");check(state.codexVoice())
         check(events==listOf(163 to true,163 to false,119 to true,119 to false))
+        // Keyboard rendering owns the whole frame, including clearing menu
+        // pixels and resetting alpha before every hover/press redraw.
+        for(keyboardMode in PicoKeyboardMode.entries) {
+            val height=PicoKeyboardLayout.height(keyboardMode).toInt()
+            val fresh=Bitmap.createBitmap(1200,height,Bitmap.Config.ARGB_8888)
+            val reused=Bitmap.createBitmap(1200,height,Bitmap.Config.ARGB_8888)
+            try {
+                val clean=Canvas(fresh);val dirty=Canvas(reused)
+                dirty.drawColor(android.graphics.Color.MAGENTA)
+                PicoKeyboardCanvas.draw(clean,keyboardMode,state,.5f,70f/height)
+                PicoKeyboardCanvas.draw(dirty,keyboardMode,state,.5f,70f/height)
+                check(fresh.sameAs(reused)) {"Previous menu leaked through $keyboardMode keyboard"}
+                PicoKeyboardCanvas.draw(dirty,keyboardMode,state,.5f,70f/height)
+                check(fresh.sameAs(reused)) {"Repeated $keyboardMode redraw accumulated translucent pixels"}
+            } finally {fresh.recycle();reused.recycle()}
+        }
         val bitmap=Bitmap.createBitmap(1200,480,Bitmap.Config.ARGB_8888)
-        val canvas=Canvas(bitmap);PicoXrMaterial.panel(canvas,1200f,480f)
-        PicoKeyboardCanvas.draw(canvas,mode,state,.5f,70f/480)
+        PicoKeyboardCanvas.draw(Canvas(bitmap),mode,state,.5f,70f/480)
         val file=File(targetContext.cacheDir,"physical-keyboard-preview.png")
         file.outputStream().use {check(bitmap.compress(Bitmap.CompressFormat.PNG,100,it))};bitmap.recycle()
         sendStatus(0,Bundle().apply {putString("stream","104-key layout rendered; hit geometry, right modifier release and Codex F8 mapping passed; no remote keys or audio sent.\n")})
