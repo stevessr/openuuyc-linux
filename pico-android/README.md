@@ -6,6 +6,8 @@
 
 PICO 在本机进行 UU 登录，获取设备列表和加入房间；**不需要运行 Linux OpenUUYC、不经过本机 WebSocket 桥接、无需 ADB reverse**。Android 和 PICO 头显本身通过 UU Socket.IO WebRTC 向被控主机连接。
 
+Linux 被控端的窗口级取流（waypipe 风格）把应用窗口作为普通屏幕源推给同一套按屏视频轨管线：沉浸式屏幕子菜单里应用窗口与显示器并列，PICO 侧零协议改动；窗口尺寸/位置解析在 Linux 侧完成（X11 用 XComposite，Wayland 用 ext_image_copy_capture 顶层源 + niri IPC 定位）。
+
 请注意：这里是 *协议实现开发版*，编译通过不代表已经与真实 UU Windows/Linux 主机完成互操作测试。
 
 ## 使用

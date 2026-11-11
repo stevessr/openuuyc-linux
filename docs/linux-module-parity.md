@@ -112,13 +112,28 @@ GetImage），窗口作为普通 `Screen` 条目（identity `x11-window/<XID>`�
 `SourceGone` 同级的失败重命名一次再抓；窗口关闭走既有"源已消失"恢复路径。
 
 输入注入：`engine_linux::absolute` 对窗口源优先用采集循环缓存的实时窗口
-矩形（每帧更新），目录快照只作兜底；Wayland 上合成器布局不含窗口，
-`logical` 为空自然落到 X 矩形分支。
+矩形（每帧更新），目录快照只作兜底；X11 的矩形在 X 像素空间，Wayland 的
+在合成器逻辑空间，各走各的注入路径。
 
-边界：Wayland 无免授权窗口抓取协议，不支持；依赖显示目标的 RPC（分辨率/
-DPI/拓扑）对窗口源明确报错；目录最多 16 个窗口（输入几何上限 32 块屏）。
-单元测试覆盖 identity 解析与上限约束；实机枚举/抓取测试标记 ignore，
-尚未在真实 Xorg 会话验收。
+## 窗口级取流（Wayland）
+
+Wayland 侧新增 `capture/wlr_window.rs`：绑定 `ext_foreign_toplevel_list_v1`
+枚举顶层窗口，`ext_foreign_toplevel_image_capture_source_manager_v1` 加
+`ext_image_copy_capture_v1` 按顶层源建会话取帧（SHM 缓冲，合成器有 damage
+才推帧；`paint_cursors` 按光标偏好随会话建立）。窗口缩放后合成器重新宣布
+buffer_size，采集按新尺寸重配缓冲；窗口关闭走 session `stopped` →
+`SourceGone` 的既有恢复路径。窗口作为普通 `Screen` 条目（identity
+`wl-window/<identifier>`）注入同一份屏幕目录，主控与 PICO 零协议改动。
+
+niri 会话上的输入定位：`niri msg --json windows/workspaces` 给出窗口在其
+工作区视图内的逻辑位置与所在输出，输出原点来自 xdg-output 布局；窗口按
+app_id + 标题匹配（同名窗口取第一个）。捕获缓冲是物理像素，IPC 是逻辑
+像素，150% 缩放会话里两者不相等，位置一律用 IPC 的逻辑值。其他合成器
+没有实测过的 IPC 不接：能枚举能看，输入注入明确报错而非投错位置。
+
+边界：预乘 ARGB 不反预乘（半透明窗口边缘偏深）；会话探测用的窗口尺寸
+缓存按 identifier 记录，目录刷新只探新窗口。实机（niri 26.04）验证：
+枚举 9 个窗口标题正确、抓帧 2066x1558、探尺寸到帧 0.3 秒内完成。
 
 ### 应用列表空白的实机修复
 

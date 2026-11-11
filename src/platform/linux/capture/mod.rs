@@ -20,6 +20,7 @@ mod nvfbc;
 mod pipewire;
 mod portal;
 mod wlr_screencopy;
+mod wlr_window;
 mod x11;
 mod x11_window;
 
@@ -29,27 +30,39 @@ use std::time::{Duration, Instant};
 
 pub(crate) use crate::media::capture::{Screen, SourceGone};
 
-/// 窗口级源（waypipe 风格）的 identity 前缀；一个应用窗口就是一块"屏幕"。
+/// 窗口级源（waypipe 风格）的 identity 前缀：一个应用窗口就是一块"屏幕"。
+/// X11 走 XComposite，Wayland 走 ext_image_copy_capture 的顶层源。
 pub(crate) const WINDOW_IDENTITY_PREFIX: &str = "x11-window/";
+pub(crate) const WL_WINDOW_PREFIX: &str = "wl-window/";
 
 /// 当前可见的应用窗口，按协议目录的屏幕形态列出。只在实际能免授权抓取的
-/// 会话（X11）返回条目；其他会话返回空或错误，由调用方决定是否展示。
+/// 会话（X11 的 XComposite、Wayland 的 ext_image_copy_capture）返回条目；
+/// 其他会话返回空或错误，由调用方决定是否展示。
 pub(crate) fn window_screens() -> Result<Vec<Screen>> {
-    x11_window::screens()
+    if wayland_session() {
+        wlr_window::screens()
+    } else {
+        x11_window::screens()
+    }
 }
 
 /// 一个窗口源当前在桌面上的矩形（left, top, width, height），供输入注入
-/// 换算用。窗口随采集循环每帧更新，比目录里的快照新。非窗口 ID 返回 None。
+/// 换算用。X11 的矩形在 X 像素空间，Wayland 的在合成器逻辑空间，各走各的
+/// 注入路径。窗口随采集循环每帧更新，比目录里的快照新。非窗口 ID 返回 None。
 pub(crate) fn window_rect(id: i32) -> Option<(i32, i32, u32, u32)> {
-    x11_window::live_rect(id)
+    x11_window::live_rect(id).or_else(|| wlr_window::live_rect(id))
 }
 
-/// 窗口源是否是这个 identity。
+/// 输入注入按 id 找不到窗口矩形时，用它区分"窗口源暂时无法定位"与普通屏幕。
+pub(crate) fn is_window_target(id: i32) -> bool {
+    x11_window::knows(id) || wlr_window::knows(id)
+}
+
+/// 窗口源是否是这个 identity（两种前缀都算）。
 pub(crate) fn is_window_source(screen: &Screen) -> bool {
-    screen
-        .identity
-        .as_deref()
-        .is_some_and(x11_window::is_window_identity)
+    screen.identity.as_deref().is_some_and(|identity| {
+        identity.starts_with(WINDOW_IDENTITY_PREFIX) || identity.starts_with(WL_WINDOW_PREFIX)
+    })
 }
 
 /// An X11 capture has no GPU device. The one value stands for the CPU path
@@ -241,9 +254,14 @@ pub(crate) fn wayland_session() -> bool {
 
 /// The same physical output as `selected`, as it is now.
 pub(crate) fn refresh(selected: &Screen) -> Result<Screen> {
-    if is_window_source(selected) {
+    if let Some(identity) = selected.identity.as_deref() {
         // 窗口不在输出拓扑里：直接按它的窗口 ID 查实时几何与标题。
-        return x11_window::refresh(selected);
+        if identity.starts_with(WL_WINDOW_PREFIX) {
+            return wlr_window::refresh(selected);
+        }
+        if identity.starts_with(WINDOW_IDENTITY_PREFIX) {
+            return x11_window::refresh(selected);
+        }
     }
     let mut found = screens()?
         .into_iter()
@@ -332,7 +350,53 @@ enum Backend {
     X11(x11::Grab),
     Wlr(wlr_screencopy::Grab),
     Portal(portal::Grab),
-    Window(x11_window::Grab),
+    Window(WindowGrab),
+}
+
+/// 窗口采集的统一接口：X11 是拉取式（每次抓一张再比较），Wayland 是推送式
+/// （合成器有 damage 才给帧）。`next` 对两种都返回"有新画面时的缓冲尺寸"，
+/// 超时无新画面返回 None。
+enum WindowGrab {
+    X11(x11_window::Grab),
+    Wl(wlr_window::Grab),
+}
+impl WindowGrab {
+    fn open(screen: &Screen, cursor: bool) -> Result<Self> {
+        if screen
+            .identity
+            .as_deref()
+            .is_some_and(|identity| identity.starts_with(WL_WINDOW_PREFIX))
+        {
+            Ok(Self::Wl(wlr_window::Grab::open(screen, cursor)?))
+        } else {
+            Ok(Self::X11(x11_window::Grab::open(screen)?))
+        }
+    }
+    fn name(&self) -> &'static str {
+        match self {
+            Self::X11(grab) => grab.name(),
+            Self::Wl(grab) => grab.name(),
+        }
+    }
+    fn cursor(&self) -> bool {
+        match self {
+            Self::X11(_) => false,
+            Self::Wl(grab) => grab.cursor(),
+        }
+    }
+    fn pixels(&self) -> &[u8] {
+        match self {
+            Self::X11(grab) => grab.pixels(),
+            Self::Wl(grab) => grab.pixels(),
+        }
+    }
+    /// 一次取帧：有新画面返回 Some(缓冲尺寸)，超时无新画面返回 None。
+    fn next(&mut self, cursor: bool, timeout: Duration) -> Result<Option<(u32, u32)>> {
+        match self {
+            Self::X11(grab) => grab.next(cursor, timeout),
+            Self::Wl(grab) => grab.next(cursor, timeout),
+        }
+    }
 }
 impl Backend {
     /// `size` is the frame size for backends that scale while capturing.
@@ -342,7 +406,7 @@ impl Backend {
             Kind::X11 => Self::X11(x11::Grab::open(screen)?),
             Kind::Wlr => Self::Wlr(wlr_screencopy::Grab::open(screen, cursor)?),
             Kind::Portal => Self::Portal(portal::Grab::open(screen, cursor)?),
-            Kind::Window => Self::Window(x11_window::Grab::open(screen)?),
+            Kind::Window => Self::Window(WindowGrab::open(screen, cursor)?),
         })
     }
     fn kind(&self) -> Kind {
@@ -559,28 +623,24 @@ impl Desktop {
                 std::thread::sleep((deadline - now).min(Duration::from_millis(8)));
             },
             // 窗口缓冲以它自己的实际尺寸为准：窗口缩放后不用等目录刷新，
-            // 下一帧就跟随新比例。
-            Backend::Window(grab) => loop {
-                let grabbed = match grab.grab(cursor) {
-                    Ok(size) => size,
-                    Err(error) => break Err(error),
+            // 下一帧就跟随新比例。X11 拉取、Wayland 推送，统一成"有新画面才返回"。
+            Backend::Window(grab) => {
+                if grab.cursor() != cursor {
+                    self.backend = Backend::Window(WindowGrab::open(&self.screen, cursor)?);
+                    self.last = None;
+                    return Ok(None);
+                }
+                let grabbed = match grab
+                    .next(cursor, deadline.saturating_duration_since(Instant::now()))?
+                {
+                    Some(size) => size,
+                    // 超时没有新画面：这一轮就不出帧。
+                    None => return Ok(None),
                 };
                 let size = output(grabbed.0, grabbed.1, quality, maximum);
                 let image = scale(grab.pixels(), grabbed, size);
-                if self.last_size != size
-                    || self
-                        .last
-                        .as_deref()
-                        .is_none_or(|last| last.as_slice() != image.as_slice())
-                {
-                    break Ok(Some((size, image)));
-                }
-                let now = Instant::now();
-                if now >= deadline {
-                    break Ok(None);
-                }
-                std::thread::sleep((deadline - now).min(Duration::from_millis(8)));
-            },
+                Ok(Some((size, image)))
+            }
             // The compositor answers a copy request only when it next draws,
             // so a still desktop reports no picture.
             Backend::Wlr(grab) => grab

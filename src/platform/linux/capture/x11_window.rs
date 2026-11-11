@@ -11,6 +11,7 @@ use super::{Screen, SourceGone, WINDOW_IDENTITY_PREFIX};
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::composite::{self, ConnectionExt as _};
 use x11rb::protocol::shm::ConnectionExt as _;
@@ -39,9 +40,6 @@ pub(crate) struct WindowInfo {
 
 pub(crate) fn identity(xid: u32) -> String {
     format!("{WINDOW_IDENTITY_PREFIX}{xid}")
-}
-pub(crate) fn is_window_identity(identity: &str) -> bool {
-    identity.starts_with(WINDOW_IDENTITY_PREFIX)
 }
 fn parse_xid(identity: &str) -> Result<u32> {
     identity
@@ -285,6 +283,11 @@ pub(crate) fn refresh(selected: &Screen) -> Result<Screen> {
     })
 }
 
+/// 输入注入按 id 找窗口时用它判断这是不是窗口源。
+pub(crate) fn knows(id: i32) -> bool {
+    lock(reverse()).contains_key(&id)
+}
+
 /// 窗口源当前在桌面上的矩形（输入注入换算用）；非窗口 ID 返回 None。
 pub(crate) fn live_rect(id: i32) -> Option<(i32, i32, u32, u32)> {
     let xid = *lock(reverse()).get(&id)?;
@@ -314,6 +317,8 @@ pub(crate) struct Grab {
     length: usize,
     cursor_available: bool,
     xid: u32,
+    /// 上一次抓到的画面（原始尺寸 + 像素），静止窗口去重用。
+    last: Option<(u32, u32, Vec<u8>)>,
 }
 
 impl Grab {
@@ -356,6 +361,7 @@ impl Grab {
             length: 0,
             cursor_available,
             xid,
+            last: None,
         };
         grab.name_pixmap().context("读取窗口缓冲失败")?;
         Ok(grab)
@@ -363,6 +369,33 @@ impl Grab {
 
     pub(crate) fn name(&self) -> &'static str {
         "X11 窗口"
+    }
+
+    /// 拉取式抓取：每次抓一张并与上一次比较，静止窗口等到变化或超时。
+    /// 返回 Some(缓冲尺寸) 表示有新画面。
+    pub(crate) fn next(&mut self, cursor: bool, timeout: Duration) -> Result<Option<(u32, u32)>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (width, height) = self.grab(cursor)?;
+            let image = self.pixels().to_vec();
+            let changed = self
+                .last
+                .as_ref()
+                .is_none_or(|(last_width, last_height, last)| {
+                    *last_width != width
+                        || *last_height != height
+                        || last.as_slice() != image.as_slice()
+                });
+            if changed {
+                self.last = Some((width, height, image));
+                return Ok(Some((width, height)));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(8)));
+        }
     }
 
     /// 让 `pixmap` 指向窗口当前的 backing pixmap。
@@ -530,8 +563,8 @@ mod tests {
 
     #[test]
     fn identity_roundtrip_and_prefix() {
-        assert!(is_window_identity(&identity(0x1a2b3c)));
-        assert!(!is_window_identity("x11/eDP-1"));
+        assert!(identity(0x1a2b3c).starts_with(WINDOW_IDENTITY_PREFIX));
+        assert!(!identity(0x1a2b3c).starts_with("x11/"));
         assert_eq!(parse_xid(&identity(0x1a2b3c)).unwrap(), 0x1a2b3c);
         assert!(parse_xid("x11-window/not-a-number").is_err());
         assert!(parse_xid("x11/eDP-1").is_err());
