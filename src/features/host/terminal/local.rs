@@ -650,11 +650,10 @@ pub(crate) fn open_remote_in_terminal(device_id: &str) -> Result<()> {
     crate::account::api::validate_device_id(device_id)?;
     let exe = std::env::current_exe().context("找不到 OpenUUYC 可执行文件")?;
     let (program, args) = terminal_emulator().context("找不到可用的系统终端模拟器")?;
-    let mut child = std::process::Command::new(&program)
-        .args(args)
-        .arg(exe)
-        .arg("remote-terminal")
-        .arg(device_id)
+    let mut command = std::process::Command::new(&program);
+    command.args(args);
+    command.args(remote_terminal_arguments(&exe, device_id));
+    let mut child = command
         .spawn()
         .with_context(|| format!("启动系统终端 {program} 失败"))?;
     std::thread::Builder::new()
@@ -674,6 +673,15 @@ fn attach_arguments(exe: &std::path::Path, session: u32) -> Vec<std::ffi::OsStri
         exe.as_os_str().to_owned(),
         "terminal".into(),
         session.to_string().into(),
+    ]
+}
+
+/// 在系统终端里运行本程序的远程终端子命令。
+fn remote_terminal_arguments(exe: &std::path::Path, device_id: &str) -> Vec<std::ffi::OsString> {
+    vec![
+        exe.as_os_str().to_owned(),
+        "remote-terminal".into(),
+        device_id.into(),
     ]
 }
 
@@ -743,6 +751,23 @@ mod tests {
                 std::ffi::OsString::from("/opt/openuuyc/OpenUUYC"),
                 std::ffi::OsString::from("terminal"),
                 std::ffi::OsString::from("7"),
+            ]
+        );
+    }
+
+    /// 远程终端命令也重新运行当前可执行文件，参数与 CLI 的形状一致。
+    #[test]
+    fn the_remote_terminal_command_reruns_this_binary() {
+        let arguments = remote_terminal_arguments(
+            std::path::Path::new("/opt/openuuyc/OpenUUYC"),
+            "test-device-id"
+        );
+        assert_eq!(
+            arguments,
+            vec![
+                std::ffi::OsString::from("/opt/openuuyc/OpenUUYC"),
+                std::ffi::OsString::from("remote-terminal"),
+                std::ffi::OsString::from("test-device-id"),
             ]
         );
     }
