@@ -129,6 +129,18 @@ identifier，同名窗口不会认错）。IPC 给出窗口在其工作区视图
 再按新位置换算。其他合成器没有实测过的 IPC 不接：能枚举能看，输入注入
 明确报错而非投错位置。
 
+### 触摸映射（niri）
+
+niri 没有按设备配置输入（`input { touch "NAME" ... }` 会被 `niri validate`
+拒绝），`input.touch.map-to-output` 对全部触摸设备同时生效，未配置时映射到
+第一块输出。被控端在每一串触摸开始时把目标输出与当前映射对齐：不一致时写
+一份包含用户原配置的临时配置（保留 touch 的 `off` 与 `calibration-matrix`），
+只覆盖 `map-to-output`，校验后用 `niri msg action load-config-file` 加载；
+会话释放时恢复原配置，进程异常退出由看门狗恢复。窗口级源先切到可见工作区，
+再按窗口在输出里的实时矩形把触点从窗口比例换算到输出比例，原生多点也能落到
+窗口上。`OPENUUYC_NIRI_TOUCH_REMAP=0`（旧名 `OPENUUYC_NIRI_TEMP_TOUCH_MAP=0`）
+关闭临时映射，触摸退回单指指针模拟。
+
 边界：预乘 ARGB 不反预乘（半透明窗口边缘偏深）；会话探测用的窗口尺寸
 缓存按 identifier 记录，目录刷新只探新窗口。实机（niri 26.04）验证：
 枚举 9 个窗口标题正确、抓帧 2066x1558、探尺寸到帧 0.3 秒内完成。

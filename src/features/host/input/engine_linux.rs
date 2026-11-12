@@ -64,78 +64,192 @@ pub(crate) struct Engine {
 /// 一串触摸走哪条路。
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Route {
-    /// 交给虚拟多点触摸屏。带上这一串要用的旋转与屏幕宽度，免得每一帧再查一次
-    /// 屏幕——抬手指那一帧查不到屏幕也得照样发得出去。
-    Touchscreen { rotation: Rotation, width: f64 },
+    /// 交给虚拟多点触摸屏。旋转、屏幕宽度与坐标映射在选路时算好带过来，免得
+    /// 每一帧再查一次屏幕——抬手指那一帧查不到屏幕也得照样发得出去。
+    Touchscreen {
+        rotation: Rotation,
+        width: f64,
+        map: TouchMap,
+    },
     /// 退回单指指针模拟。模拟走绝对指针，落点总是对的。
     Simulated,
 }
 
-/// 这一串触摸该走哪条路。
+/// 客户端坐标（当前屏的比例）落到触摸设备铺开的那块输出上的比例。
+///
+/// 整屏是恒等映射；窗口级源只占输出的一部分，触点要按窗口在输出里的位置
+/// 平移、按窗口大小缩放，合成器才会把触点送到窗口上。
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct TouchMap {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+impl TouchMap {
+    const FULL: Self = Self {
+        left: 0.0,
+        top: 0.0,
+        width: 1.0,
+        height: 1.0,
+    };
+    fn apply(self, x: f64, y: f64) -> (f64, f64) {
+        (self.left + x * self.width, self.top + y * self.height)
+    }
+    /// 窗口矩形 (left, top, width, height) 相对输出矩形的映射。
+    fn of_window(
+        window: (i32, i32, u32, u32),
+        output: (i32, i32, u32, u32),
+    ) -> Option<Self> {
+        if output.2 == 0 || output.3 == 0 {
+            return None;
+        }
+        Some(Self {
+            left: f64::from(window.0.checked_sub(output.0)?) / f64::from(output.2),
+            top: f64::from(window.1.checked_sub(output.1)?) / f64::from(output.3),
+            width: f64::from(window.2) / f64::from(output.2),
+            height: f64::from(window.3) / f64::from(output.3),
+        })
+    }
+}
+
+/// 这一串触摸该落到哪块输出、怎么换算。
+#[derive(Debug)]
+struct TouchTarget {
+    output: String,
+    rotation: Rotation,
+    width: f64,
+    map: TouchMap,
+}
+
+fn output_rect(output: &crate::platform::CompositorOutput) -> (i32, i32, u32, u32) {
+    (output.left, output.top, output.width, output.height)
+}
+
+fn output_as_rect(output: &crate::platform::CompositorOutput) -> Rect {
+    Rect {
+        left: output.left,
+        top: output.top,
+        right: output.left.saturating_add(output.width as i32),
+        bottom: output.top.saturating_add(output.height as i32),
+    }
+}
+
+/// 这一串触摸要交给哪块输出。显示器按合成器布局里的矩形配对；窗口级源按
+/// 采集给出的实时位置配到它所在的那块输出，并把窗口内的坐标换算成输出比例。
 ///
 /// 只有「合成器必然把这块触摸屏认到目标屏上」时才敢用设备。合成器怎么给触摸屏
 /// 和输出配对各家都不一样：Hyprland 找不到绑定就用当前聚焦的显示器（触点落在哪块屏
 /// 取决于被控端此刻的焦点），mutter 按 EDID 与物理尺寸匹配、都匹配不上就归给内置屏，
 /// KWin 又是另一套。猜错就是「主控看着这块屏、点下去落在另一块屏上」，比单指模拟更
-/// 差——模拟走绝对指针，落点总是对的。所以三件事都得成立：
-///
-/// niri 将 uinput 触摸屏作为真实 `wl_touch` 事件派发，但默认映射到第一个输出；
-/// 其 `input.touch.map-to-output` 可改这个目标。读取映射后，只在当前远端屏恰好对应
-/// 该输出时才走原生触摸，否则保留绝对指针回退，避免触点落到错误显示器。
-fn route_for(
+/// 差——模拟走绝对指针，落点总是对的。所以 niri 以外的会话仍要求单屏、未旋转；
+/// niri 由调用方先把 `input.touch.map-to-output` 对准目标输出（见 `ensure_touch_mapping`）。
+fn touch_target(
     layout: Option<&CompositorLayout>,
     screens: &[Screen],
     current: i32,
-    niri_output: Option<&str>,
-) -> Result<Route, String> {
-    let Some(layout) = layout else {
-        return Err("读不到合成器的输出布局".into());
-    };
+    niri: bool,
+) -> Result<TouchTarget, String> {
+    use crate::platform::capture::WindowPlace;
+    let layout = layout.ok_or_else(|| "读不到合成器的输出布局".to_owned())?;
     let screen = screens
         .iter()
         .find(|screen| screen.id == current)
         .ok_or_else(|| format!("当前触摸屏幕 {current} 已失效"))?;
-    let is_niri = niri_output.is_some();
-    let output = if is_niri {
-        let name = niri_output
-            .map(str::to_owned)
-            .or_else(|| layout.outputs.first().and_then(|o| o.name.clone()))
-            .ok_or_else(|| "niri 没有可用输出".to_owned())?;
-        layout
-            .output(&name)
-            .ok_or_else(|| format!("niri 触摸映射输出 {name} 不存在"))?
-    } else {
-        let [output] = layout.outputs.as_slice() else {
-            return Err(format!("合成器有 {} 块屏", layout.outputs.len()));
-        };
-        if screens.len() != 1 || screen.id != screens[0].id {
-            return Err(format!("被控端有 {} 块屏", screens.len()));
+    let width = f64::from(screen.width).max(1.0);
+    if crate::platform::capture::is_window_target(current) {
+        if !niri {
+            return Err("窗口源没有可映射的合成器输出".into());
         }
-        output
+        // 窗口在别的工作区上时先露出来，和鼠标注入走同一条路。
+        let place = crate::platform::capture::window_place(current).or_else(|| {
+            if crate::platform::capture::reveal_window(current) {
+                crate::platform::capture::window_place(current)
+            } else {
+                None
+            }
+        });
+        let Some(WindowPlace::Compositor { rect, output }) = place else {
+            return Err("窗口位置未知，无法把触点落到窗口上".into());
+        };
+        let output = layout
+            .outputs
+            .iter()
+            .find(|candidate| output_rect(candidate) == output)
+            .ok_or_else(|| "窗口所在输出不在合成器布局里".to_owned())?;
+        let name = output
+            .name
+            .clone()
+            .ok_or_else(|| "窗口所在输出没有名字".to_owned())?;
+        let map = TouchMap::of_window(rect, output_rect(output))
+            .ok_or_else(|| "窗口尺寸无效".to_owned())?;
+        return Ok(TouchTarget {
+            output: name,
+            rotation: output.rotation,
+            width,
+            map,
+        });
+    }
+    if niri {
+        let logical = screen
+            .logical
+            .ok_or_else(|| "触摸屏与合成器输出未配对".to_owned())?;
+        let output = layout
+            .outputs
+            .iter()
+            .find(|output| output_as_rect(output) == logical)
+            .ok_or_else(|| "触摸屏与合成器输出未配对".to_owned())?;
+        let name = output
+            .name
+            .clone()
+            .ok_or_else(|| "触摸屏所在输出没有名字".to_owned())?;
+        return Ok(TouchTarget {
+            output: name,
+            rotation: output.rotation,
+            width,
+            map: TouchMap::FULL,
+        });
+    }
+    let [output] = layout.outputs.as_slice() else {
+        return Err(format!("合成器有 {} 块屏", layout.outputs.len()));
     };
+    // 「被控端只有一块屏」数的是显示器：目录里并列的窗口源不是输出。
+    let monitors: Vec<&Screen> = screens
+        .iter()
+        .filter(|screen| !crate::platform::capture::is_window_target(screen.id))
+        .collect();
+    if monitors.len() != 1 || screen.id != monitors[0].id {
+        return Err(format!("被控端有 {} 块屏", monitors.len()));
+    }
     let logical = screen
         .logical
         .ok_or_else(|| "触摸屏与合成器输出未配对".to_owned())?;
-    if !is_niri && output.rotation != Rotation::Normal {
+    if output.rotation != Rotation::Normal {
         return Err(format!("输出旋转为 {:?}", output.rotation));
     }
-    let rect = Rect {
-        left: output.left,
-        top: output.top,
-        right: output.left.saturating_add(output.width as i32),
-        bottom: output.top.saturating_add(output.height as i32),
-    };
-    if logical != rect {
-        return Err("niri 触摸设备映射到另一块输出".into());
+    if logical != output_as_rect(output) {
+        return Err("触摸屏与合成器输出未配对".into());
     }
-    Ok(Route::Touchscreen {
-        rotation: output.rotation,
-        width: f64::from(screen.width).max(1.0),
+    Ok(TouchTarget {
+        output: output.name.clone().unwrap_or_default(),
+        rotation: Rotation::Normal,
+        width,
+        map: TouchMap::FULL,
     })
 }
 
+/// 原配置里与触摸有关的设置。niri 没有按设备配置（`input { touch "NAME" ... }`
+/// 会被 `niri validate` 拒绝），`map-to-output` 对全部触摸设备同时生效，所以只
+/// 有一个全局值。
+#[derive(Clone, Debug, Default, PartialEq)]
+struct NiriTouch {
+    off: bool,
+    calibration: Option<Vec<String>>,
+    map_to_output: Option<String>,
+}
+
 /// Niri does not expose `input.touch.map-to-output` over IPC. Read the user's
-/// KDL include tree (read-only) so native touch is used only on its mapped output.
+/// KDL include tree (read-only) so native touch is aimed at the right output.
 fn niri_config_root() -> Option<std::path::PathBuf> {
     let socket = std::env::var_os("NIRI_SOCKET")?;
     let socket_name = std::path::Path::new(&socket).file_name()?.to_string_lossy();
@@ -150,7 +264,7 @@ fn niri_config_root() -> Option<std::path::PathBuf> {
         .split(|b| *b == 0)
         .map(|v| String::from_utf8_lossy(v).into_owned())
         .collect::<Vec<_>>();
-    let root = args
+    let configured = args
         .iter()
         .position(|a| a == "--config")
         .and_then(|i| args.get(i + 1))
@@ -170,57 +284,96 @@ fn niri_config_root() -> Option<std::path::PathBuf> {
                     .join("niri/config.kdl"),
             )
         })?;
-    Some(root)
+    // niri 的相对 --config 是相对它自己的当前目录，不是本进程的。
+    let root = if configured.is_absolute() {
+        configured
+    } else {
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()?
+            .join(configured)
+    };
+    Some(std::fs::canonicalize(&root).unwrap_or(root))
 }
 
-fn read_niri_touch_mapping(device: &str) -> Option<String> {
+fn read_niri_touch() -> Option<NiriTouch> {
     let root = niri_config_root()?;
     let mut tokens = Vec::new();
     expand_niri_config(&root, &mut std::collections::HashSet::new(), &mut tokens, 0);
-    niri_mapping_from_tokens(&tokens, device)
+    Some(niri_touch_from_tokens(&tokens))
 }
 
-fn niri_mapping_from_tokens(tokens: &[String], device: &str) -> Option<String> {
-    let mut global = None;
-    let mut named = None;
+/// 配置里最后一段 `input { touch { ... } }` 生效：niri 合并多个 `input` 段时
+/// 整段替换 `touch`，不会把前面的字段并进来。
+fn niri_touch_from_tokens(tokens: &[String]) -> NiriTouch {
+    let mut touch = NiriTouch::default();
     let mut i = 0;
     while i + 1 < tokens.len() {
-        if tokens[i] == "input" && tokens[i + 1] == "{" {
-            let end = kdl_block_end(tokens, i + 1)?;
-            let mut child = i + 2;
-            while child + 1 < end {
-                if tokens[child] == "touch" {
-                    let (name, open) = if tokens[child + 1] == "{" {
-                        (None, child + 1)
-                    } else if tokens.get(child + 2).map(String::as_str) == Some("{") {
-                        (Some(tokens[child + 1].as_str()), child + 2)
-                    } else {
-                        child += 1;
-                        continue;
-                    };
-                    let close = kdl_block_end(tokens, open)?;
-                    let value = (open + 1..close)
-                        .find(|&p| tokens[p] == "map-to-output")
-                        .and_then(|p| tokens.get(p + 1))
-                        .cloned();
-                    match name {
-                        None => global = value,
-                        Some(name) if name == device => named = Some(value),
-                        _ => (),
-                    }
-                    child = close + 1;
-                } else if tokens[child] == "{" {
-                    child = kdl_block_end(tokens, child)? + 1;
-                } else {
-                    child += 1;
-                }
-            }
-            i = end + 1;
-        } else {
+        if tokens[i] != "input" || tokens[i + 1] != "{" {
             i += 1;
+            continue;
         }
+        let Some(end) = kdl_block_end(tokens, i + 1) else {
+            break;
+        };
+        let mut child = i + 2;
+        while child + 1 < end {
+            if tokens[child] == "touch" && tokens[child + 1] == "{" {
+                let Some(close) = kdl_block_end(tokens, child + 1) else {
+                    break;
+                };
+                let mut found = NiriTouch::default();
+                let mut p = child + 2;
+                while p < close {
+                    match tokens[p].as_str() {
+                        "off" => {
+                            found.off = true;
+                            p += 1;
+                        }
+                        "calibration-matrix" => {
+                            let mut values = Vec::new();
+                            p += 1;
+                            while p < close
+                                && values.len() < 6
+                                && tokens[p].parse::<f64>().is_ok()
+                            {
+                                values.push(tokens[p].clone());
+                                p += 1;
+                            }
+                            found.calibration = Some(values);
+                        }
+                        "map-to-output" => {
+                            found.map_to_output = tokens.get(p + 1).cloned();
+                            p += 2;
+                        }
+                        _ => p += 1,
+                    }
+                }
+                touch = found;
+                child = close + 1;
+            } else if tokens[child] == "{" {
+                match kdl_block_end(tokens, child) {
+                    Some(close) => child = close + 1,
+                    None => break,
+                }
+            } else {
+                child += 1;
+            }
+        }
+        i = end + 1;
     }
-    named.unwrap_or(global)
+    touch
+}
+
+/// 临时改 Niri 的触摸映射默认开启；`OPENUUYC_NIRI_TOUCH_REMAP=0`（旧的
+/// `OPENUUYC_NIRI_TEMP_TOUCH_MAP=0` 同样）关掉，触摸退回单指模拟。
+fn touch_remap_enabled() -> bool {
+    let value = std::env::var("OPENUUYC_NIRI_TOUCH_REMAP")
+        .or_else(|_| std::env::var("OPENUUYC_NIRI_TEMP_TOUCH_MAP"))
+        .ok();
+    !matches!(
+        value.as_deref(),
+        Some("0" | "false" | "off" | "no" | "False" | "OFF")
+    )
 }
 
 fn expand_niri_config(
@@ -664,8 +817,12 @@ impl Engine {
         if kind >= 3 {
             self.touch_route = None;
         }
-        if let Route::Touchscreen { rotation, width } = route
-            && self.deliver_touch(kind, points, rotation, width)?
+        if let Route::Touchscreen {
+            rotation,
+            width,
+            map,
+        } = route
+            && self.deliver_touch(kind, points, rotation, width, map)?
         {
             // 触摸屏不经绝对指针，可合成器会让光标跟着触点走（sway 在触点底下的
             // 表面不收触摸时就拿它模拟指针），绝对指针轴上那个位置也就过期了。
@@ -700,79 +857,28 @@ impl Engine {
     /// 选这一串触摸走哪条路，判定变化时记一条日志（和 `aim_space` 一样只记一次）。
     fn choose_route(&mut self) -> Route {
         let current = self.touch_screen_hint.unwrap_or(self.geometry.current);
-        let is_window = crate::platform::capture::is_window_target;
-        let decision = if is_window(current) {
-            // 触摸屏设备是映射到一块输出上的；窗口源不是输出，走指针模拟。
-            Err("窗口源没有对应的触摸屏输出".into())
-        } else if self.injector.has_touchscreen() {
-            let layout = crate::platform::display::compositor_layout();
-            // 「被控端只有一块屏」数的是显示器：目录里并列的窗口源不算。
-            let monitors = monitors(&self.geometry.screens, is_window);
-            let target = monitors
-                .iter()
-                .find(|s| s.id == current)
-                .and_then(|screen| screen.logical)
-                .and_then(|rect| {
-                    layout.as_ref()?.outputs.iter().find(|o| {
-                        rect == Rect {
-                            left: o.left,
-                            top: o.top,
-                            right: o.left.saturating_add(o.width as i32),
-                            bottom: o.top.saturating_add(o.height as i32),
-                        }
-                    })
-                })
-                .and_then(|o| o.name.clone());
-            let is_niri = std::env::var_os("NIRI_SOCKET").is_some();
-            // Read/configure only when a new touch sequence needs another output.
-            // Selecting a screen or moving the mouse alone never changes mapping.
-            let already_mapped = target.as_ref().is_some_and(|output| {
-                self.touch_lease
-                    .as_ref()
-                    .is_some_and(|lease| lease.maps_to(output))
-            });
-            let mut mapping = if already_mapped {
-                target.clone()
-            } else if is_niri {
-                target.as_ref().and_then(|name| {
-                    read_niri_touch_mapping(&native::touch_output_device_name(name))
-                })
-            } else {
-                None
-            };
-            if is_niri && std::env::var("OPENUUYC_NIRI_TEMP_TOUCH_MAP").as_deref() == Ok("1") {
-                if let Some(output) = target.as_ref() {
-                    if !already_mapped
-                        && (self.touch_lease.is_some() || mapping.as_ref() != Some(output))
-                    {
-                        let lease_result = (|| -> Result<()> {
-                            if self.touch_lease.is_none() {
-                                self.touch_lease = Some(niri_touch_lease::Lease::new(
-                                    niri_config_root()
-                                        .ok_or_else(|| anyhow::anyhow!("找不到 Niri 配置"))?,
-                                )?);
-                            }
-                            self.touch_lease.as_mut().unwrap().map_to(output)
-                        })();
-                        if let Err(error) = lease_result {
-                            tracing::warn!(%error,"未能临时映射触摸输出");
-                            return Route::Simulated;
-                        }
-                        mapping = Some(output.clone());
-                    }
-                }
-            }
-            let decision = route_for(layout.as_deref(), &monitors, current, mapping.as_deref());
-            match (decision, is_niri, target) {
-                (Ok(route), true, Some(output)) => self
-                    .injector
-                    .select_touch_output(&output)
-                    .map(|_| route)
-                    .map_err(|e| e.to_string()),
-                (decision, _, _) => decision,
-            }
-        } else {
+        let is_niri = std::env::var_os("NIRI_SOCKET").is_some();
+        let layout = crate::platform::display::compositor_layout();
+        let decision = if !self.injector.has_touchscreen() {
             Err("没有虚拟触摸屏".into())
+        } else {
+            match touch_target(layout.as_deref(), &self.geometry.screens, current, is_niri) {
+                Ok(target) => {
+                    let aim = if is_niri {
+                        // Niri 只有一个全局触摸映射；先把它对准这一串触摸要去
+                        // 的输出，合成器才会把触点派发到那块屏上。
+                        self.ensure_touch_mapping(&target.output)
+                    } else {
+                        Ok(())
+                    };
+                    aim.map(|()| Route::Touchscreen {
+                        rotation: target.rotation,
+                        width: target.width,
+                        map: target.map,
+                    })
+                }
+                Err(reason) => Err(reason),
+            }
         };
         let state = decision.as_ref().map(|_| ()).map_err(Clone::clone);
         if self.touch_space.as_ref() != Some(&state) {
@@ -784,26 +890,82 @@ impl Engine {
         }
         decision.unwrap_or(Route::Simulated)
     }
-    /// 把触点交给触摸屏设备。旋转与屏幕宽度由 `route_for` 在选路时算好带过来，这一
-    /// 帧不再查屏幕。返回 false 表示设备已经在这一串中途被丢掉，调用方退回模拟。
+
+    /// 让 Niri 把触摸设备映射到这块输出。已经对上就不动；没对上时写一份临时
+    /// 配置（包含用户原配置，保留触摸的其他设置）并加载，断开或换屏时恢复。
+    fn ensure_touch_mapping(&mut self, output: &str) -> Result<(), String> {
+        let Some(touch) = read_niri_touch() else {
+            return Err("读不到 Niri 的触摸配置".into());
+        };
+        if touch.off {
+            return Err("Niri 配置关闭了触摸".into());
+        }
+        // 已经有一份临时配置在生效时，以它为准：原配置里写的是哪块屏都不
+        // 代表 niri 现在的映射，临时配置会一直盖着它直到会话结束。
+        if let Some(lease) = &self.touch_lease {
+            if lease.maps_to(output) {
+                return Ok(());
+            }
+        } else if touch.map_to_output.as_deref() == Some(output) {
+            return Ok(());
+        }
+        if !touch_remap_enabled() {
+            return Err(match &touch.map_to_output {
+                Some(mapped) => format!("Niri 触摸映射到 {mapped}，临时映射已关闭"),
+                None => "Niri 没有配置触摸输出，临时映射已关闭".into(),
+            });
+        }
+        let root = niri_config_root().ok_or_else(|| "找不到 Niri 配置".to_owned())?;
+        if !root.is_file() {
+            // 没有配置文件时 niri 用内置默认值；拿一份只含触摸覆盖的临时配置
+            // 去替换它会把别的设置一起冲掉，不如退回单指模拟。
+            return Err("Niri 没有配置文件，无法临时映射触摸".into());
+        }
+        if self.touch_lease.is_none() {
+            self.touch_lease = Some(
+                niri_touch_lease::Lease::new(
+                    root,
+                    niri_touch_lease::TouchSettings {
+                        off: touch.off,
+                        calibration: touch.calibration.clone(),
+                    },
+                )
+                .map_err(|error| format!("临时触摸映射不可用：{error}"))?,
+            );
+        }
+        self.touch_lease
+            .as_mut()
+            .expect("just created")
+            .map_to(output)
+            .map_err(|error| format!("临时触摸映射失败：{error}"))
+    }
+    /// 把触点交给触摸屏设备。旋转、屏幕宽度与坐标映射由 `touch_target` 在选路时
+    /// 算好带过来，这一帧不再查屏幕。返回 false 表示设备已经在这一串中途被丢掉，
+    /// 调用方退回模拟。
     fn deliver_touch(
         &mut self,
         kind: u8,
         points: &[super::wire::Point],
         rotation: Rotation,
         width: f64,
+        map: TouchMap,
     ) -> Result<bool> {
         let touches = points
             .iter()
-            .map(|point| native::Touch {
-                id: point.id,
-                x: point.x as f32,
-                y: point.y as f32,
-                // 接触椭圆的长轴半径，按屏幕宽度换算成触摸屏的量程。libinput 处理
-                // 触摸屏的那条路径不读这个轴（`ABS_MT_TOUCH_MAJOR`），公开接口里也
-                // 没有接触面积，所以报了也没有人看得见；留着只是照实体设备的样子
-                // 报一个值。旋转过的屏上两条轴的半径混在一起，取平均。
-                radius: (((point.radius_x + point.radius_y) / 2.0) / width) as f32,
+            .map(|point| {
+                // 窗口级源只占输出的一部分：先把窗口内的比例换算到输出比例，
+                // 合成器才会把触点送到窗口上。
+                let (x, y) = map.apply(point.x, point.y);
+                native::Touch {
+                    id: point.id,
+                    x: x as f32,
+                    y: y as f32,
+                    // 接触椭圆的长轴半径，按屏幕宽度换算成触摸屏的量程。libinput 处理
+                    // 触摸屏的那条路径不读这个轴（`ABS_MT_TOUCH_MAJOR`），公开接口里也
+                    // 没有接触面积，所以报了也没有人看得见；留着只是照实体设备的样子
+                    // 报一个值。旋转过的屏上两条轴的半径混在一起，取平均。
+                    radius: (((point.radius_x + point.radius_y) / 2.0) / width) as f32,
+                }
             })
             .collect::<Vec<_>>();
         self.injector.touch(kind, &touches, rotation)
@@ -1295,41 +1457,39 @@ mod tests {
             outputs: vec![output(Some("DP-1"), 0, 0, 1920, 1080)],
         };
         let screens = vec![screen(0, (0, 0, 1920, 1080), layout.outputs.first())];
-        assert_eq!(
-            route_for(Some(&layout), &screens, 0, None),
-            Ok(Route::Touchscreen {
-                rotation: Rotation::Normal,
-                width: 1920.0
-            })
-        );
+        let target = touch_target(Some(&layout), &screens, 0, false).unwrap();
+        assert_eq!(target.output, "DP-1");
+        assert_eq!(target.rotation, Rotation::Normal);
+        assert_eq!(target.width, 1920.0);
+        assert_eq!(target.map, TouchMap::FULL);
     }
 
-    /// 多屏、旋转、读不到布局，一律退回单指模拟：合成器怎么把触摸屏认到哪块屏上各
-    /// 家都不一样，猜错就是主控看着这块屏、点下去落在另一块屏上，比单指模拟更差
-    /// （模拟走绝对指针，落点总是对的）。
+    /// niri 以外的合成器：多屏、旋转、读不到布局，一律退回单指模拟。合成器怎么
+    /// 把触摸屏认到哪块屏上各家都不一样，猜错就是「主控看着这块屏、点下去落在
+    /// 另一块屏上」，比单指模拟更差（模拟走绝对指针，落点总是对的）。
     #[test]
     fn anything_but_a_single_unrotated_screen_falls_back_to_simulation() {
         let single = CompositorLayout {
             outputs: vec![output(Some("DP-1"), 0, 0, 1920, 1080)],
         };
         let one = vec![screen(0, (0, 0, 1920, 1080), single.outputs.first())];
-        assert!(route_for(None, &one, 0, None).is_err(), "没有布局");
+        assert!(touch_target(None, &one, 0, false).is_err(), "没有布局");
         assert!(
-            route_for(Some(&scaled()), &one, 0, None).is_err(),
+            touch_target(Some(&scaled()), &one, 0, false).is_err(),
             "合成器两块屏"
         );
 
         let mut two = one.clone();
         two.push(screen(1, (0, 0, 1920, 1080), single.outputs.first()));
         assert!(
-            route_for(Some(&single), &two, 0, None).is_err(),
+            touch_target(Some(&single), &two, 0, false).is_err(),
             "被控端两块屏"
         );
 
         let mut turned = single.clone();
         turned.outputs[0].rotation = Rotation::Rotate90;
         assert!(
-            route_for(Some(&turned), &one, 0, None).is_err(),
+            touch_target(Some(&turned), &one, 0, false).is_err(),
             "屏幕转过 90 度"
         );
     }
@@ -1344,70 +1504,86 @@ mod tests {
         layout.outputs[0].rotation = Rotation::Rotate90;
         let unpaired = vec![screen(0, (0, 0, 1080, 1920), None)];
         assert!(unpaired[0].logical.is_none());
-        let error = route_for(Some(&layout), &unpaired, 0, None).unwrap_err();
+        let error = touch_target(Some(&layout), &unpaired, 0, false).unwrap_err();
         assert!(error.contains("未配对"), "{error}");
     }
 
+    /// niri 只有一个全局触摸映射：每块显示器各自解析到自己的输出，调用方再把
+    /// 触摸设备临时映射过去。旋转按输出带进路由。
     #[test]
-    fn named_touch_mapping_does_not_override_physical_touch_default() {
-        let tokens = kdl_tokens(
-            r#"input {
-            touch { map-to-output "DP-1" }
-            touch "OpenUUYC touch HDMI-A-1" { map-to-output "HDMI-A-1" }
-        }"#,
-        );
-        assert_eq!(
-            niri_mapping_from_tokens(&tokens, "OpenUUYC touch HDMI-A-1").as_deref(),
-            Some("HDMI-A-1")
-        );
-        assert_eq!(
-            niri_mapping_from_tokens(&tokens, "physical touchscreen").as_deref(),
-            Some("DP-1")
-        );
-    }
-
-    #[test]
-    fn named_touch_mapping_wins_even_when_default_is_later() {
-        let tokens = kdl_tokens(
-            r#"input { touch "OpenUUYC touch DP-1" { map-to-output "DP-1" } }
-            input { touch { map-to-output "eDP-1" } }"#,
-        );
-        assert_eq!(
-            niri_mapping_from_tokens(&tokens, "OpenUUYC touch DP-1").as_deref(),
-            Some("DP-1")
-        );
-    }
-
-    #[test]
-    fn other_named_touch_devices_never_select_our_output() {
-        let tokens = kdl_tokens(
-            r#"input {
-            touch { map-to-output "eDP-1" }
-            touch "physical tablet" { map-to-output "DP-1" }
-        }"#,
-        );
-        assert_eq!(
-            niri_mapping_from_tokens(&tokens, "OpenUUYC touch DP-1").as_deref(),
-            Some("eDP-1")
-        );
-    }
-
-    #[test]
-    fn niri_native_touch_uses_configured_output_in_multi_monitor_setup() {
+    fn niri_touch_resolves_each_screen_to_its_own_output() {
         let mut layout = scaled();
         layout.outputs[1].rotation = Rotation::Rotate90;
         let screens = [
             screen(1, (0, 0, 1600, 2560), layout.output("DP-3")),
             screen(2, (1000, 0, 5120, 2160), layout.output("DP-1")),
         ];
-        assert_eq!(
-            route_for(Some(&layout), &screens, 2, Some("DP-1")),
-            Ok(Route::Touchscreen {
-                rotation: Rotation::Rotate90,
-                width: 5120.0
-            })
+        let left = touch_target(Some(&layout), &screens, 1, true).unwrap();
+        assert_eq!(left.output, "DP-3");
+        assert_eq!(left.rotation, Rotation::Normal);
+        let right = touch_target(Some(&layout), &screens, 2, true).unwrap();
+        assert_eq!(right.output, "DP-1");
+        assert_eq!(right.rotation, Rotation::Rotate90);
+        assert_eq!(right.width, 5120.0);
+        assert_eq!(right.map, TouchMap::FULL);
+    }
+
+    /// 窗口级源只占输出的一部分：客户端给的窗口内比例要平移、缩放成输出比例，
+    /// 合成器才会把触点送到窗口上。
+    #[test]
+    fn a_window_maps_its_own_rectangle_onto_the_output() {
+        // 1375,4 1358x1059 的窗口在 1200,0 1706x1066 的输出上（开发机真实值）。
+        let map = TouchMap::of_window((1375, 4, 1358, 1059), (1200, 0, 1706, 1066)).unwrap();
+        assert!((map.left - 175.0 / 1706.0).abs() < 1e-9);
+        assert!((map.width - 1358.0 / 1706.0).abs() < 1e-9);
+        let (x, y) = map.apply(0.0, 0.0);
+        assert!((x - 175.0 / 1706.0).abs() < 1e-9);
+        assert!((y - 4.0 / 1066.0).abs() < 1e-9);
+        // 窗口中心落在输出上的同一个相对位置。
+        let (cx, cy) = map.apply(0.5, 0.5);
+        assert!((cx - (175.0 + 679.0) / 1706.0).abs() < 1e-9);
+        assert!((cy - (4.0 + 529.5) / 1066.0).abs() < 1e-9);
+        assert!(TouchMap::of_window((0, 0, 10, 10), (0, 0, 0, 10)).is_none());
+    }
+
+    #[test]
+    fn the_niri_touch_section_is_read_from_the_last_input_block() {
+        let tokens = kdl_tokens(
+            r#"input {
+                touch { map-to-output "DP-1" calibration-matrix 1 0 0 0 1 0 }
+            }
+            input {
+                touch { off map-to-output "eDP-1" }
+            }"#,
         );
-        assert!(route_for(Some(&layout), &screens, 1, Some("DP-1")).is_err());
+        let touch = niri_touch_from_tokens(&tokens);
+        assert!(touch.off);
+        assert_eq!(touch.map_to_output.as_deref(), Some("eDP-1"));
+        // 后一段整个替换了 touch，前一段的校准不会混进来。
+        assert_eq!(touch.calibration, None);
+    }
+
+    #[test]
+    fn the_niri_touch_section_keeps_calibration_and_ignores_unknown_children() {
+        let tokens = kdl_tokens(
+            r#"input {
+                touch {
+                    calibration-matrix 1.0 0.0 0.0 0.0 1.0 0.0
+                    map-to-output "DP-1"
+                }
+            }"#,
+        );
+        let touch = niri_touch_from_tokens(&tokens);
+        assert!(!touch.off);
+        assert_eq!(touch.map_to_output.as_deref(), Some("DP-1"));
+        assert_eq!(
+            touch.calibration.as_deref(),
+            Some(
+                ["1.0", "0.0", "0.0", "0.0", "1.0", "0.0"]
+                    .map(str::to_owned)
+                    .as_slice()
+            )
+        );
     }
 
     #[test]
@@ -1472,8 +1648,10 @@ mod tests {
             screen(0, (0, 0, 1920, 1080), single.outputs.first()),
             screen(3, (0, 0, 800, 600), None),
         ];
-        assert!(route_for(Some(&single), &listed, 0, None).is_err());
-        assert!(route_for(Some(&single), &monitors(&listed, |id| id == 3), 0, None).is_ok());
+        // 触摸屏那条路上「被控端只有一块屏」数的也是显示器（调用方先滤掉
+        // 窗口源）；窗口源本身没有输出可映射，触摸走单指模拟。
+        let only_monitors = monitors(&listed, |id| id == 3);
+        assert!(touch_target(Some(&single), &only_monitors, 0, false).is_ok());
     }
 
     #[test]
@@ -1524,5 +1702,34 @@ mod tests {
                 height: 1080
             }
         );
+    }
+
+    /// 需要 niri 会话和可写的 `/dev/uinput`：真的加载一份临时配置把触摸映射
+    /// 到另一块输出，再恢复原配置。会短暂重载 niri 配置。
+    #[test]
+    #[ignore = "reloads the live niri config twice and restores it"]
+    fn live_touch_mapping_moves_and_restores() {
+        let mut engine =
+            Engine::new(false, super::super::wire::Policy::Mobile, 0, false).expect("engine");
+        engine
+            .ensure_touch_mapping("eDP-1")
+            .expect("map touch to eDP-1");
+        assert!(
+            engine
+                .touch_lease
+                .as_ref()
+                .is_some_and(|lease| lease.maps_to("eDP-1"))
+        );
+        engine
+            .ensure_touch_mapping("DP-1")
+            .expect("map touch to DP-1");
+        assert!(
+            engine
+                .touch_lease
+                .as_ref()
+                .is_some_and(|lease| lease.maps_to("DP-1"))
+        );
+        engine.release().expect("release restores the original config");
+        assert!(engine.touch_lease.is_none());
     }
 }
