@@ -159,6 +159,10 @@ enum Commands {
         /// 附着到远端已有会话；默认新建会话
         #[arg(long)]
         attach: Option<u32>,
+        /// 用固定句柄打开（接回上次的会话，没有就新建）；图形界面用它让
+        /// 「关掉终端再打开」接回同一个 Shell
+        #[arg(long, conflicts_with = "attach")]
+        handle: Option<u32>,
     },
     /// 列出或接上本机正在运行的被控终端会话
     Terminal {
@@ -419,9 +423,9 @@ fn main() -> Result<()> {
             openuuyc::application::capture_agent(&pipe, parent)
         }
         Commands::DisplayRecovery { token } => openuuyc::application::display_recovery(&token),
-        Commands::RemoteTerminal { device, list, attach } => {
+        Commands::RemoteTerminal { device, list, attach, handle } => {
             tokio::runtime::Runtime::new()?.block_on(
-                controller::terminal::run_saved(device, list, attach)
+                controller::terminal::run_saved(device, list, attach, handle)
             )
         }
         Commands::Terminal { session, list, new } => {

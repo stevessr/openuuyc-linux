@@ -163,6 +163,8 @@ impl Terminal {
                 s.input.clear();
                 s.active = false;
                 s.pending = false;
+                // Shell 没了，这个句柄不再指向活着的会话；下次打开新开一个。
+                s.handle = 0;
                 s.status = if frame.kind == FrameType::Exit {
                     "Shell 已退出".into()
                 } else {
@@ -178,7 +180,27 @@ impl Terminal {
     pub(crate) fn show(&self) {
         self.lock().visible = true;
     }
-    pub(crate) fn close(&self) {
+    /// 离开这个 Shell，但不结束它：只发 DETACH，和 tmux detach 一样。句柄
+    /// 留着，下次打开按同一个句柄接回原来的 Shell（远端会重放当前屏幕）。
+    pub(crate) fn detach(&self) {
+        let mut s = self.lock();
+        s.epoch = s.epoch.wrapping_add(1);
+        if s.active || s.pending {
+            Self::send(&s, FrameType::Detach, &[]);
+        }
+        s.active = false;
+        s.pending = false;
+        s.visible = false;
+        s.input.clear();
+        s.status = if s.handle != 0 {
+            "已离开远端 Shell，它仍在远端运行；再打开会接回同一个 Shell".into()
+        } else {
+            "已离开远端终端".into()
+        };
+    }
+    /// 结束这个 Shell。只有用户明确要求时才发 CLOSE：多数远端把它当作杀掉
+    /// 进程，和 [`Self::detach`] 不是一回事。
+    pub(crate) fn end(&self) {
         let mut s = self.lock();
         s.epoch = s.epoch.wrapping_add(1);
         if s.active || s.pending {
@@ -186,9 +208,10 @@ impl Terminal {
         }
         s.active = false;
         s.pending = false;
-        s.visible = false;
+        s.handle = 0;
         s.input.clear();
         s.parser = vt100::Parser::new(s.rows, s.cols, 500);
+        s.status = "已结束远端 Shell".into();
     }
     pub(crate) fn disconnected(&self) {
         let mut s = self.lock();
@@ -219,7 +242,7 @@ impl Terminal {
             return;
         }
         s.epoch = s.epoch.wrapping_add(1);
-        s.handle = (uuid::Uuid::new_v4().as_u128() as u32 & 0x7fff_ffff).max(1);
+        let reattach = Self::prepare_open(&mut s);
         if Self::send(
             &s,
             FrameType::Open,
@@ -231,8 +254,25 @@ impl Terminal {
         ) {
             s.pending = true;
             s.started = Some(std::time::Instant::now());
-            s.status = "等待远端授权并创建 Shell…".into();
+            s.status = if reattach {
+                "正在接回上次的 Shell…".into()
+            } else {
+                "等待远端授权并创建 Shell…".into()
+            };
         }
+    }
+    /// 打开前把状态准备好：有句柄就按它接回上次的 Shell（远端保留着它并重
+    /// 放屏幕），没有才生成新的。远端遇到不存在的句柄会用它新建，所以这个
+    /// 句柄一直可用。重放的是一整屏，旧的模型内容要丢掉，否则会接在后面重
+    /// 复一遍。返回是不是接回。
+    fn prepare_open(s: &mut State) -> bool {
+        let reattach = s.handle != 0;
+        if !reattach {
+            s.handle = (uuid::Uuid::new_v4().as_u128() as u32 & 0x7fff_ffff).max(1);
+        }
+        s.parser = vt100::Parser::new(s.rows, s.cols, 500);
+        s.input.clear();
+        reattach
     }
     fn submit(&self, epoch: u64, input: String, send: Option<String>) {
         let mut s = self.lock();
@@ -250,15 +290,16 @@ impl Terminal {
         }
     }
     pub(crate) fn ui(&self, ctx: &egui::Context) {
-        let (mut visible, status, contents, active, pending, mut input, epoch) = {
+        let (mut visible, status, contents, active, pending, mut input, epoch, handle) = {
             let mut s = self.lock();
             if s.pending
                 && s.started
                     .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(8))
             {
-                Self::send(&s, FrameType::Close, &[]);
+                // 创建超时：只离开，不杀可能已经在远端跑起来的 Shell。
+                Self::send(&s, FrameType::Detach, &[]);
                 s.pending = false;
-                s.status = "终端创建超时，已请求关闭".into();
+                s.status = "终端创建超时，已离开；Shell 可能仍在远端".into();
             }
             (
                 s.visible,
@@ -268,12 +309,14 @@ impl Terminal {
                 s.pending,
                 s.input.clone(),
                 s.epoch,
+                s.handle,
             )
         };
         if !visible {
             return;
         }
         let mut open = false;
+        let mut end = false;
         let mut send = None;
         egui::Window::new("远端终端")
             .id(egui::Id::new((
@@ -284,12 +327,28 @@ impl Terminal {
             .default_width(740.)
             .show(ctx, |ui| {
                 ui.label(
-                    "命令在当前连接的远端设备执行；需要被控端单独授权。关闭此窗口会关闭此 Shell。",
+                    "命令在当前连接的远端设备执行；需要被控端单独授权。关闭此窗口只是离开，\
+                     Shell 会留在远端继续运行，再打开可接回同一个 Shell。",
                 );
                 ui.label(status);
-                if !active && !pending {
-                    open = ui.button("打开远端 Shell").clicked();
-                }
+                ui.horizontal(|ui| {
+                    if !active && !pending {
+                        let label = if handle != 0 {
+                            "接回远端 Shell"
+                        } else {
+                            "打开远端 Shell"
+                        };
+                        open = ui.button(label).clicked();
+                    }
+                    if (active || pending || handle != 0)
+                        && ui
+                            .button("结束 Shell")
+                            .on_hover_text("让远端结束这个 Shell；只是离开窗口不需要点它")
+                            .clicked()
+                    {
+                        end = true;
+                    }
+                });
                 egui::ScrollArea::both()
                     .max_height(500.)
                     .stick_to_bottom(true)
@@ -356,7 +415,9 @@ impl Terminal {
             });
         self.submit(epoch, input, send);
         if !visible {
-            self.close();
+            self.detach();
+        } else if end {
+            self.end();
         } else if open {
             self.open();
         }
@@ -419,9 +480,68 @@ mod tests {
         assert!(t.lock().parser.screen().contents().is_empty());
         t.receive(&Frame::encode(FrameType::Stdout, 7, b"ok"));
         assert_eq!(t.lock().parser.screen().contents(), "ok");
-        t.close();
+        t.detach();
         t.receive(&Frame::encode(FrameType::OpenResp, 7, br#"{"code":0}"#));
         assert!(!t.lock().active);
+    }
+    /// 关窗口只是离开：句柄留着，下次打开接回同一个 Shell。
+    fn wired() -> (Terminal, mpsc::Receiver<Vec<u8>>) {
+        let terminal = Terminal::default();
+        let (tx, rx) = mpsc::channel(8);
+        terminal.lock().tx = Some(tx);
+        (terminal, rx)
+    }
+    #[test]
+    fn closing_the_window_detaches_and_keeps_the_shell() {
+        let (t, mut rx) = wired();
+        {
+            let mut s = t.lock();
+            s.handle = 7;
+            s.active = true;
+        }
+        t.detach();
+        let s = t.lock();
+        assert_eq!(s.handle, 7, "the handle survives so the shell can be reattached");
+        assert!(!s.active);
+        assert!(!s.visible);
+        drop(s);
+        let frame = Frame::parse(&rx.try_recv().expect("detach frame")).unwrap();
+        assert_eq!(frame.kind, FrameType::Detach);
+        assert_eq!(frame.session, 7);
+    }
+    #[test]
+    fn reopening_reuses_the_handle_and_clears_the_old_screen() {
+        let (t, _rx) = wired();
+        {
+            let mut s = t.lock();
+            s.handle = 7;
+            s.active = false;
+            s.parser.process(b"stale screen");
+            assert_eq!(s.parser.screen().contents(), "stale screen");
+            // 打开前要判断通道是否就绪；这里只验证句柄与重放缓冲那一段。
+            assert!(Terminal::prepare_open(&mut s), "an existing handle means reattach");
+            assert_eq!(s.handle, 7);
+            assert!(s.parser.screen().contents().is_empty());
+        }
+        // 没有句柄时生成一个新的非零句柄。
+        let fresh = Terminal::default();
+        let mut fresh = fresh.lock();
+        assert!(!Terminal::prepare_open(&mut fresh));
+        assert_ne!(fresh.handle, 0);
+    }
+    #[test]
+    fn ending_the_shell_clears_the_handle_and_sends_close() {
+        let (t, mut rx) = wired();
+        {
+            let mut s = t.lock();
+            s.handle = 7;
+            s.active = true;
+        }
+        t.end();
+        assert_eq!(t.lock().handle, 0);
+        let frame = Frame::parse(&rx.try_recv().expect("close frame")).unwrap();
+        assert_eq!(frame.kind, FrameType::Close);
+        assert_eq!(frame.session, 7);
     }
     #[test]
     fn ansi_and_unicode_are_rendered_not_executed() {

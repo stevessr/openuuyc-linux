@@ -46,11 +46,40 @@ pub(crate) fn window_screens() -> Result<Vec<Screen>> {
     }
 }
 
-/// 一个窗口源当前在桌面上的矩形（left, top, width, height），供输入注入
-/// 换算用。X11 的矩形在 X 像素空间，Wayland 的在合成器逻辑空间，各走各的
-/// 注入路径。窗口随采集循环每帧更新，比目录里的快照新。非窗口 ID 返回 None。
-pub(crate) fn window_rect(id: i32) -> Option<(i32, i32, u32, u32)> {
-    x11_window::live_rect(id).or_else(|| wlr_window::live_rect(id))
+/// 输入注入按 id 找一个窗口源时，它现在在哪，以及那个矩形在哪个坐标空间里。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowPlace {
+    /// X11 窗口（XComposite 源）：矩形在 X 像素空间，按屏幕位置注入。
+    X11 { rect: (i32, i32, u32, u32) },
+    /// Wayland 窗口：矩形在合成器逻辑空间里，和绝对指针解算落点用的是同一个
+    /// 空间。`output` 是它所在输出的矩形——窗口露在这块输出之外的部位不在
+    /// 屏幕上，往那里投的点击只会落到别处。
+    Compositor {
+        rect: (i32, i32, u32, u32),
+        output: (i32, i32, u32, u32),
+    },
+}
+
+/// 一个窗口源此刻的位置（left, top, width, height），供输入注入换算用。两种
+/// 窗口各走各的注入路径，所以连坐标空间一起给出来。定位不到（窗口不在可见
+/// 工作区、或者合成器没有这个接口）返回 None，调用方明确报错，不把点击投到
+/// 过期位置。非窗口 ID 也返回 None。
+pub(crate) fn window_place(id: i32) -> Option<WindowPlace> {
+    if let Some(placement) = wlr_window::placement(id) {
+        return Some(WindowPlace::Compositor {
+            rect: placement.rect,
+            output: placement.output,
+        });
+    }
+    x11_window::live_rect(id).map(|rect| WindowPlace::X11 { rect })
+}
+
+/// 让一个当前不在屏幕上的窗口露出来（切到它所在的工作区并滚进视口），这
+/// 样输入才有落点。只有 Wayland 窗口能这样做：X11 的窗口本来就在 X 的屏幕
+/// 坐标里，位置未知说明它没有映射，叫醒它不是注入该做的事。返回「合成器接
+/// 受了这个请求」，之后要重新取位置。
+pub(crate) fn reveal_window(id: i32) -> bool {
+    wlr_window::reveal(id)
 }
 
 /// 输入注入按 id 找不到窗口矩形时，用它区分"窗口源暂时无法定位"与普通屏幕。

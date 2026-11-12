@@ -558,37 +558,48 @@ impl Sessions {
         } else {
             handle
         };
-        // Re-opening an existing handle happens on reconnect and when the
-        // size changes; replacing the pty would hang up a shell in use.
-        if let Some(key) = self.resolve(owner, handle)
-            && let Some(existing) = self.sessions.get_mut(&key)
-        {
-            if existing.state != SessionState::Exited {
-                existing.state = SessionState::Running;
-            }
-            existing.remote_size = Some((cols, rows));
-            // A reopen is a takeover, as it always was: the controller
-            // reconnected (or moved the tab to another connection), and the
-            // old connection's queue would otherwise stay until its channel
-            // finally closes, tens of seconds on a lost network. Reaching the
-            // high-water mark there stops the shell for everyone. A local
-            // terminal attached to the same shell stays.
-            existing.output.retain(|consumer, _| match consumer {
-                Consumer::Remote(other) => *other == connection,
-                Consumer::Local(_) => true,
+        // Re-opening an existing handle happens on reconnect, when the size
+        // changes, and when a controller comes back to a shell it left; the
+        // pty is kept because replacing it would hang up a shell in use.
+        if let Some(key) = self.resolve(owner, handle) {
+            // A finished shell cannot be resumed. A controller that reopens
+            // its handle means "carry on with my terminal", so the dead
+            // session is taken out and a fresh shell gets the same handle.
+            // One that a local terminal is still showing the exit of stays
+            // until its output queue is drained.
+            let finished = self.sessions.get(&key).is_some_and(|session| {
+                session.state == SessionState::Exited && session.output.is_empty()
             });
-            existing
-                .output
-                .entry(Consumer::Remote(connection))
-                .or_default();
-            existing.detached_since = None;
-            existing.apply_size();
-            existing.last_active_ms = now_ms();
-            return Ok((
-                handle,
-                existing.name.clone(),
-                existing.screen.screen().state_formatted(),
-            ));
+            if finished {
+                self.sessions.remove(&key);
+            } else if let Some(existing) = self.sessions.get_mut(&key) {
+                if existing.state != SessionState::Exited {
+                    existing.state = SessionState::Running;
+                }
+                existing.remote_size = Some((cols, rows));
+                // A reopen is a takeover, as it always was: the controller
+                // reconnected (or moved the tab to another connection), and the
+                // old connection's queue would otherwise stay until its channel
+                // finally closes, tens of seconds on a lost network. Reaching the
+                // high-water mark there stops the shell for everyone. A local
+                // terminal attached to the same shell stays.
+                existing.output.retain(|consumer, _| match consumer {
+                    Consumer::Remote(other) => *other == connection,
+                    Consumer::Local(_) => true,
+                });
+                existing
+                    .output
+                    .entry(Consumer::Remote(connection))
+                    .or_default();
+                existing.detached_since = None;
+                existing.apply_size();
+                existing.last_active_ms = now_ms();
+                return Ok((
+                    handle,
+                    existing.name.clone(),
+                    existing.screen.screen().state_formatted(),
+                ));
+            }
         }
         let owner = owner.account;
         if self.owned(owner).count() >= MAX_SESSIONS || self.sessions.len() >= MAX_TOTAL {
@@ -2133,6 +2144,43 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("shell did not exit");
+    }
+
+    /// 主控按同一个句柄回来时，结束的 Shell 不当作可接回的会话：同一个句柄
+    /// 换一个新的 Shell，这样「关掉终端再打开」总能拿到能用的 shell。
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", windows)),
+        ignore = "no terminal backend on this platform"
+    )]
+    fn a_finished_shell_is_replaced_when_the_same_handle_reopens() {
+        let mut sessions = Sessions::default();
+        sessions
+            .open("acct", 1, 1, shell(), None, 80, 24)
+            .expect("open");
+        sessions.write("acct", 1, &line("exit")).expect("write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut reported = false;
+        while std::time::Instant::now() < deadline {
+            if sessions
+                .pump(1, PUMP_BUDGET)
+                .iter()
+                .any(|(_, kind, _)| *kind == FrameType::Exit)
+            {
+                reported = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(reported, "shell did not exit");
+        assert_eq!(sessions.list("acct")[0]["state"], "exited");
+        // 退出已经报给主控，队列空了：这个句柄应当开一个新的 shell。
+        let (handle, _, replay) = sessions
+            .open("acct", 1, 2, shell(), None, 80, 24)
+            .expect("reopen");
+        assert_eq!(handle, 1, "the controller keeps its handle");
+        assert!(replay.is_empty(), "a new shell has nothing to replay");
+        assert_eq!(sessions.list("acct")[0]["state"], "running");
     }
 
     #[test]

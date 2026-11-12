@@ -466,7 +466,14 @@ impl Engine {
             return None;
         }
         let layout = crate::platform::display::compositor_layout();
-        let chosen = compositor_bounds(&self.geometry.screens, layout.as_deref());
+        // 窗口级源不是输出，合成器布局里本来就没有它的名字。它走自己的定位
+        // （见 `absolute_window`），不参与这里的逐屏配对：否则目录里只要列
+        // 着一个窗口，所有显示器的绝对定位都会被它一起否决。
+        let monitors = monitors(
+            &self.geometry.screens,
+            crate::platform::capture::is_window_target,
+        );
+        let chosen = compositor_bounds(&monitors, layout.as_deref());
         let state = chosen.as_ref().map(|_| ()).map_err(Clone::clone);
         if self.aim_space.as_ref() != Some(&state) {
             match &state {
@@ -476,6 +483,16 @@ impl Engine {
             self.aim_space = Some(state);
         }
         chosen.ok()
+    }
+
+    /// 合成器全局布局的外接矩形，绝对指针就是按它解算的。窗口级源不参与
+    /// [`Self::compositor_bounds`] 的逐屏配对，但它的位置本来就在这个空间
+    /// 里，只要有这块范围就能定位。
+    fn layout_bounds(&self) -> Option<native::Desktop> {
+        if !self.injector.has_absolute_pointer() {
+            return None;
+        }
+        native::layout_bounds(crate::platform::display::compositor_layout()?.as_ref())
     }
 
     pub fn synchronize(&mut self, geometry: Geometry) -> Result<()> {
@@ -524,6 +541,11 @@ impl Engine {
         if screen.is_some() && self.touch_route.is_none() {
             self.touch_screen_hint = Some(id);
         }
+        // 窗口级源（waypipe 风格）不在合成器的输出拓扑里，目录里那个矩形也
+        // 不是它的位置：它现在在哪由采集那边实时给出。
+        if crate::platform::capture::is_window_target(id) {
+            return self.absolute_window(id, x, y);
+        }
         // Every screen in the compositor's space, or every screen in X's:
         // a position named in one and resolved in the other lands off by the
         // output's scale.
@@ -536,24 +558,71 @@ impl Engine {
             return result;
         }
         self.aimed = false;
-        // 窗口级源（waypipe 风格）不在合成器布局里，且目录矩形可能落后于
-        // 窗口的实际位置；注入前按采集循环缓存的实时几何换算。定位不到
-        // （Wayland 上窗口不在可见工作区）明确报错，不把点击投到过期位置。
-        let live = crate::platform::capture::window_rect(id);
-        if live.is_none() && crate::platform::capture::is_window_target(id) {
-            bail!("窗口位置未知（可能不在可见工作区），无法注入输入");
-        }
-        let rect = match live {
-            Some((left, top, width, height)) => Ok(super::geometry::Rect {
-                left,
-                top,
-                right: left + i32::try_from(width).map_err(|_| anyhow::anyhow!("窗口宽度无效"))?,
-                bottom: top + i32::try_from(height).map_err(|_| anyhow::anyhow!("窗口高度无效"))?,
-            }),
-            None => rect,
-        };
         let (px, py) = point_in(rect?, x, y);
         self.injector.move_to(px, py)
+    }
+
+    /// 窗口级源上的绝对定位。位置按采集循环缓存的实时几何换算；定位不到
+    /// 时先请合成器把窗口露出来（见 `reveal_window`），再算一次。窗口源可以
+    /// 在别的工作区上被采集，但指针只能落到屏幕上看得见的地方。
+    fn absolute_window(&mut self, id: i32, x: f64, y: f64) -> Result<()> {
+        use crate::platform::capture::WindowPlace;
+        let place = match crate::platform::capture::window_place(id) {
+            Some(place) => place,
+            None => {
+                // 窗口在别的工作区、或者整个滚出了视口：屏幕上没有它，指针
+                // 也够不着。让合成器切过去并滚进视口，按新位置再算一次。
+                if crate::platform::capture::reveal_window(id)
+                    && let Some(place) = crate::platform::capture::window_place(id)
+                {
+                    place
+                } else {
+                    self.aimed = false;
+                    bail!("窗口位置未知（可能不在可见工作区），无法注入输入");
+                }
+            }
+        };
+        match place {
+            // X 像素空间里的矩形：Xorg 会话由 XTest 直接摆到那个位置。
+            WindowPlace::X11 { rect } => {
+                self.aimed = false;
+                let (px, py) = point_in(window_rect(rect)?, x, y);
+                self.injector.move_to(px, py)
+            }
+            WindowPlace::Compositor { rect, output } => {
+                let (px, py) = point_in(window_rect(rect)?, x, y);
+                // 窗口伸到它所在输出之外的部位（被滚出视口的那一截）在屏幕
+                // 上没有位置，投过去只会落到别的窗口或别的屏上。
+                let shown = window_rect(output)?;
+                if !((shown.left..shown.right).contains(&px)
+                    && (shown.top..shown.bottom).contains(&py))
+                {
+                    self.aimed = false;
+                    bail!("窗口的这一部分不在屏幕上（滚出了视口），无法注入输入");
+                }
+                // 窗口位置和绝对指针在同一个空间里，直接交给合成器解算。退回
+                // 相对移动要先读当前指针位置，而 Wayland 上读到的是 XWayland
+                // 的那一份，指针在原生窗口上时它是过期的；更不能拿合成器的
+                // 坐标去按 X 的坐标注入。没有布局就明确报错。
+                let Some(bounds) = self.layout_bounds() else {
+                    self.aimed = false;
+                    bail!("合成器布局未知，无法按窗口位置注入输入");
+                };
+                let result = self.injector.aim(px, py, bounds);
+                self.aimed = result.is_ok();
+                result
+            }
+        }
+    }
+
+    /// 按屏幅折算相对位移时用的尺寸。Wayland 窗口源用它现在的逻辑尺寸：目
+    /// 录里那个是捕获缓冲的物理像素，缩放过的输出上比指针走的逻辑像素大。
+    fn extent(&self, screen: &Screen) -> (f64, f64) {
+        use crate::platform::capture::WindowPlace;
+        match crate::platform::capture::window_place(screen.id) {
+            Some(WindowPlace::Compositor { rect, .. }) => (f64::from(rect.2), f64::from(rect.3)),
+            _ => (f64::from(screen.width), f64::from(screen.height)),
+        }
     }
     fn wheel(&mut self, horizontal: bool, delta: i32) -> Result<()> {
         // 120 units per notch as on Windows. X wheels only click, so partial
@@ -630,12 +699,16 @@ impl Engine {
     }
     /// 选这一串触摸走哪条路，判定变化时记一条日志（和 `aim_space` 一样只记一次）。
     fn choose_route(&mut self) -> Route {
-        let decision = if self.injector.has_touchscreen() {
+        let current = self.touch_screen_hint.unwrap_or(self.geometry.current);
+        let is_window = crate::platform::capture::is_window_target;
+        let decision = if is_window(current) {
+            // 触摸屏设备是映射到一块输出上的；窗口源不是输出，走指针模拟。
+            Err("窗口源没有对应的触摸屏输出".into())
+        } else if self.injector.has_touchscreen() {
             let layout = crate::platform::display::compositor_layout();
-            let current = self.touch_screen_hint.unwrap_or(self.geometry.current);
-            let target = self
-                .geometry
-                .screens
+            // 「被控端只有一块屏」数的是显示器：目录里并列的窗口源不算。
+            let monitors = monitors(&self.geometry.screens, is_window);
+            let target = monitors
                 .iter()
                 .find(|s| s.id == current)
                 .and_then(|screen| screen.logical)
@@ -689,12 +762,7 @@ impl Engine {
                     }
                 }
             }
-            let decision = route_for(
-                layout.as_deref(),
-                &self.geometry.screens,
-                current,
-                mapping.as_deref(),
-            );
+            let decision = route_for(layout.as_deref(), &monitors, current, mapping.as_deref());
             match (decision, is_niri, target) {
                 (Ok(route), true, Some(output)) => self
                     .injector
@@ -879,11 +947,9 @@ impl Engine {
             }
             Event::RelativeScaled { screen, x, y } => {
                 self.aimed = false;
-                let s = self.geometry.screen(screen)?;
-                self.injector.move_by(
-                    (f64::from(s.width) * x).round() as i32,
-                    (f64::from(s.height) * y).round() as i32,
-                )?;
+                let (width, height) = self.extent(self.geometry.screen(screen)?);
+                self.injector
+                    .move_by((width * x).round() as i32, (height * y).round() as i32)?;
             }
             Event::Absolute { screen, x, y } => self.absolute(screen, x, y)?,
             Event::Wheel { x, y } => {
@@ -991,6 +1057,34 @@ fn point_in(rect: Rect, x: f64, y: f64) -> (i32, i32) {
         .round()
         .clamp(f64::from(rect.top), f64::from(rect.bottom - 1));
     (px as i32, py as i32)
+}
+
+/// 采集那边给出的 (left, top, width, height)，换成这里换算用的半开矩形。
+fn window_rect((left, top, width, height): (i32, i32, u32, u32)) -> Result<Rect> {
+    // 空矩形里没有可以落点的像素。
+    ensure!(width > 0 && height > 0, "窗口尺寸无效");
+    let edge = |origin: i32, extent: u32| {
+        i32::try_from(extent)
+            .ok()
+            .and_then(|extent| origin.checked_add(extent))
+            .ok_or_else(|| anyhow::anyhow!("窗口坐标溢出"))
+    };
+    Ok(Rect {
+        left,
+        top,
+        right: edge(left, width)?,
+        bottom: edge(top, height)?,
+    })
+}
+
+/// 屏幕清单里是显示器的那一部分。目录把窗口级源（waypipe 风格）和显示器并
+/// 列，但窗口不是输出：合成器布局里没有它，触摸屏也映射不到它上面。
+fn monitors(screens: &[Screen], is_window: impl Fn(i32) -> bool) -> Vec<Screen> {
+    screens
+        .iter()
+        .filter(|screen| !is_window(screen.id))
+        .cloned()
+        .collect()
 }
 
 /// The bounds an absolute pointer covers, when every screen has its place in
@@ -1351,6 +1445,54 @@ mod tests {
         assert!(error.contains("屏幕 2"), "{error}");
         assert!(compositor_bounds(&screens[..1], None).is_err());
         assert!(compositor_bounds(&[], Some(&layout)).is_err());
+    }
+
+    /// 目录里并列着窗口级源（它没有同名输出）时，显示器照样按合成器布局定位：
+    /// 窗口不是输出，不参与逐屏配对。漏掉这一条，开着任何一个应用窗口的会话
+    /// 里所有显示器都会退回相对移动。
+    #[test]
+    fn window_sources_do_not_veto_the_monitors() {
+        let layout = scaled();
+        let screens = [
+            screen(1, (0, 0, 1600, 2560), layout.output("DP-3")),
+            screen(2, (1000, 0, 5120, 2160), layout.output("DP-1")),
+            // 一个窗口源：目录里没有原点，合成器布局里也没有它。
+            screen(3, (0, 0, 1790, 1529), None),
+        ];
+        assert!(compositor_bounds(&screens, Some(&layout)).is_err());
+        let only = monitors(&screens, |id| id == 3);
+        assert_eq!(only.len(), 2);
+        assert!(compositor_bounds(&only, Some(&layout)).is_ok());
+
+        // 触摸屏那条路上「被控端只有一块屏」数的也是显示器。
+        let single = CompositorLayout {
+            outputs: vec![output(Some("DP-1"), 0, 0, 1920, 1080)],
+        };
+        let listed = [
+            screen(0, (0, 0, 1920, 1080), single.outputs.first()),
+            screen(3, (0, 0, 800, 600), None),
+        ];
+        assert!(route_for(Some(&single), &listed, 0, None).is_err());
+        assert!(route_for(Some(&single), &monitors(&listed, |id| id == 3), 0, None).is_ok());
+    }
+
+    #[test]
+    fn a_window_rectangle_must_hold_a_pixel() {
+        let rect = window_rect((1627, 1111, 1193, 1019)).unwrap();
+        assert_eq!(
+            rect,
+            Rect {
+                left: 1627,
+                top: 1111,
+                right: 2820,
+                bottom: 2130
+            }
+        );
+        // 四角都落在窗口自己的矩形里，右下角是最后一个像素而不是它外面那个。
+        assert_eq!(point_in(rect, 0.0, 0.0), (1627, 1111));
+        assert_eq!(point_in(rect, 1.0, 1.0), (2819, 2129));
+        assert!(window_rect((0, 0, 0, 10)).is_err(), "空矩形");
+        assert!(window_rect((i32::MAX - 5, 0, 10, 10)).is_err(), "溢出");
     }
 
     #[test]

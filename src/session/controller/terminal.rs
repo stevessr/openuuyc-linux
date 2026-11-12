@@ -248,7 +248,6 @@ async fn interactive(terminal: &mut Terminal, id: u32) -> Result<()> {
     let _raw_mode = RawMode::enter()?;
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    eprintln!("[DEBUG] interactive: stdin and stdout ready, entering main loop");
     let mut input = [0u8; 16 * 1024];
     let mut last_size = (cols, rows);
     let mut tick = tokio::time::interval(Duration::from_millis(350));
@@ -265,10 +264,7 @@ async fn interactive(terminal: &mut Terminal, id: u32) -> Result<()> {
             }
             read = stdin.read(&mut input) => {
                 let count = read.context("reading local keyboard")?;
-                if count == 0 {
-                    eprintln!("[DEBUG] stdin.read returned 0 (EOF), exiting interactive loop");
-                    break;
-                }
+                if count == 0 { break; }
                 // Ctrl+] ends only the local attachment. Ctrl+C reaches the
                 // remote shell in POSIX raw mode, just like SSH.
                 if let Some(pos) = input[..count].iter().position(|b| *b == 0x1d) {
@@ -294,16 +290,21 @@ async fn interactive(terminal: &mut Terminal, id: u32) -> Result<()> {
 
 /// Never forcibly take over an existing controller. The host decides whether
 /// this authenticated UU account is allowed to open remote shell sessions.
-pub async fn run_saved(target: String, list_only: bool, attach: Option<u32>) -> Result<()> {
+pub async fn run_saved(
+    target: String, list_only: bool, attach: Option<u32>, handle: Option<u32>
+) -> Result<()> {
     let client = AuthenticatedClient::from_saved_session()?;
-    let result = run_with_client(&client, &target, list_only, attach).await;
+    let result = run_with_client(&client, &target, list_only, attach, handle).await;
     client.close().await;
     result
 }
 async fn run_with_client(
-    client: &AuthenticatedClient, target: &str, list_only: bool, attach: Option<u32>
+    client: &AuthenticatedClient, target: &str, list_only: bool, attach: Option<u32>,
+    handle: Option<u32>
 ) -> Result<()> {
-    ensure!(!(list_only && attach.is_some()), "--list conflicts with --attach");
+    ensure!(!(list_only && (attach.is_some() || handle.is_some())),
+            "--list conflicts with --attach and --handle");
+    ensure!(handle.is_none_or(|handle| handle != 0), "--handle requires a nonzero session ID");
     let devices = client.list_devices().await?;
     let candidates: Vec<_> = devices.my_binded_devices.iter()
         .filter(|d| d.alias == target || d.device_id == target).collect();
@@ -331,12 +332,15 @@ async fn run_with_client(
         crate::media::audio::AudioSettings { volume: 0, muted: true },
         None, &cancel, ControlPurpose::Terminal, false
     ).await.context("establish official UU terminal session")?;
-    let operated = operate(&connection, list_only, attach).await;
+    let operated = operate(&connection, list_only, attach, handle).await;
     let closed = connection.close().await;
     operated?;
     closed
 }
-async fn operate(connection: &ControllerConnection, list_only: bool, attach: Option<u32>) -> Result<()> {
+async fn operate(
+    connection: &ControllerConnection, list_only: bool, attach: Option<u32>,
+    handle: Option<u32>
+) -> Result<()> {
     let (channel, rx) = connection.peer.terminal_transport()?;
     tokio::time::timeout(Duration::from_secs(12), async {
         while channel.ready_state() != RTCDataChannelState::Open {
@@ -364,7 +368,9 @@ async fn operate(connection: &ControllerConnection, list_only: bool, attach: Opt
                 "remote terminal session no longer exists");
     }
     let (cols,rows) = terminal_size();
-    let id = terminal.open(attach, cols, rows).await?;
+    // --handle 不先查清单：句柄不存在时远端会用它新建，这正是「接回上次的
+    // 会话，没有就开一个」的意思。--attach 仍然要求会话确实在。
+    let id = terminal.open(attach.or(handle), cols, rows).await?;
     eprintln!("已连接 UU 官方远程终端（会话 {id}），Ctrl+] 分离，不结束远端 Shell。");
     interactive(&mut terminal, id).await
 }

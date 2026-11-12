@@ -4,19 +4,20 @@
 //! 窗口不产生重复画面；窗口内容缓冲以它自己的实际尺寸为准，窗口缩放后下一
 //! 帧即跟随。
 //!
-//! 协议本身不给窗口位置：niri 会话上再按 niri msg 的 IPC 把窗口对到它所在
-//! 输出上的全局逻辑矩形（工作区视图位置 + 输出原点），输入注入据此换算；对
-//! 不上的窗口（不在可见工作区）明确拒绝注入，而不是把点击投到别处。其他合
-//! 成器没有实测过的 IPC，不写进来——那种会话里窗口可以看（采集照常），但输
-//! 入会明确报错。
+//! 协议本身不给窗口位置：niri 会话上再问它的 IPC 套接字，把窗口对到它所在
+//! 输出上的全局逻辑矩形（工作区视图位置 + 输出原点），输入注入据此换算。
+//! niri 把自己的窗口 id 原样当作 ext_foreign_toplevel 的 identifier，所以两
+//! 边按 id 精确对上，同名窗口也不会认错。对不上的窗口（不在可见工作区、或
+//! 者滚出了视口）明确拒绝注入，而不是把点击投到别处。其他合成器没有实测过
+//! 的 IPC，不写进来——那种会话里窗口可以看（采集照常），但输入会明确报错。
 //!
 //! 窗口缓冲是预乘 ARGB：透明区域按预乘后的颜色输出（不反预乘），边缘可能
 //! 偏深；不透明的普通窗口不受影响。
 use super::{Screen, SourceGone, WL_WINDOW_PREFIX};
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use wayland_client::backend::WaylandError;
 use wayland_client::protocol::{wl_buffer, wl_registry, wl_shm, wl_shm_pool};
@@ -68,17 +69,39 @@ fn sizes() -> &'static Mutex<HashMap<String, (u32, u32)>> {
     SIZES.get_or_init(Default::default)
 }
 
-/// niri 会话上窗口的全局逻辑矩形；live_rect 用它给输入换算。
-/// 键是 (app_id, 标题, 缓冲尺寸)，与枚举到的窗口按内容对上。
-fn positions() -> &'static Mutex<HashMap<(String, String), (i32, i32, u32, u32)>> {
-    static POSITIONS: OnceLock<Mutex<HashMap<(String, String), (i32, i32, u32, u32)>>> =
-        OnceLock::new();
-    POSITIONS.get_or_init(Default::default)
+/// 一个窗口此刻在合成器逻辑空间里的位置，输入注入用它换算落点。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Placement {
+    /// 窗口的全局逻辑矩形：left, top, width, height。
+    pub rect: (i32, i32, u32, u32),
+    /// 它所在输出的全局逻辑矩形。窗口伸到这块输出之外的部位不在屏幕上，
+    /// 往那里投的点击只会落到别处。
+    pub output: (i32, i32, u32, u32),
 }
 
-fn titles() -> &'static Mutex<HashMap<String, (String, String)>> {
-    static TITLES: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
-    TITLES.get_or_init(Default::default)
+/// 一次 niri IPC 问到的全部窗口位置，按 niri 的窗口 id。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Placements {
+    /// niri 报出来的每个窗口，不管它在不在可见工作区；只为把「窗口不在屏幕
+    /// 上」和「这个合成器对不上号」两种定位失败分开说。
+    reported: HashSet<u64>,
+    /// 在可见工作区上、并且 niri 给了位置的那部分。
+    visible: HashMap<u64, Placement>,
+}
+
+/// 窗口位置隔多久向 niri 重问一次。摆着不动的窗口不必每帧都问，滚动的视图
+/// 要跟得上：一次点击把窗口聚焦之后 niri 会把它滚进视口，下一次点击就得按
+/// 新位置算。
+const PLACEMENT_TTL: Duration = Duration::from_millis(100);
+/// niri IPC 套接字的读写上限。合成器答一次是亚毫秒的事，它卡住时别把采集
+/// 线程拖住。
+const IPC_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// 最近一次问到的窗口位置和它的时刻。只由采集与目录这边刷新（见
+/// [`refresh_placements`]）；输入注入只读，不在自己的线程里等合成器。
+fn placements() -> &'static Mutex<Option<(Instant, Arc<Placements>)>> {
+    static PLACEMENTS: OnceLock<Mutex<Option<(Instant, Arc<Placements>)>>> = OnceLock::new();
+    PLACEMENTS.get_or_init(Default::default)
 }
 
 fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -615,6 +638,8 @@ impl Grab {
         _cursor: bool,
         timeout: Duration,
     ) -> Result<Option<(u32, u32)>> {
+        // 窗口在桌面上的位置跟着采集循环走，输入注入读的就是这一份。
+        refresh_placements();
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(error) = &self.state.error {
@@ -832,6 +857,7 @@ fn allocate(
 
 /// 目录条目按协议列出；尺寸走缓存，没见过的窗口当场探测一次。
 pub(crate) fn screens() -> Result<Vec<Screen>> {
+    refresh_placements();
     let toplevels = list()?;
     let mut found = Vec::new();
     for toplevel in toplevels {
@@ -842,17 +868,18 @@ pub(crate) fn screens() -> Result<Vec<Screen>> {
             continue;
         };
         let id = crate::media::capture::source_id(&identity(&toplevel.identifier))?;
-        register(id, &toplevel, (width, height));
-        let position = niri_rect(&toplevel.app_id, &toplevel.title);
-        let (left, top) = position.map(|rect| (rect.0, rect.1)).unwrap_or((0, 0));
+        register(id, &toplevel);
         found.push(Screen {
             id,
             device_name: format!("win-{}", short(&toplevel.identifier)),
             display_name: display_name(&toplevel),
             width,
             height,
-            left,
-            top,
+            // 窗口源不在显示器拓扑里：这个原点只表示「没有」，输入换算一律
+            // 走实时的窗口位置（见 [`placement`]）。跟着窗口动的原点还会让
+            // 输入几何每滚一下就变一次，持有的按键和鼠标键都被跟着放开。
+            left: 0,
+            top: 0,
             primary: false,
             fps: 60,
             dpi_scale: None,
@@ -896,6 +923,7 @@ fn cached_size(toplevel: &Toplevel) -> Option<(u32, u32)> {
 
 /// 重新查询一个窗口源：标题/尺寸可能变了；窗口没了报 SourceGone。
 pub(crate) fn refresh(selected: &Screen) -> Result<Screen> {
+    refresh_placements();
     let identity_owned = selected.identity.clone().unwrap_or_default();
     let identifier = parse_identity(&identity_owned)?;
     let toplevels = list()?;
@@ -904,16 +932,15 @@ pub(crate) fn refresh(selected: &Screen) -> Result<Screen> {
         .find(|entry| entry.identifier == identifier)
         .context("窗口已关闭")?;
     let size = cached_size(toplevel).context("窗口还没有可采集的缓冲尺寸")?;
-    let position = niri_rect(&toplevel.app_id, &toplevel.title);
-    let (left, top) = position.map(|rect| (rect.0, rect.1)).unwrap_or((0, 0));
     Ok(Screen {
         id: selected.id,
         device_name: selected.device_name.clone(),
         display_name: display_name(toplevel),
         width: size.0,
         height: size.1,
-        left,
-        top,
+        // 与目录条目一致：窗口源没有拓扑原点（见 [`screens`]）。
+        left: 0,
+        top: 0,
         primary: false,
         fps: selected.fps,
         dpi_scale: None,
@@ -924,12 +951,52 @@ pub(crate) fn refresh(selected: &Screen) -> Result<Screen> {
     })
 }
 
-/// 窗口源当前在桌面上的全局逻辑矩形（输入注入用）。X11 的 rect 是 X 像素，
-/// 这里的 rect 是合成器逻辑空间，各走各的注入路径。
-pub(crate) fn live_rect(id: i32) -> Option<(i32, i32, u32, u32)> {
+/// 窗口源此刻在桌面上的位置（输入注入用），在合成器的逻辑空间里。只读缓
+/// 存，不等合成器：缓存由采集循环和目录刷新保持新鲜。定位不到返回 None，
+/// 调用方明确报错，而不是把点击投到别处。
+pub(crate) fn placement(id: i32) -> Option<Placement> {
     let identifier = lock(reverse()).get(&id).cloned()?;
-    let (app_id, title) = lock(titles()).get(&identifier).cloned()?;
-    lock(positions()).get(&(app_id, title)).copied()
+    let snapshot = lock(placements()).as_ref().map(|(_, found)| found.clone());
+    let found = placement_in(snapshot.as_deref(), &identifier);
+    note_placement(id, found.as_ref().err().copied());
+    found.ok()
+}
+
+/// 在一份位置快照里找一个窗口；找不到时说明是哪一种找不到。
+fn placement_in(
+    snapshot: Option<&Placements>,
+    identifier: &str,
+) -> Result<Placement, &'static str> {
+    let snapshot = snapshot.ok_or("合成器没有可用的窗口位置接口（目前只有 niri）")?;
+    // niri 的 identifier 就是它的窗口 id；别的形式对不上号。
+    let window = identifier
+        .parse::<u64>()
+        .ok()
+        .filter(|window| snapshot.reported.contains(window))
+        .ok_or("合成器的窗口清单里没有这个窗口")?;
+    snapshot
+        .visible
+        .get(&window)
+        .copied()
+        .ok_or("窗口不在可见工作区，或者已经滚出视口")
+}
+
+/// 一个窗口源定位得到还是定位不到，只在变化时记一条：输入事件一秒上百个，
+/// 每个都记会刷屏。
+fn note_placement(id: i32, failure: Option<&'static str>) {
+    static FAILING: Mutex<Option<(i32, &'static str)>> = Mutex::new(None);
+    let mut failing = lock(&FAILING);
+    match failure {
+        Some(reason) if *failing != Some((id, reason)) => {
+            *failing = Some((id, reason));
+            tracing::warn!(screen = id, reason, "窗口源定位不到，按位置注入的输入会被拒绝");
+        }
+        None if failing.is_some_and(|(screen, _)| screen == id) => {
+            *failing = None;
+            tracing::info!(screen = id, "窗口源重新定位到了");
+        }
+        _ => {}
+    }
 }
 
 /// 输入注入按 id 找窗口时用它判断这是不是窗口源。
@@ -937,74 +1004,204 @@ pub(crate) fn knows(id: i32) -> bool {
     lock(reverse()).contains_key(&id)
 }
 
-/// 枚举时登记 id → identifier → 标题/应用，并算好 niri 的全局逻辑矩形。
-fn register(id: i32, toplevel: &Toplevel, size: (u32, u32)) {
+/// 枚举时登记 id → identifier，输入注入按屏幕 id 找回窗口。
+fn register(id: i32, toplevel: &Toplevel) {
     lock(reverse()).insert(id, toplevel.identifier.clone());
-    lock(titles()).insert(
-        toplevel.identifier.clone(),
-        (toplevel.app_id.clone(), toplevel.title.clone()),
-    );
-    if let Some(rect) = niri_rect(&toplevel.app_id, &toplevel.title) {
-        lock(positions()).insert(
-            (toplevel.app_id.clone(), toplevel.title.clone()),
-            rect,
-        );
-    }
 }
 
-/// niri 会话上窗口在桌面上的全局逻辑矩形：工作区视图内的位置加输出原点，
-/// 尺寸用 IPC 的逻辑值（捕获缓冲是物理像素，缩放会话里两者不相等）。
-/// 只算可见工作区上的窗口；合成器没有这个 IPC（或窗口对不上）时返回
-/// None，输入注入会明确报错。窗口按 app_id + 标题匹配，同名窗口取第一个。
-fn niri_rect(app_id: &str, title: &str) -> Option<(i32, i32, u32, u32)> {
-    let layout = crate::platform::display::compositor_layout()?;
-    let windows = niri_json(&["windows", "--json"])?;
-    let workspaces = niri_json(&["workspaces", "--json"])?;
-    // workspace_id → 输出名，只要可见工作区。
-    let mut outputs = HashMap::new();
-    for workspace in workspaces.as_array()? {
-        let active = workspace.get("is_active").and_then(|v| v.as_bool())?;
-        if !active {
-            continue;
-        }
-        let id = workspace.get("id").and_then(|v| v.as_i64())?;
-        let output = workspace.get("output").and_then(|v| v.as_str())?.to_owned();
-        outputs.insert(id, output);
+/// 让窗口位置缓存不过期：过了 [`PLACEMENT_TTL`] 就向 niri 重问一次。niri 不
+/// 在（别的合成器）或者问不到时把缓存清掉——旧位置不能继续当作现况用。
+fn refresh_placements() {
+    if lock(placements())
+        .as_ref()
+        .is_some_and(|(taken, _)| taken.elapsed() < PLACEMENT_TTL)
+    {
+        return;
     }
-    for window in windows.as_array()? {
-        let window_app_id = window.get("app_id").and_then(|v| v.as_str())?;
-        let window_title = window.get("title").and_then(|v| v.as_str())?;
-        if window_app_id != app_id || window_title != title {
-            continue;
-        }
-        let window_layout = window.get("layout")?;
-        let window_size = window_layout.get("window_size").and_then(|v| v.as_array())?;
-        let width = window_size.first().and_then(|v| v.as_u64())? as u32;
-        let height = window_size.get(1).and_then(|v| v.as_u64())? as u32;
-        let workspace_id = window.get("workspace_id").and_then(|v| v.as_i64())?;
-        let output_name = outputs.get(&workspace_id)?;
-        let output = layout.output(output_name)?;
-        let tile = window_layout
-            .get("tile_pos_in_workspace_view")
-            .and_then(|v| v.as_array())?;
-        let left = tile.first().and_then(|v| v.as_f64())? as i32 + output.left;
-        let top = tile.get(1).and_then(|v| v.as_f64())? as i32 + output.top;
-        return Some((left, top, width, height));
-    }
-    None
+    refresh_placements_now();
 }
 
-/// niri msg 的 JSON 输出；niri 不在（其他合成器）时返回 None。
-fn niri_json(args: &[&str]) -> Option<serde_json::Value> {
-    let output = std::process::Command::new("niri")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
+/// 不管缓存多新都重问一次。合成器刚被要求把窗口挪进视口之后用它：输入注
+/// 入要按新的位置算，等不到下一个采集帧。
+fn refresh_placements_now() {
+    // 不拿着锁去问合成器：输入注入那边读缓存，不该等这一次往返。
+    let found = query_placements().map(|found| (Instant::now(), Arc::new(found)));
+    *lock(placements()) = found;
+}
+
+/// 问一次 niri：每个窗口在哪个工作区、瓦片摆在视图的什么位置。
+fn query_placements() -> Option<Placements> {
+    // 没有 niri 的会话连套接字都没有，不必再去要合成器布局。
+    std::env::var_os("NIRI_SOCKET")?;
+    // 第一次问可能早于布局监视线程发布第一份描述（比如测试进程刚起来）。
+    // 等这一份是有限次的：发布过之后 [`layout_soon`] 直接读快照。
+    let layout = crate::platform::display::compositor_layout_soon()?;
+    let windows = niri_request("Windows")?;
+    let workspaces = niri_request("Workspaces")?;
+    Some(placements_of(&layout, &windows, &workspaces))
+}
+
+/// 把一个窗口切到可见位置：niri 的 `FocusWindow` 会切到它所在的工作区，并把
+/// 它滚进视口。窗口源可以在别的工作区上被采集，但指针只能落到屏幕上看得见
+/// 的地方——不先把它露出来，窗口级输入就没有落点。
+///
+/// 只在窗口确实在 niri 的清单里、但当前不可见时试；同一个窗口最多每秒试一
+/// 次，免得输入事件把 IPC 打满。成功之后立刻重问位置，调用方马上就能算落点。
+pub(crate) fn reveal(id: i32) -> bool {
+    let Some(identifier) = lock(reverse()).get(&id).cloned() else {
+        return false;
+    };
+    let Ok(window) = identifier.parse::<u64>() else {
+        // 别的合成器的 identifier 不是 niri 的窗口 id，没有能对上的窗口。
+        return false;
+    };
+    let known = lock(placements())
+        .as_ref()
+        .is_some_and(|(_, found)| found.reported.contains(&window));
+    if !known || !allow_reveal(window) {
+        return false;
+    }
+    tracing::info!(screen = id, window, "窗口不在屏幕上，切到它所在的工作区以便注入输入");
+    if !niri_action(&focus_request(window)) {
+        return false;
+    }
+    refresh_placements_now();
+    true
+}
+
+/// niri 的「聚焦这个窗口」动作：切到它所在的工作区，并把它滚进视口。
+fn focus_request(window: u64) -> String {
+    format!(r#"{{"FocusWindow":{{"id":{window}}}}}"#)
+}
+
+/// 同一个窗口的「切到可见位置」最多每秒试一次。输入事件一秒上百个，每次都
+/// 问一遍合成器只会白等；合成器没做到时（窗口固定在别处）也别一直重试。
+fn allow_reveal(window: u64) -> bool {
+    const RETRY: Duration = Duration::from_secs(1);
+    static LAST: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+    let mut last = lock(&LAST);
+    if last.is_some_and(|(id, at)| id == window && at.elapsed() < RETRY) {
+        return false;
+    }
+    *last = Some((window, Instant::now()));
+    true
+}
+
+/// 把 niri 的窗口与工作区清单换算成全局逻辑矩形。只算可见工作区（每块输出
+/// 上当前显示的那个）上的窗口；别的工作区上的窗口 niri 也报位置，但那是它
+/// 自己工作区视图里的位置，屏幕上并没有它。
+fn placements_of(
+    layout: &crate::platform::CompositorLayout,
+    windows: &serde_json::Value,
+    workspaces: &serde_json::Value,
+) -> Placements {
+    use serde_json::Value;
+    // 可见工作区的 id → 它所在的输出。
+    let shown: HashMap<i64, &crate::platform::CompositorOutput> = workspaces
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|workspace| workspace.get("is_active").and_then(Value::as_bool) == Some(true))
+        .filter_map(|workspace| {
+            let id = workspace.get("id").and_then(Value::as_i64)?;
+            let output = workspace.get("output").and_then(Value::as_str)?;
+            Some((id, layout.output(output)?))
+        })
+        .collect();
+    let mut placements = Placements::default();
+    // 一个窗口的字段不全（没有 app_id 的窗口、没有位置的窗口）只跳过它自己。
+    for window in windows.as_array().into_iter().flatten() {
+        let Some(id) = window.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+        placements.reported.insert(id);
+        let Some(output) = window
+            .get("workspace_id")
+            .and_then(Value::as_i64)
+            .and_then(|workspace| shown.get(&workspace))
+        else {
+            continue;
+        };
+        if let Some(rect) = window_rect(window, output) {
+            placements.visible.insert(
+                id,
+                Placement {
+                    rect,
+                    output: (output.left, output.top, output.width, output.height),
+                },
+            );
+        }
+    }
+    placements
+}
+
+/// 一个窗口的全局逻辑矩形：瓦片在工作区视图里的位置，加上窗口在瓦片里的偏
+/// 移（边框之类），再加输出原点；尺寸用 IPC 的逻辑值（捕获缓冲是物理像素，
+/// 缩放的输出上两者不相等）。整个滚出视口的瓦片 niri 不给位置，返回 None。
+fn window_rect(
+    window: &serde_json::Value,
+    output: &crate::platform::CompositorOutput,
+) -> Option<(i32, i32, u32, u32)> {
+    use serde_json::Value;
+    let layout = window.get("layout")?;
+    let pair = |name: &str| -> Option<(f64, f64)> {
+        let values = layout.get(name)?.as_array()?;
+        Some((values.first()?.as_f64()?, values.get(1)?.as_f64()?))
+    };
+    let tile = pair("tile_pos_in_workspace_view")?;
+    let offset = pair("window_offset_in_tile").unwrap_or((0.0, 0.0));
+    let size = layout.get("window_size").and_then(Value::as_array)?;
+    let extent = |index: usize| -> Option<u32> {
+        u32::try_from(size.get(index)?.as_u64()?)
+            .ok()
+            .filter(|extent| *extent > 0 && *extent <= 65536)
+    };
+    let (width, height) = (extent(0)?, extent(1)?);
+    // 位置四舍五入到整像素；越界的值（不该有）不参与换算。
+    let whole = |value: f64, origin: i32| -> Option<i32> {
+        let value = value.round();
+        (value.is_finite() && value.abs() <= 1_000_000.0)
+            .then(|| (value as i32).checked_add(origin))
+            .flatten()
+    };
+    let left = whole(tile.0 + offset.0, output.left)?;
+    let top = whole(tile.1 + offset.1, output.top)?;
+    // 保证宽高加进原点不会溢出，调用方可以直接当半开矩形用。
+    left.checked_add(width as i32)?;
+    top.checked_add(height as i32)?;
+    Some((left, top, width, height))
+}
+
+/// 向 niri 的 IPC 套接字发一句请求，读回它那一行 JSON 回复。不经 `niri msg`：
+/// 位置每秒要问好几次，犯不着每次起一个进程。niri 不在、连不上、超时或者
+/// 回复不是 JSON 都返回 None。
+fn niri_call(request: &str) -> Option<serde_json::Value> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let path = std::env::var_os("NIRI_SOCKET")?;
+    let mut stream = std::os::unix::net::UnixStream::connect(path).ok()?;
+    stream.set_read_timeout(Some(IPC_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(IPC_TIMEOUT)).ok()?;
+    stream
+        .write_all(format!("{request}\n").as_bytes())
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&output.stdout).ok()
+    // 回复是一行 JSON；封个顶，免得对面不换行时一直读下去。
+    let mut line = String::new();
+    BufReader::new(stream.take(8 << 20))
+        .read_line(&mut line)
+        .ok()?;
+    serde_json::from_str(&line).ok()
+}
+
+/// 一个单元请求（`"Windows"` 这样），拿回 `Ok` 里同名的那一项。
+fn niri_request(request: &str) -> Option<serde_json::Value> {
+    let mut reply = niri_call(&format!("\"{request}\""))?;
+    Some(reply.get_mut("Ok")?.get_mut(request)?.take())
+}
+
+/// 一个动作请求（`{"Action":...}`），合成器答 `{"Ok":"Handled"}` 才算做到。
+fn niri_action(action: &str) -> bool {
+    niri_call(&format!(r#"{{"Action":{action}}}"#))
+        .is_some_and(|reply| reply.get("Ok").is_some())
 }
 
 #[cfg(test)]
@@ -1033,6 +1230,184 @@ mod tests {
             ),
         );
         assert!(chosen_format(&[]).is_err());
+    }
+
+    fn output(
+        name: &str,
+        left: i32,
+        top: i32,
+        width: u32,
+        height: u32,
+    ) -> crate::platform::CompositorOutput {
+        crate::platform::CompositorOutput {
+            name: Some(name.into()),
+            left,
+            top,
+            width,
+            height,
+            rotation: Default::default(),
+        }
+    }
+
+    /// 开发机上 niri 的真实回复（裁剪过）：三块输出，eDP-1 缩放 1.5、摆在
+    /// (1200, 1067)；工作区 6 上的视图正对着 50 号窗口。
+    fn sample() -> (
+        crate::platform::CompositorLayout,
+        serde_json::Value,
+        serde_json::Value,
+    ) {
+        let layout = crate::platform::CompositorLayout {
+            outputs: vec![
+                output("DP-1", 0, 0, 1200, 1920),
+                output("HDMI-A-1", 1200, 0, 1706, 1066),
+                output("eDP-1", 1200, 1067, 1706, 1066),
+            ],
+        };
+        let workspaces = serde_json::json!([
+            {"id": 3, "idx": 3, "name": null, "output": "HDMI-A-1", "is_active": true},
+            {"id": 10, "idx": 2, "name": null, "output": "HDMI-A-1", "is_active": false},
+            {"id": 6, "idx": 2, "name": null, "output": "eDP-1", "is_active": true},
+        ]);
+        let windows = serde_json::json!([
+            // 没有 app_id、整个滚出视口（niri 不给位置）的窗口排在最前面。
+            {"id": 24, "title": "OpenUUYC · 控制中心", "app_id": null, "workspace_id": 6,
+             "layout": {"window_size": [1024, 764], "tile_pos_in_workspace_view": null,
+                        "window_offset_in_tile": [0.0, 0.0]}},
+            // 不在可见工作区：niri 照样报位置，但屏幕上没有它。
+            {"id": 19, "title": "Steam", "app_id": "steam", "workspace_id": 10,
+             "layout": {"window_size": [1358, 1059],
+                        "tile_pos_in_workspace_view": [-775.3333333333334, 4.0],
+                        "window_offset_in_tile": [0.0, 0.0]}},
+            {"id": 33, "title": "Edge", "app_id": "microsoft-edge", "workspace_id": 3,
+             "layout": {"window_size": [1358, 1059],
+                        "tile_pos_in_workspace_view": [174.66666666666666, 4.0],
+                        "window_offset_in_tile": [0.0, 0.0]}},
+            // 两个同名的 kitty：45 大半滚出视口左边，50 在正中、带 2x3 的边框偏移。
+            {"id": 45, "title": "Claude Code", "app_id": "kitty", "workspace_id": 6,
+             "layout": {"window_size": [1193, 1019],
+                        "tile_pos_in_workspace_view": [-770.6666666666666, 44.0],
+                        "window_offset_in_tile": [0.0, 0.0]}},
+            {"id": 50, "title": "Claude Code", "app_id": "kitty", "workspace_id": 6,
+             "layout": {"window_size": [1193, 1019],
+                        "tile_pos_in_workspace_view": [426.6666666666667, 44.0],
+                        "window_offset_in_tile": [2.0, 3.0]}},
+        ]);
+        (layout, windows, workspaces)
+    }
+
+    #[test]
+    fn windows_are_placed_by_id_in_the_compositor_layout() {
+        let (layout, windows, workspaces) = sample();
+        let found = placements_of(&layout, &windows, &workspaces);
+        // 报出来的窗口一个不少，哪怕它没有位置、没有 app_id。
+        assert_eq!(found.reported, HashSet::from([24, 19, 33, 45, 50]));
+        // 视图里的位置加输出原点。
+        assert_eq!(
+            found.visible[&33],
+            Placement {
+                rect: (1375, 4, 1358, 1059),
+                output: (1200, 0, 1706, 1066),
+            }
+        );
+        // 同名窗口按 id 区分；窗口在瓦片里的偏移（边框）也算进去。
+        assert_eq!(found.visible[&50].rect, (1629, 1114, 1193, 1019));
+        assert_eq!(found.visible[&45].rect, (429, 1111, 1193, 1019));
+        assert_eq!(found.visible[&45].output, (1200, 1067, 1706, 1066));
+        // 别的工作区上的、整个滚出视口的，屏幕上都没有它。
+        assert_eq!(found.visible.len(), 3);
+    }
+
+    #[test]
+    fn an_unplaceable_window_says_why() {
+        let (layout, windows, workspaces) = sample();
+        let found = placements_of(&layout, &windows, &workspaces);
+        assert_eq!(placement_in(Some(&found), "50"), Ok(found.visible[&50]));
+        // 在清单里、但屏幕上没有：别的工作区上的窗口，滚出视口的窗口。
+        for hidden in ["19", "24"] {
+            let reason = placement_in(Some(&found), hidden).unwrap_err();
+            assert!(reason.contains("可见工作区"), "{hidden}: {reason}");
+        }
+        // 清单里没有的 id、不是 id 的 identifier（别的合成器）都对不上号。
+        for unknown in ["7", "f3a9c0de11", "-50", ""] {
+            let reason = placement_in(Some(&found), unknown).unwrap_err();
+            assert!(reason.contains("清单"), "{unknown:?}: {reason}");
+        }
+        assert!(placement_in(None, "50").unwrap_err().contains("niri"));
+    }
+
+    #[test]
+    fn malformed_replies_place_nothing() {
+        let (layout, windows, workspaces) = sample();
+        for odd in [
+            serde_json::json!(null),
+            serde_json::json!({"Windows": []}),
+            // 没有 id、不是对象、尺寸为零、位置不是数。
+            serde_json::json!([
+                {"title": "x", "workspace_id": 6},
+                5,
+                {"id": 9, "workspace_id": 6,
+                 "layout": {"window_size": [0, 10], "tile_pos_in_workspace_view": [0.0, 0.0]}},
+                {"id": 8, "workspace_id": 6,
+                 "layout": {"window_size": [10, 10], "tile_pos_in_workspace_view": ["a", 0.0]}},
+            ]),
+        ] {
+            let found = placements_of(&layout, &odd, &workspaces);
+            assert!(found.visible.is_empty(), "{odd}");
+        }
+        // 工作区清单读不出来时，没有哪个工作区算可见。
+        let found = placements_of(&layout, &windows, &serde_json::json!("oops"));
+        assert_eq!(found.reported.len(), 5);
+        assert!(found.visible.is_empty());
+    }
+
+    #[test]
+    fn focus_request_uses_niris_window_id() {
+        let request = focus_request(50);
+        assert_eq!(request, r#"{"FocusWindow":{"id":50}}"#);
+        // 外层动作包由 niri_action 加，拼起来是 niri 的 Request 形状。
+        let full = format!(r#"{{"Action":{request}}}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&full).unwrap();
+        assert_eq!(parsed["Action"]["FocusWindow"]["id"], 50);
+    }
+
+    #[test]
+    fn reveal_is_rate_limited_per_window() {
+        // 用别的测试不会碰到的窗口 id：限频状态是进程里共享的。
+        assert!(allow_reveal(9_000_001));
+        assert!(!allow_reveal(9_000_001), "同一个窗口一秒内只试一次");
+        assert!(allow_reveal(9_000_002));
+    }
+
+    /// 需要 niri 会话：`cargo test --lib wlr_window -- --ignored --nocapture`。
+    #[test]
+    #[ignore = "queries the local compositor; needs a running niri session"]
+    fn live_placements_cover_the_listed_toplevels() {
+        let found = query_placements().expect("niri IPC");
+        let toplevels = list().unwrap();
+        assert!(!toplevels.is_empty(), "no toplevels listed");
+        for toplevel in &toplevels {
+            eprintln!(
+                "{:>4} {:<28} -> {:?}",
+                toplevel.identifier,
+                toplevel.title.chars().take(28).collect::<String>(),
+                placement_in(Some(&found), &toplevel.identifier)
+            );
+            // niri 把窗口 id 当作 identifier：协议列出来的每个窗口都在它的清单里。
+            let id = toplevel.identifier.parse::<u64>().expect("identifier is a window id");
+            assert!(found.reported.contains(&id), "{id} missing from niri's list");
+        }
+        // 每个有位置的窗口，都和它所在的输出有交集。
+        for (id, placement) in &found.visible {
+            let ((left, top, width, height), (ol, ot, ow, oh)) = (placement.rect, placement.output);
+            assert!(
+                left < ol + ow as i32
+                    && left + width as i32 > ol
+                    && top < ot + oh as i32
+                    && top + height as i32 > ot,
+                "{id}: {placement:?}"
+            );
+        }
+        assert!(!found.visible.is_empty());
     }
 
     /// 需要 niri 会话与已映射的窗口：`cargo test --lib wlr_window -- --ignored --nocapture`。

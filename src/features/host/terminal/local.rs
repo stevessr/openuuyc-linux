@@ -677,12 +677,29 @@ fn attach_arguments(exe: &std::path::Path, session: u32) -> Vec<std::ffi::OsStri
 }
 
 /// 在系统终端里运行本程序的远程终端子命令。
+///
+/// 带上按设备算出来的固定句柄：关掉这个终端窗口只是分离，远端 Shell 留着；
+/// 再点一次「远程终端」按同一个句柄接回去，而不是又开一个新的。句柄只由设备
+/// ID 决定，同一次登录下不同设备互不相同；31 位里撞上别的主控随机句柄的概率
+/// 可以忽略。
 fn remote_terminal_arguments(exe: &std::path::Path, device_id: &str) -> Vec<std::ffi::OsString> {
     vec![
         exe.as_os_str().to_owned(),
         "remote-terminal".into(),
         device_id.into(),
+        "--handle".into(),
+        stable_handle(device_id).to_string().into(),
     ]
+}
+
+/// 由设备 ID 得到的固定会话句柄（FNV-1a，非零）。
+fn stable_handle(device_id: &str) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in device_id.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    (hash & 0x7fff_ffff).max(1)
 }
 
 /// 找一个能运行命令的终端模拟器。`$TERMINAL` 优先，再试常见的几个。
@@ -762,14 +779,21 @@ mod tests {
             std::path::Path::new("/opt/openuuyc/OpenUUYC"),
             "test-device-id"
         );
+        let handle = stable_handle("test-device-id");
+        assert_ne!(handle, 0);
         assert_eq!(
             arguments,
             vec![
                 std::ffi::OsString::from("/opt/openuuyc/OpenUUYC"),
                 std::ffi::OsString::from("remote-terminal"),
                 std::ffi::OsString::from("test-device-id"),
+                std::ffi::OsString::from("--handle"),
+                std::ffi::OsString::from(handle.to_string()),
             ]
         );
+        // 同一个设备总是同一个句柄，不同设备（实际使用中）不会共用。
+        assert_eq!(handle, stable_handle("test-device-id"));
+        assert_ne!(handle, stable_handle("another-device-id"));
     }
 
     /// A private socket under a fresh directory, served from its own table:
