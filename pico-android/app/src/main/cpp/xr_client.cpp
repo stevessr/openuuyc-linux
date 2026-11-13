@@ -21,6 +21,7 @@
 #include "xr_grip_hold.h"
 #include "xr_panel_orbit.h"
 #include "xr_ray_geometry.h"
+#include "xr_workspace.h"
 #include <android/log.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -52,6 +53,16 @@ static std::atomic<bool> pointer_probe_requested{false};
 static std::atomic<uint32_t> window_visible_mask{1u};
 static std::atomic<bool> passthrough_requested{true};
 static std::atomic<bool> layout_reset{false};
+// Vision Pro-style workspace state: mode/distance come from Java prefs; a
+// manual grab wins over auto-arrangement until the user applies a layout again.
+static std::atomic<int> workspace_mode{WORKSPACE_AUTO};
+static std::atomic<float> workspace_distance{2.2f};
+static std::atomic<bool> workspace_apply{true};
+static std::atomic<bool> workspace_reanchor{true};
+static std::atomic<bool> workspace_recenter_request{false};
+static std::atomic<bool> workspace_manual{false};
+// Head pose of the last explicit layout/recenter. Render thread only.
+static WorkspaceHead workspace_anchor{};
 static std::atomic<float> panel_aspects[6]{{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f}};
 static std::atomic<int> panel_scale_requests[6]{};
 static PanelGeometry panels[6] = {{0.f,0.f,1.65f},{-1.55f,0.f,1.25f},{1.55f,0.f,1.25f},{0.f,1.3f,1.25f},{-1.55f,1.3f,1.25f},{1.55f,1.3f,1.25f}};
@@ -84,6 +95,7 @@ static bool follow_click_valid=false;
 static bool frame_available = false;
 static std::atomic<bool> follow_view{false};
 static int grabbed_pane = -1;
+static PanelGeometry workspace_grab_start{};
 static bool resizing = false;
 static int resize_corner=3;
 static float resize_anchor_x=0,resize_anchor_y=0,resize_anchor_z=-2;
@@ -826,6 +838,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
             if (grabbed_pane < 0 && down && !last_down) {
                 interaction_hand=hand;
                 grabbed_pane=pane>=13?(pane-13)/4:pane-7; resizing=pane>=13;
+                workspace_grab_start=panels[grabbed_pane];
                 resize_corner=pane>=13?(pane-13)%4:3;
                 const auto &p=panels[grabbed_pane];
                 const float sx=resize_corner%2?1.f:-1.f,sy=resize_corner<2?1.f:-1.f;
@@ -874,6 +887,13 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
                             {d.x,d.y,d.z},{grab_depth_origin.x,grab_depth_origin.y,grab_depth_origin.z},window_grab_radius,grab_u,grab_v,p.aspect,false);
                     }
                 }
+                // Only a real move/resize wins over automatic re-fitting; a
+                // press without motion must not disable it. Compare against the
+                // grab start, not the previous frame, so slow drags also count.
+                if(std::fabs(p.x-workspace_grab_start.x)+std::fabs(p.y-workspace_grab_start.y)+
+                       std::fabs(p.z-workspace_grab_start.z)>.01f ||
+                   std::fabs(p.width-workspace_grab_start.width)>.001f)
+                    workspace_manual.store(true,std::memory_order_release);
             }
             if(!down) {grabbed_pane=-1;interaction_hand=-1;grip_dragging=false;}
             last_down=down;last_pane=pane;old_u=u;old_v=v;
@@ -999,7 +1019,34 @@ Java_org_openuuyc_pico_PicoActivity_nativeDockMenu(JNIEnv *,jobject,jint pane) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeSetWindowAspect(JNIEnv *,jobject,jint pane,jint width,jint height) {
-    if(pane>=0 && pane<6 && width>0 && height>0) panel_aspects[pane].store(std::clamp(float(height)/width,.125f,8.f));
+    if(pane>=0 && pane<6 && width>0 && height>0) {
+        const float next=std::clamp(float(height)/width,.125f,8.f);
+        // Window-info republishing reports unchanged sizes too; only a real
+        // aspect change may move the workspace.
+        if(panel_aspects[pane].exchange(next)!=next && !workspace_manual.load(std::memory_order_relaxed))
+            workspace_apply.store(true,std::memory_order_release);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeSetWorkspace(JNIEnv *,jobject,jint mode,jfloat distance) {
+    workspace_mode.store(workspace_clamp_mode(mode),std::memory_order_relaxed);
+    workspace_distance.store(workspace_clamp_distance(distance),std::memory_order_relaxed);
+    workspace_manual.store(false,std::memory_order_release);
+    workspace_reanchor.store(true,std::memory_order_release);
+    workspace_apply.store(true,std::memory_order_release);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeApplyWorkspace(JNIEnv *,jobject) {
+    workspace_manual.store(false,std::memory_order_release);
+    workspace_reanchor.store(true,std::memory_order_release);
+    workspace_apply.store(true,std::memory_order_release);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_openuuyc_pico_PicoActivity_nativeRecenterWorkspace(JNIEnv *,jobject) {
+    workspace_recenter_request.store(true,std::memory_order_release);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1019,7 +1066,12 @@ Java_org_openuuyc_pico_PicoActivity_nativeSetFollowView(JNIEnv *, jobject, jbool
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_org_openuuyc_pico_PicoActivity_nativeResetLayout(JNIEnv *, jobject) { layout_reset.store(true); }
+Java_org_openuuyc_pico_PicoActivity_nativeResetLayout(JNIEnv *, jobject) {
+    layout_reset.store(true);
+    workspace_manual.store(false,std::memory_order_release);
+    workspace_reanchor.store(true,std::memory_order_release);
+    workspace_apply.store(true,std::memory_order_release);
+}
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_openuuyc_pico_PicoActivity_nativeSetWindowVisible(JNIEnv *, jobject, jint pane, jboolean visible) {
@@ -1027,6 +1079,9 @@ Java_org_openuuyc_pico_PicoActivity_nativeSetWindowVisible(JNIEnv *, jobject, ji
     const uint32_t bit = 1u << pane;
     if (visible) window_visible_mask.fetch_or(bit, std::memory_order_acq_rel);
     else window_visible_mask.fetch_and(~bit, std::memory_order_acq_rel);
+    // Opening or closing a desktop re-fits the workspace, unless the user has
+    // placed windows by hand since the last explicit layout.
+    if(!workspace_manual.load(std::memory_order_relaxed)) workspace_apply.store(true,std::memory_order_release);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1091,6 +1146,11 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     menu_panel=default_menu_panel();menu_grab=false;menu_grip=false;interaction_hand=-1;
     {std::lock_guard<std::mutex> lock(follow_pose_mutex);follow_click_valid=false;follow_requested_valid=false;}
     toolbar_available = false; frame_available=false; grabbed_pane=-1; follow_view.store(false); layout_reset.store(true);
+    workspace_manual.store(false,std::memory_order_release);
+    workspace_anchor={};
+    workspace_reanchor.store(true,std::memory_order_release);
+    // Re-apply the saved mode/distance even if no visibility event arrives.
+    workspace_apply.store(true,std::memory_order_release);
     EGLState egl;
     Actions actions;
     bool running = false;
@@ -1327,6 +1387,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                         panels[3]={0.f,1.3f,1.25f};panels[4]={-1.55f,1.3f,1.25f};panels[5]={1.55f,1.3f,1.25f};
                         menu_panel=default_menu_panel();menu_host.store(-1);
                         grabbed_pane=-1;menu_grab=false;layout_reset.store(false);
+                        workspace_anchor={};workspace_reanchor.store(true,std::memory_order_release);
                         if(follow_report) env->CallVoidMethod(activity,follow_report,JNI_FALSE);
                     }
                 }
@@ -1343,6 +1404,8 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
             for(int i=0;i<6;++i) {
                 panels[i].aspect=panel_aspects[i].load();
                 int steps=panel_scale_requests[i].exchange(0,std::memory_order_acq_rel);
+                if(steps && !workspace_manual.load(std::memory_order_relaxed))
+                    workspace_apply.store(true,std::memory_order_release);
                 for(;steps>0;--steps) panel_scale(panels[i],1.f);
                 for(;steps<0;++steps) panel_scale(panels[i],-1.f);
                 panels[i].width=std::min(panels[i].width,panel_max_width(panels[i].aspect));
@@ -1387,6 +1450,8 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                     }
                 }
                 grabbed_pane=-1;
+                // The anchor belongs to the previous reference space.
+                workspace_anchor={};workspace_reanchor.store(true,std::memory_order_release);
                 if(!adopted) follow_view.store(actual_follow);
                 if(follow_report) env->CallVoidMethod(activity,follow_report,actual_follow?JNI_TRUE:JNI_FALSE);
             }
@@ -1417,6 +1482,42 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                     menu_panel.x=head.pose.position.x+offset.x;menu_panel.y=head.pose.position.y+offset.y;menu_panel.z=head.pose.position.z+offset.z;
                     const float dx=head.pose.position.x-menu_panel.x,dy=head.pose.position.y-menu_panel.y,dz=head.pose.position.z-menu_panel.z;
                     menu_panel.yaw=std::atan2(dx,dz);menu_panel.pitch=-std::atan2(dy,std::sqrt(dx*dx+dz*dz));
+                }
+            }
+            // Vision Pro-style workspace: arrange or recenter the visible
+            // desktops in the same space the layers and input use. Placement is
+            // requested by Java (saved prefs, layout menu, window show/hide);
+            // a manual grab suppresses automatic re-fitting.
+            XrSpaceLocation workspace_head{XR_TYPE_SPACE_LOCATION};
+            const auto workspace_flags=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+            const bool workspace_head_valid=state.shouldRender &&
+                XR_SUCCEEDED(xrLocateSpace(view,active_space,state.predictedDisplayTime,&workspace_head)) &&
+                (workspace_head.locationFlags&workspace_flags)==workspace_flags;
+            if(workspace_head_valid) {
+                const uint32_t workspace_panes=window_visible_mask.load(std::memory_order_acquire);
+                if(workspace_panes) {
+                    const auto forward=rotate_vector(workspace_head.pose.orientation,{0.f,0.f,-1.f});
+                    const WorkspaceHead head{workspace_head.pose.position.x,workspace_head.pose.position.y,
+                        workspace_head.pose.position.z,panel_anchor_yaw(forward.x,forward.z)};
+                    if(workspace_apply.exchange(false,std::memory_order_acq_rel)) {
+                        // Explicit layout/distance/rearrange actions re-anchor
+                        // in front of the current gaze; auto re-fits keep the
+                        // anchor so a recentered workspace stays in place.
+                        if(workspace_reanchor.exchange(false,std::memory_order_acq_rel))
+                            workspace_anchor=head;
+                        workspace_layout(panels,workspace_panes,
+                            workspace_distance.load(std::memory_order_relaxed),
+                            workspace_mode.load(std::memory_order_relaxed),workspace_anchor);
+                    }
+                    if(workspace_recenter_request.exchange(false,std::memory_order_acq_rel)) {
+                        if(workspace_recenter(panels,workspace_panes,head,
+                                workspace_distance.load(std::memory_order_relaxed))) {
+                            workspace_anchor=head;
+                            // The recenter already used the latest head pose;
+                            // do not let a stale explicit request re-anchor it.
+                            workspace_reanchor.store(false,std::memory_order_release);
+                        }
+                    }
                 }
             }
             // Locate the eye in the exact space used by both input and layers.

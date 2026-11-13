@@ -11,6 +11,11 @@ import org.openuuyc.pico.uu.UuDirectSession
 internal class PicoXrToolbar(
     private val surface: Surface, private val session: () -> UuDirectSession?,
     private val followView: (Boolean) -> Unit, private val reset: () -> Unit,
+    private val workspaceMode: () -> PicoXrWorkspace.Mode = {PicoXrWorkspace.Mode.AUTO},
+    private val workspaceDistance: () -> Float = {PicoXrWorkspace.default.meters},
+    private val workspaceChanged: (PicoXrWorkspace.Mode,Float) -> Unit = {_,_->},
+    private val workspaceRecenter: () -> Unit = {},
+    private val workspaceApply: () -> Unit = {},
     private val touchMode: (Boolean) -> Unit,
     private val keyboardModeChanged: (PicoKeyboardMode) -> Unit,
     private val appearance: (Boolean,Int,Int) -> Unit,
@@ -242,6 +247,14 @@ internal class PicoXrToolbar(
     private var spacePage=false
     private var windowScale: (Int?,Int) -> String = {_,_-> "请先选中一个串流窗口" }
     fun setWindowScale(action: (Int?,Int) -> String) {windowScale=action}
+    /** Layout/distance rows apply immediately; recenter and re-arrange only move panes, never resize them. */
+    private fun applyWorkspace(mode: PicoXrWorkspace.Mode,distance: Float) {
+        workspaceChanged(mode,PicoXrWorkspace.clampDistance(distance))
+        notice="已应用${mode.label}布局 · 观看距离 ${PicoXrWorkspace.distanceText(distance)}"+
+            if(mode==PicoXrWorkspace.Mode.WRAP) "；窗口过宽时自动后移以保持视野" else ""
+    }
+    private fun recenterWorkspace() {workspaceRecenter();notice="已请求重定位到当前视线 · 观看距离 ${PicoXrWorkspace.distanceText(workspaceDistance())}；极宽组可能更远，尺寸与相对布局保持不变"}
+    private fun reapplyWorkspace() {workspaceApply();notice="已请求按${workspaceMode().label}布局重新排列窗口"}
     private var mrVisibility=100
     private var customImage=false
     fun setAppearance(visibility: Int,custom: Boolean,color: Int,preset: String="black",brightness: Int=75,flow: Boolean=true) {
@@ -381,7 +394,7 @@ internal class PicoXrToolbar(
         if(isRoot()) PicoXrMenuHit.toolbar(u,v)?.let {index ->
             when(index) {
                 0 -> inputOptions()
-                3 -> {spacePage=true;dropdownOffset=0;notice="空间布局 · 跟随与固定使用菜单按钮";draw()}
+                3 -> {spacePage=true;dropdownOffset=0;notice="空间布局 · 工作区布局、观看距离与重定位";draw()}
                 8 -> {setFollowing(true);draw()}
                 9 -> {setFollowing(false);draw()}
                 10 -> {collapsed=true;draw()}
@@ -474,14 +487,17 @@ internal class PicoXrToolbar(
             PicoXrDropdownRow("返回主菜单",kind=PicoXrDropdownRow.ACTION)
         )
         spacePage->listOf(
+            PicoXrDropdownRow("工作区布局",workspaceMode().label),
+            PicoXrDropdownRow("观看距离",PicoXrWorkspace.distanceText(workspaceDistance())),
+            PicoXrDropdownRow("重定位到眼前","保持相对布局",PicoXrDropdownRow.ACTION),
+            PicoXrDropdownRow("重新排列窗口","按${workspaceMode().label}布局",PicoXrDropdownRow.ACTION),
             PicoXrDropdownRow("跟随视角",if(followPending) "切换中…" else if(following) "开启" else "关闭",PicoXrDropdownRow.TOGGLE,enabled=!followPending),
             PicoXrDropdownRow("固定窗口",kind=PicoXrDropdownRow.ACTION),
-            PicoXrDropdownRow("重置到当前视角",kind=PicoXrDropdownRow.ACTION),
             PicoXrDropdownRow("缩小 XR 窗口（−6%）","保持比例",PicoXrDropdownRow.ACTION),
             PicoXrDropdownRow("放大 XR 窗口（＋6%）","保持比例",PicoXrDropdownRow.ACTION),
             PicoXrDropdownRow("焦点圆点",if(focusDots) "开启" else "关闭（默认）",PicoXrDropdownRow.TOGGLE),
             PicoXrDropdownRow("主菜单位置",when(controllerHand) {0->"左手柄";1->"右手柄";else->"悬浮（推荐）"}),
-            PicoXrDropdownRow("窗口尺寸范围","宽度 ≥ 40 cm · 对角线 ≤ 100 英寸",enabled=false),
+            PicoXrDropdownRow("重置窗口位置","恢复默认尺寸与位置",PicoXrDropdownRow.ACTION),
             PicoXrDropdownRow("返回主菜单",kind=PicoXrDropdownRow.ACTION)
         )
         targetScreen!=null->screenSettingRows()
@@ -511,7 +527,7 @@ internal class PicoXrToolbar(
 
     private fun streamSettingRows(): List<PicoXrDropdownRow> = listOf(
         PicoXrDropdownRow("跟随视角",if(followPending) "切换中…" else if(following) "开启" else "关闭",PicoXrDropdownRow.TOGGLE,enabled=!followPending),
-        PicoXrDropdownRow("重置空间布局",kind=PicoXrDropdownRow.ACTION),
+        PicoXrDropdownRow("重置窗口位置",kind=PicoXrDropdownRow.ACTION),
         PicoXrDropdownRow("切换屏幕","›"),
         PicoXrDropdownRow("创建虚拟屏",kind=PicoXrDropdownRow.ACTION),
         PicoXrDropdownRow("MR 透视",if(mr) "开启" else "关闭",PicoXrDropdownRow.TOGGLE),
@@ -618,13 +634,17 @@ internal class PicoXrToolbar(
                 "返回主菜单"->{environmentPage=false;backgroundPage=false}
             }
             spacePage->when(label) {
+                "工作区布局"->applyWorkspace(PicoXrWorkspace.nextMode(workspaceMode()),workspaceDistance())
+                "观看距离"->applyWorkspace(workspaceMode(),PicoXrWorkspace.nextDistance(workspaceDistance()).meters)
+                "重定位到眼前"->recenterWorkspace()
+                "重新排列窗口"->reapplyWorkspace()
                 "跟随视角"->{if(!followPending) {session()?.releaseInputs();followPending=true;followView(!following)};return}
                 "固定窗口"->setFollowing(false)
-                "重置到当前视角"->{reset();return}
                 "焦点圆点"->{focusDots=!focusDots;focusDotsChanged(focusDots);notice=if(focusDots) "焦点圆点已开启" else "焦点圆点已隐藏；射线与点击保持可用"}
                 "缩小 XR 窗口（−6%）"->notice=windowScale(null,-1)
                 "放大 XR 窗口（＋6%）"->notice=windowScale(null,1)
                 "主菜单位置"->{controllerHand=when(controllerHand) {2->0;0->1;else->2};previousLayout=-1}
+                "重置窗口位置"->{reset();notice="已重置窗口尺寸与位置"}
                 "返回主菜单"->spacePage=false
             }
             qualityPage()->qualityAction(label)
@@ -726,7 +746,7 @@ internal class PicoXrToolbar(
     private fun streamSettingAction(label: String) {
         when(label) {
             "跟随视角"->{if(!followPending) {session()?.releaseInputs();followPending=true;followView(!following);notice="正在切换跟随模式…"}}
-            "重置空间布局"->{reset();notice="已重置六个桌面的空间布局"}
+            "重置窗口位置"->{reset();notice="已重置窗口尺寸与位置"}
             "切换屏幕"->openScreens()
             "创建虚拟屏"->confirmVirtualScreen()
             "MR 透视"->mr=!mr
@@ -764,14 +784,17 @@ internal class PicoXrToolbar(
             }
             if(spacePage) {
                 when(cell) {
-                    0 -> if(!followPending) {session()?.releaseInputs();followPending=true;followView(!following)}
-                    1 -> reset()
-                    2 -> setFollowing(true)
-                    3 -> setFollowing(false)
-                    7 -> options("主菜单位置",listOf("悬浮菜单（推荐）","左手柄","右手柄"),if(controllerHand==2) 0 else controllerHand+1) {controllerHand=if(it==0) 2 else it-1;previousLayout=-1}
-                    4 -> notice=windowScale(null,-1)
-                    5 -> notice=windowScale(null,1)
-                    6 -> {focusDots=!focusDots;focusDotsChanged(focusDots);notice=if(focusDots) "焦点圆点已开启" else "焦点圆点已隐藏；射线与点击保持可用"}
+                    0 -> applyWorkspace(PicoXrWorkspace.nextMode(workspaceMode()),workspaceDistance())
+                    1 -> applyWorkspace(workspaceMode(),PicoXrWorkspace.nextDistance(workspaceDistance()).meters)
+                    2 -> recenterWorkspace()
+                    3 -> reapplyWorkspace()
+                    4 -> if(!followPending) {session()?.releaseInputs();followPending=true;followView(!following)}
+                    5 -> setFollowing(false)
+                    6 -> notice=windowScale(null,-1)
+                    7 -> notice=windowScale(null,1)
+                    8 -> {focusDots=!focusDots;focusDotsChanged(focusDots);notice=if(focusDots) "焦点圆点已开启" else "焦点圆点已隐藏；射线与点击保持可用"}
+                    9 -> options("主菜单位置",listOf("悬浮菜单（推荐）","左手柄","右手柄"),if(controllerHand==2) 0 else controllerHand+1) {controllerHand=if(it==0) 2 else it-1;previousLayout=-1}
+                    10 -> {reset();notice="已重置窗口尺寸与位置"}
                     11 -> {spacePage=false;notice=if(targetScreen!=null) "已返回窗口设置" else "已返回主菜单"}
                 }
                 draw();return
@@ -931,7 +954,7 @@ internal class PicoXrToolbar(
             }
             when (cell) {
                 0 -> { if(!followPending) { direct.releaseInputs(); followPending=true; followView(!following); notice="正在切换跟随模式…" } }
-                1 -> { reset(); notice = "已重置六个桌面的空间布局" }
+                1 -> { reset(); notice = "已重置窗口尺寸与位置" }
                 2 -> openScreens()
                 3 -> { check(state.captureLevel>=5) { "远端未开放虚拟显示器功能" }; confirmingVirtual=true; notice="将在远端创建 1920×1080 虚拟显示器，是否确认？" }
                 4 -> {environmentPage=true;notice="环境 · MR 与背景"}
@@ -956,21 +979,23 @@ internal class PicoXrToolbar(
                     "${if(it.id==session()?.selectedScreen()) "✓ " else ""}${it.name.ifBlank { "屏幕 ${it.id+1}" }} ${it.current ?: ""}"
                 } ?: ""
             }} else if(confirmingVirtual) listOf("确认创建","取消","取消","取消") else if(targetScreen!=null) listOf("帧率 ${c?.fps}","画质 ${c?.quality}","码率 ${c?.bitrateMbps}M","编码：自动","远端光标","窗口大小调整","屏幕分辨率","DPI 缩放","创建虚拟屏","串流尺寸","屏幕信息","收起设置") else listOf(
-                if(followPending) "跟随：切换中" else if(following) "跟随视角：开" else "跟随视角：关", "重置布局", "切换屏幕", "创建虚拟屏",
+                if(followPending) "跟随：切换中" else if(following) "跟随视角：开" else "跟随视角：关", "重置窗口位置", "切换屏幕", "创建虚拟屏",
                 if(mr) "MR：开" else "MR：关", "背景：${listOf("全黑","深灰","深蓝")[backgroundIndex]}", "主页面", "操作帮助",
                 "键盘", "最大100英寸", if(usingTouch) "输入：触摸" else "输入：鼠标", "断开全部")
     }
 
     private fun spaceLabels(): List<String> = listOf(
+        "布局：${workspaceMode().label}",
+        "距离：${PicoXrWorkspace.distanceText(workspaceDistance())}",
+        "重定位到眼前",
+        "重新排列窗口",
         if(followPending) "跟随：切换中" else if(following) "跟随视角：开" else "跟随视角：关",
-        "重置到当前视角",
-        "跟随视角",
         "固定窗口",
         "缩小窗口（−6%）",
         "放大窗口（＋6%）",
         if(focusDots) "焦点圆点：开" else "焦点圆点：关（默认）",
         when(controllerHand) {0->"主菜单：左手柄";1->"主菜单：右手柄";else->"主菜单：悬浮"},
-        "", "", "",
+        "重置窗口位置",
         if(targetScreen!=null) "返回窗口设置" else "返回主菜单"
     )
     fun draw() {

@@ -236,6 +236,8 @@ cargo dist
 桌面和应用窗口通过 UU WebRTC 视频轨传输；PCVR 双眼画面从头显的
 「附加已有 VR 应用 → 附加 SteamVR 运行中场景」入口请求。
 本页已移除 ADB/scrcpy 投屏入口，不要求为原生串流开启 USB 调试。
+沉浸式会话的屏幕支持自动/并排/环绕工作区、近/标准/远观看距离与一键重定位，
+布局会记住；详见 [PICO 空间工作区](pico-android/docs/XR-WORKSPACE.md)。
 真实游戏、头显双眼画面与交互仍需实机联测。
 
 

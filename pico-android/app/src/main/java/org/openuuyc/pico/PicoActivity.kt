@@ -64,6 +64,9 @@ open class PicoActivity : Activity() {
     }
     private external fun nativeRun(activity: PicoActivity)
     private external fun nativeResetLayout()
+    private external fun nativeSetWorkspace(mode: Int,distance: Float)
+    private external fun nativeApplyWorkspace()
+    private external fun nativeRecenterWorkspace()
     private external fun nativeSetFollowView(enabled: Boolean)
     private var xrWindowFrame: PicoXrWindowFrame? = null
     private var xrToolbar: PicoXrToolbar? = null
@@ -148,6 +151,7 @@ open class PicoActivity : Activity() {
     private external fun nativeSetPassthroughEnabled(enabled: Boolean)
     private var passthroughEnabled = true
     private lateinit var xrAppearance: PicoXrAppearance
+    private lateinit var xrWorkspace: PicoXrWorkspaceSettings
     private lateinit var cameraPreview: PicoCameraPreview
 
     private val ui = Handler(Looper.getMainLooper())
@@ -175,6 +179,8 @@ open class PicoActivity : Activity() {
         xrAppearance=PicoXrAppearance(this)
         passthroughEnabled=xrAppearance.mr
         System.loadLibrary("openuuyc_pico")
+        xrWorkspace=PicoXrWorkspaceSettings(this)
+        nativeSetWorkspace(xrWorkspace.mode.native,xrWorkspace.distance)
         nativeSetFocusDots(xrAppearance.focusDots)
         xrPointerStyle=getSharedPreferences("xr_appearance",MODE_PRIVATE).getInt("pointer_style",4).coerceIn(0,4);nativeSetPointerStyle(xrPointerStyle)
         nativeSetControllerMenu(0,xrAppearance.menuHand)
@@ -941,7 +947,7 @@ open class PicoActivity : Activity() {
             }
             if (index == 6 && running.get()) {
                 xrToolbar?.close()
-                xrToolbar = PicoXrToolbar(surface, { currentXrSession() }, ::nativeSetFollowView, { session?.showAllWindows();nativeResetLayout() }, { enabled -> xrTouchMode=enabled }, { mode -> when(mode) {PicoKeyboardMode.SYSTEM->{xrKeyboardTarget=currentXrSession();remoteKeyboard?.show()};PicoKeyboardMode.VOICE->{remoteKeyboard?.hide();xrKeyboardTarget=currentXrSession()};else->{xrKeyboardTarget=null;remoteKeyboard?.hide()}} }, { mr,color,opacity -> xrAppearance.update(mr,color,opacity);applyXrAppearance() }, { xrSettingsSession=null;nativeDockMenu(-1) }, ::openXrHome, ::connectXrDevice, ::pickXrBackground, ::setXrCustomBackground, ::changeXrBackground, ::nativeSetMenuPortrait, {xrExtraDeviceIds.values.toSet()+if(xrMainAlive) setOf(xrDeviceId) else emptySet()}) {
+                xrToolbar = PicoXrToolbar(surface, { currentXrSession() }, ::nativeSetFollowView, { session?.showAllWindows();nativeResetLayout() }, { xrWorkspace.mode }, { xrWorkspace.distance }, { mode,distance -> xrWorkspace.update(mode,distance);nativeSetWorkspace(mode.native,distance) }, { nativeRecenterWorkspace() }, { nativeApplyWorkspace() }, { enabled -> xrTouchMode=enabled }, { mode -> when(mode) {PicoKeyboardMode.SYSTEM->{xrKeyboardTarget=currentXrSession();remoteKeyboard?.show()};PicoKeyboardMode.VOICE->{remoteKeyboard?.hide();xrKeyboardTarget=currentXrSession()};else->{xrKeyboardTarget=null;remoteKeyboard?.hide()}} }, { mr,color,opacity -> xrAppearance.update(mr,color,opacity);applyXrAppearance() }, { xrSettingsSession=null;nativeDockMenu(-1) }, ::openXrHome, ::connectXrDevice, ::pickXrBackground, ::setXrCustomBackground, ::changeXrBackground, ::nativeSetMenuPortrait, {xrExtraDeviceIds.values.toSet()+if(xrMainAlive) setOf(xrDeviceId) else emptySet()}) {
                     stopSession(); finishViewer()
                 } .also { it.setLocalVrApps({callback->worker.execute {
                     val apps=runCatching {PicoLocalVrApps.list(this)}.getOrDefault(emptyList())
@@ -1114,7 +1120,10 @@ open class PicoActivity : Activity() {
         if (!hasFocus) { panelVideo?.releasePointer(); remoteKeyboard?.cancelVoice();remoteKeyboard?.releaseKeys(); xrToolbar?.releaseKeyboardKeys(); session?.releaseInputs() }
     }
 
-    @Suppress("DEPRECATION")
+    // The API < 33 overload is the only one that accepts a broadcast permission
+    // before the exported-flag parameter existed. The receiver is debug-only and
+    // guarded by android.permission.DUMP; lint's flag check is a false positive.
+    @Suppress("DEPRECATION", "UnspecifiedRegisterReceiverFlag")
     private fun registerDebugXrTestInput() {
         if (this !is XrActivity ||
             applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE == 0 ||
