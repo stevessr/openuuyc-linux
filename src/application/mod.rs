@@ -26,6 +26,19 @@ pub fn terminal_attach(session: Option<&str>, list: bool, new: bool) -> anyhow::
     crate::features::host::terminal::local::run_client(session, list, new)
 }
 
+/// Install (or remove) the running Linux build in the current user's desktop
+/// environment: `~/.local/bin`, a desktop entry, icon and `uuremote://`
+/// handler. No root rights are required and user data is never touched.
+#[cfg(target_os = "linux")]
+pub fn install_to_system(uninstall: bool) -> anyhow::Result<bool> {
+    let status = if uninstall {
+        crate::platform::linux::install::uninstall()?
+    } else {
+        crate::platform::linux::install::install()?
+    };
+    Ok(status.installed)
+}
+
 /// Hand the GUI to the installed copy when one exists. Linux has no
 /// installed copy: the built binary is the application.
 pub fn route_installed_gui() -> anyhow::Result<bool> {

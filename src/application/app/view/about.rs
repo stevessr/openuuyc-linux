@@ -36,7 +36,13 @@ impl DeviceCenterApp {
                         RichText::new(format!(
                             "v{}  ·  {} {}",
                             env!("CARGO_PKG_VERSION"),
-                            "Windows",
+                            if cfg!(windows) {
+                                "Windows"
+                            } else if cfg!(target_os = "macos") {
+                                "macOS"
+                            } else {
+                                "Linux"
+                            },
                             std::env::consts::ARCH
                         ))
                         .size(crate::ui::theme::SMALL)
@@ -48,6 +54,13 @@ impl DeviceCenterApp {
             ui.add_space(28.0);
             ui.separator();
             ui.add_space(20.0);
+            #[cfg(target_os = "linux")]
+            {
+                self.center_ui.installer.render(ui);
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(20.0);
+            }
             self.about_updates(ui);
             ui.add_space(20.0);
             ui.separator();

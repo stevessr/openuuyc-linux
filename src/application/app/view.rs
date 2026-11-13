@@ -18,6 +18,9 @@ mod diagnostic_export;
 mod diagnostics_panel;
 mod host_assist;
 mod host_settings;
+// User-level desktop integration for portable Linux builds.
+#[cfg(target_os = "linux")]
+mod installer;
 mod logs;
 #[cfg(target_os = "linux")]
 mod mr_devices;
@@ -74,6 +77,8 @@ impl Page {
 pub(super) struct CenterUi {
     #[cfg(windows)]
     pub(super) components: components::Manager,
+    #[cfg(target_os = "linux")]
+    pub(super) installer: installer::Manager,
     page: Page,
     device_lists: [devices::ListUi; 2],
     detail_id: Option<String>,

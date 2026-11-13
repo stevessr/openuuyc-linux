@@ -434,6 +434,8 @@ sudo apt install ./target/debian/openuuyc_*.deb
 
 安装后从应用菜单启动，或运行 `OpenUUYC`。
 
+便携构建也可以安装到当前用户，不需要 root：`OpenUUYC install`（或图形界面「关于 → 安装到系统」）会把程序复制到 `~/.local/bin/OpenUUYC`，写入桌面入口和图标，并登记 `uuremote://` 链接；`OpenUUYC install --uninstall` 只移除这些文件，账号与设置保留。
+
 ## 命令行更新
 
 从新下载的程序包运行 `OpenUUYC.exe update --silent`，静默更新已有安装。会中断当前连接，完成后不自动打开控制中心或重启 Windows；非管理员运行时仍需确认系统 UAC。

@@ -166,6 +166,13 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["list", "attach", "handle"])]
         pick: bool,
     },
+    /// 把当前程序安装到用户目录（桌面入口、图标、uuremote:// 链接）
+    #[cfg(target_os = "linux")]
+    Install {
+        /// 移除用户目录里的程序、桌面入口和图标，保留账号与设置
+        #[arg(long)]
+        uninstall: bool,
+    },
     /// 列出或接上本机正在运行的被控终端会话
     Terminal {
         /// 会话名或编号；省略时列出
@@ -423,6 +430,16 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Commands::CaptureAgent { pipe, parent } => {
             openuuyc::application::capture_agent(&pipe, parent)
+        }
+        #[cfg(target_os = "linux")]
+        Commands::Install { uninstall } => {
+            let installed = openuuyc::application::install_to_system(uninstall)?;
+            if installed {
+                println!("已安装到用户目录；桌面菜单和 uuremote:// 链接已可用");
+            } else {
+                println!("已从用户目录卸载；账号与设置保留");
+            }
+            Ok(())
         }
         Commands::DisplayRecovery { token } => openuuyc::application::display_recovery(&token),
         Commands::RemoteTerminal { device, list, attach, handle, pick } => {
