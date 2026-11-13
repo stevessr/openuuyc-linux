@@ -24,12 +24,44 @@ constexpr float WORKSPACE_MIN_DISTANCE = 1.2f;
 constexpr float WORKSPACE_MAX_DISTANCE = 4.0f;
 constexpr float WORKSPACE_GAP = 0.08f;
 constexpr float WORKSPACE_ROW_GAP = 0.12f;
+// Rows sit slightly below eye level, the comfortable place to read from.
+constexpr float WORKSPACE_EYE_OFFSET = -0.05f;
 // Total horizontal arc a wrap workspace may cover. Three 75-inch desktops are
 // already very wide; beyond 120 degrees the outer panes leave comfortable
 // vision, so the cylinder radius grows instead of pushing panes further aside.
 constexpr float WORKSPACE_MAX_ARC = 2.0943951f;
 
 struct WorkspaceHead { float x = 0.f, y = 0.f, z = 0.f; float yaw = 0.f; };
+
+// Layout/recenter transitions: Vision Pro moves windows instead of snapping.
+constexpr float WORKSPACE_TRANSITION_SECONDS = 0.26f;
+
+inline float workspace_ease(float t) {
+    if (!std::isfinite(t)) return 1.f;
+    t = std::clamp(t, 0.f, 1.f);
+    return t * t * (3.f - 2.f * t);
+}
+
+inline float workspace_transition_progress(double now, double start, double duration) {
+    if (!(duration > 0.0) || !std::isfinite(now) || !std::isfinite(start)) return 1.f;
+    return std::clamp(float((now - start) / duration), 0.f, 1.f);
+}
+
+// Interpolate position and width; aspect follows the target immediately because
+// the video size is not an animation property.
+inline void workspace_interpolate(PanelGeometry &out, const PanelGeometry &from,
+                                  const PanelGeometry &to, float t) {
+    const float e = workspace_ease(t);
+    out.x = from.x + (to.x - from.x) * e;
+    out.y = from.y + (to.y - from.y) * e;
+    out.z = from.z + (to.z - from.z) * e;
+    out.width = from.width + (to.width - from.width) * e;
+    out.yaw = from.yaw + (to.yaw - from.yaw) * e;
+    out.pitch = from.pitch + (to.pitch - from.pitch) * e;
+    out.roll = from.roll + (to.roll - from.roll) * e;
+    // Deliberately leave aspect untouched: the XR loop refreshes it from the
+    // latest video metadata before animation each frame.
+}
 
 inline int workspace_clamp_mode(int mode) {
     return mode < WORKSPACE_AUTO || mode > WORKSPACE_WRAP ? WORKSPACE_AUTO : mode;
@@ -179,9 +211,9 @@ inline void workspace_layout(PanelGeometry *panels, uint32_t visible, float dist
 
     const float lower_height = workspace_row_height(panels, lower, lower_count);
     const float upper_height = workspace_row_height(panels, upper, upper_count);
-    float lower_y = 0.f, upper_y = 0.f;
+    float lower_y = WORKSPACE_EYE_OFFSET, upper_y = WORKSPACE_EYE_OFFSET;
     if (lower_count > 0 && upper_count > 0)
-        upper_y = lower_height * .5f + WORKSPACE_ROW_GAP + upper_height * .5f;
+        upper_y = lower_y + lower_height * .5f + WORKSPACE_ROW_GAP + upper_height * .5f;
 
     const bool wrap = mode == WORKSPACE_WRAP ||
         (mode == WORKSPACE_AUTO && lower_count + upper_count >= 3);
@@ -212,47 +244,31 @@ inline void workspace_layout(PanelGeometry *panels, uint32_t visible, float dist
     }
 }
 
-// Vision Pro's "recenter": rigidly move the whole arrangement in front of the
-// viewer without changing sizes or the relative layout. The centroid is placed
-// slightly below eye level at the configured viewing distance, so walking away
-// from (or into) the workspace does not leave the screens behind or in the
-// user's face.
+// Vision Pro's "recenter": re-anchor the whole arrangement at the viewer's
+// current head pose. The layout frame (anchor) moves to the head, so the main
+// screen ends up in front of the gaze at the layout's distance, sizes and
+// pairwise distances stay intact, and a later workspace_layout(..., head)
+// reproduces exactly the same positions for any pane count or layout.
 inline bool workspace_recenter(PanelGeometry *panels, uint32_t visible, WorkspaceHead head,
-                               float distance) {
+                               WorkspaceHead anchor = {}) {
     visible &= (1u << WORKSPACE_SLOTS) - 1u;
-    distance = workspace_clamp_distance(distance);
-    float cx = 0.f, cy = 0.f, cz = 0.f;
-    int count = 0;
-    for (int i = 0; i < WORKSPACE_SLOTS; ++i) if (visible & (1u << i)) {
-        const PanelGeometry &panel = panels[i];
-        if (!std::isfinite(panel.x) || !std::isfinite(panel.y) || !std::isfinite(panel.z)) continue;
-        cx += panel.x; cy += panel.y; cz += panel.z; ++count;
-    }
-    if (count == 0) return false;
-    cx /= float(count); cy /= float(count); cz /= float(count);
-    const float dx = cx - head.x, dz = cz - head.z;
-    const float current_distance = std::hypot(dx, dz);
-    if (!std::isfinite(current_distance) || current_distance < .05f) return false;
-
-    // Rotate about the viewer so the arrangement's bearing matches the gaze.
-    // Head forward is (-sin yaw, -cos yaw); bearing uses atan2(x, z).
-    const float current = std::atan2(dx, dz);
-    const float desired = std::atan2(-std::sin(head.yaw), -std::cos(head.yaw));
-    const float delta = desired - current;
+    const float delta = std::remainder(head.yaw - anchor.yaw, 6.2831853f);
     const float c = std::cos(delta), s = std::sin(delta);
-    const float vertical = (head.y - .05f) - cy;
-    const float gaze_x = -std::sin(head.yaw), gaze_z = -std::cos(head.yaw);
+    int moved = 0;
     for (int i = 0; i < WORKSPACE_SLOTS; ++i) if (visible & (1u << i)) {
         PanelGeometry &panel = panels[i];
         if (!std::isfinite(panel.x) || !std::isfinite(panel.y) || !std::isfinite(panel.z)) continue;
-        const float x = panel.x - head.x, z = panel.z - head.z;
+        const float x = panel.x - anchor.x, z = panel.z - anchor.z;
         panel.x = head.x + x * c + z * s;
         panel.z = head.z - x * s + z * c;
+        panel.y = head.y + (panel.y - anchor.y);
+        ++moved;
     }
-    // Rotation preserves the centroid distance; one uniform translation along
-    // the gaze restores the configured distance without changing the layout.
-    // Never pull a pane through the viewer, even for a very wide, off-centre
-    // group: clamp the move so the nearest pane keeps 40 cm of clearance.
+    if (moved == 0) return false;
+
+    // Never pull a pane through the viewer, even for a very wide or manually
+    // placed group: keep 40 cm of clearance and move the whole group farther.
+    const float gaze_x = -std::sin(head.yaw), gaze_z = -std::cos(head.yaw);
     float nearest_depth = 1e30f;
     for (int i = 0; i < WORKSPACE_SLOTS; ++i) if (visible & (1u << i)) {
         const PanelGeometry &panel = panels[i];
@@ -260,15 +276,16 @@ inline bool workspace_recenter(PanelGeometry *panels, uint32_t visible, Workspac
         nearest_depth = std::min(nearest_depth,
             (panel.x - head.x) * gaze_x + (panel.z - head.z) * gaze_z);
     }
-    float shift = distance - current_distance;
-    if (nearest_depth < 1e29f) shift = std::max(shift, .4f - nearest_depth);
-    for (int i = 0; i < WORKSPACE_SLOTS; ++i) if (visible & (1u << i)) {
-        PanelGeometry &panel = panels[i];
-        if (!std::isfinite(panel.x) || !std::isfinite(panel.y) || !std::isfinite(panel.z)) continue;
-        panel.x += gaze_x * shift;
-        panel.z += gaze_z * shift;
-        panel.y += vertical;
-        workspace_clear_rotation(panel);
+    if (nearest_depth < 1e29f && nearest_depth < .4f) {
+        const float extra = .4f - nearest_depth;
+        for (int i = 0; i < WORKSPACE_SLOTS; ++i) if (visible & (1u << i)) {
+            PanelGeometry &panel = panels[i];
+            if (!std::isfinite(panel.x) || !std::isfinite(panel.z)) continue;
+            panel.x += gaze_x * extra;
+            panel.z += gaze_z * extra;
+        }
     }
+    for (int i = 0; i < WORKSPACE_SLOTS; ++i) if (visible & (1u << i))
+        workspace_clear_rotation(panels[i]);
     return true;
 }

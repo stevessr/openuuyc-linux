@@ -63,9 +63,33 @@ static std::atomic<bool> workspace_recenter_request{false};
 static std::atomic<bool> workspace_manual{false};
 // Head pose of the last explicit layout/recenter. Render thread only.
 static WorkspaceHead workspace_anchor{};
+// Smooth layout/recenter transitions (render thread only).
+static PanelGeometry workspace_anim_from[6]{}, workspace_anim_to[6]{};
+static bool workspace_animating=false;
+static double workspace_anim_start=0;
+static double workspace_clock() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 static std::atomic<float> panel_aspects[6]{{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f},{9.f/16.f}};
 static std::atomic<int> panel_scale_requests[6]{};
 static PanelGeometry panels[6] = {{0.f,0.f,1.65f},{-1.55f,0.f,1.25f},{1.55f,0.f,1.25f},{0.f,1.3f,1.25f},{-1.55f,1.3f,1.25f},{1.55f,1.3f,1.25f}};
+static void workspace_begin_transition(const PanelGeometry *target,uint32_t visible) {
+    // Initialise every slot: a hidden pane that becomes visible mid-transition
+    // must not interpolate from a stale from/to pair.
+    for(int i=0;i<6;++i) {
+        workspace_anim_from[i]=panels[i];
+        workspace_anim_to[i]=(visible&(1u<<i))?target[i]:panels[i];
+    }
+    workspace_anim_start=workspace_clock();
+    workspace_animating=true;
+}
+static void workspace_step_transition(uint32_t visible) {
+    if(!workspace_animating) return;
+    const float t=workspace_transition_progress(workspace_clock(),workspace_anim_start,WORKSPACE_TRANSITION_SECONDS);
+    for(int i=0;i<6;++i) if(visible&(1u<<i))
+        workspace_interpolate(panels[i],workspace_anim_from[i],workspace_anim_to[i],t);
+    if(t>=1.f) workspace_animating=false;
+}
 static bool toolbar_available = false;
 static PanelGeometry menu_panel=default_menu_panel();
 static std::atomic<bool> menu_portrait{false};
@@ -839,6 +863,7 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
                 interaction_hand=hand;
                 grabbed_pane=pane>=13?(pane-13)/4:pane-7; resizing=pane>=13;
                 workspace_grab_start=panels[grabbed_pane];
+                workspace_animating=false;
                 resize_corner=pane>=13?(pane-13)%4:3;
                 const auto &p=panels[grabbed_pane];
                 const float sx=resize_corner%2?1.f:-1.f,sy=resize_corner<2?1.f:-1.f;
@@ -1148,6 +1173,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
     toolbar_available = false; frame_available=false; grabbed_pane=-1; follow_view.store(false); layout_reset.store(true);
     workspace_manual.store(false,std::memory_order_release);
     workspace_anchor={};
+    workspace_animating=false;
     workspace_reanchor.store(true,std::memory_order_release);
     // Re-apply the saved mode/distance even if no visibility event arrives.
     workspace_apply.store(true,std::memory_order_release);
@@ -1383,11 +1409,17 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                         if(frozen!=XR_NULL_HANDLE) xrDestroySpace(frozen);
                         frozen=next; actual_follow=false;follow_view.store(false);
                         {std::lock_guard<std::mutex> lock(follow_pose_mutex);follow_click_valid=false;follow_requested_valid=false;}
-                        panels[0]={0.f,0.f,1.65f}; panels[1]={-1.55f,0.f,1.25f}; panels[2]={1.55f,0.f,1.25f};
-                        panels[3]={0.f,1.3f,1.25f};panels[4]={-1.55f,1.3f,1.25f};panels[5]={1.55f,1.3f,1.25f};
+                        // Keep the current positions as the animation start; the
+                        // workspace target below repositions them. Only restore
+                        // default sizes here so reset does not snap first.
+                        for(int i=0;i<6;++i) {
+                            panels[i].width=(i==0?1.65f:1.25f);
+                            panels[i].yaw=panels[i].pitch=panels[i].roll=0.f;
+                        }
                         menu_panel=default_menu_panel();menu_host.store(-1);
                         grabbed_pane=-1;menu_grab=false;layout_reset.store(false);
                         workspace_anchor={};workspace_reanchor.store(true,std::memory_order_release);
+                        workspace_animating=false;
                         if(follow_report) env->CallVoidMethod(activity,follow_report,JNI_FALSE);
                     }
                 }
@@ -1452,6 +1484,7 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                 grabbed_pane=-1;
                 // The anchor belongs to the previous reference space.
                 workspace_anchor={};workspace_reanchor.store(true,std::memory_order_release);
+                workspace_animating=false;
                 if(!adopted) follow_view.store(actual_follow);
                 if(follow_report) env->CallVoidMethod(activity,follow_report,actual_follow?JNI_TRUE:JNI_FALSE);
             }
@@ -1505,19 +1538,25 @@ Java_org_openuuyc_pico_PicoActivity_nativeRun(JNIEnv *env, jobject, jobject acti
                         // anchor so a recentered workspace stays in place.
                         if(workspace_reanchor.exchange(false,std::memory_order_acq_rel))
                             workspace_anchor=head;
-                        workspace_layout(panels,workspace_panes,
+                        PanelGeometry target[6];
+                        std::copy(std::begin(panels),std::end(panels),target);
+                        workspace_layout(target,workspace_panes,
                             workspace_distance.load(std::memory_order_relaxed),
                             workspace_mode.load(std::memory_order_relaxed),workspace_anchor);
+                        workspace_begin_transition(target,workspace_panes);
                     }
                     if(workspace_recenter_request.exchange(false,std::memory_order_acq_rel)) {
-                        if(workspace_recenter(panels,workspace_panes,head,
-                                workspace_distance.load(std::memory_order_relaxed))) {
+                        PanelGeometry target[6];
+                        std::copy(std::begin(panels),std::end(panels),target);
+                        if(workspace_recenter(target,workspace_panes,head,workspace_anchor)) {
                             workspace_anchor=head;
                             // The recenter already used the latest head pose;
                             // do not let a stale explicit request re-anchor it.
                             workspace_reanchor.store(false,std::memory_order_release);
+                            workspace_begin_transition(target,workspace_panes);
                         }
                     }
+                    workspace_step_transition(workspace_panes);
                 }
             }
             // Locate the eye in the exact space used by both input and layers.

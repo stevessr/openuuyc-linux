@@ -23,6 +23,40 @@ int main() {
     assert(workspace_clamp_mode(3) == WORKSPACE_AUTO);
     assert(workspace_clamp_mode(WORKSPACE_WRAP) == WORKSPACE_WRAP);
 
+    // Layout transitions ease instead of snapping.
+    assert(workspace_ease(0.f) == 0.f && workspace_ease(1.f) == 1.f);
+    assert(std::fabs(workspace_ease(.5f) - .5f) < .00001f);
+    assert(workspace_ease(-1.f) == 0.f && workspace_ease(2.f) == 1.f);
+    assert(workspace_ease(NAN) == 1.f);
+    // Smoothstep, not linear: this catches a `return t` mutation.
+    assert(workspace_ease(.25f) < .24f);
+    assert(workspace_ease(.75f) > .76f);
+    float previous = -1.f;
+    for (int i = 0; i <= 20; ++i) {
+        const float e = workspace_ease(i / 20.f);
+        assert(e >= previous - .00001f && e >= 0.f && e <= 1.f);
+        previous = e;
+    }
+    assert(workspace_transition_progress(1.0, 1.0, .26) == 0.f);
+    assert(std::fabs(workspace_transition_progress(1.13, 1.0, .26) - .5f) < .0001f);
+    assert(workspace_transition_progress(2.0, 1.0, .26) == 1.f);
+    assert(workspace_transition_progress(1.0, 1.0, 0.0) == 1.f);
+    PanelGeometry from = pane(1.65f), to = pane(1.25f);
+    from.x = -1.f; from.y = .2f; from.z = -2.5f;
+    to.x = 1.f; to.y = -.2f; to.z = -3.f;
+    PanelGeometry mid{};
+    mid.aspect=1.25f; // latest video metadata, refreshed every XR frame
+    workspace_interpolate(mid, from, to, .5f);
+    assert(std::fabs(mid.x) < .00001f);
+    assert(std::fabs(mid.y) < .00001f);
+    assert(std::fabs(mid.z + 2.75f) < .00001f);
+    assert(std::fabs(mid.width - 1.45f) < .00001f);
+    assert(std::fabs(mid.aspect - 1.25f) < .00001f);
+    workspace_interpolate(mid, from, to, 0.f);
+    assert(mid.x == from.x && mid.width == from.width);
+    workspace_interpolate(mid, from, to, 1.f);
+    assert(mid.x == to.x && mid.width == to.width);
+
     PanelGeometry p[WORKSPACE_SLOTS];
 
     // One desktop: centred, upright, at the chosen distance.
@@ -30,7 +64,7 @@ int main() {
     workspace_layout(p, 1u << 0, 2.2f, WORKSPACE_AUTO);
     assert(std::fabs(p[0].x) < .00001f);
     assert(std::fabs(p[0].z + 2.2f) < .00001f);
-    assert(std::fabs(p[0].y) < .00001f);
+    assert(std::fabs(p[0].y - WORKSPACE_EYE_OFFSET) < .00001f);
     assert(std::fabs(p[0].yaw) < .00001f);
 
     // Two desktops: the primary stays centred and the second sits to its right,
@@ -41,7 +75,7 @@ int main() {
     assert(p[1].x > p[0].x);
     assert(std::fabs(p[1].x - (1.65f * .5f + WORKSPACE_GAP + 1.25f * .5f)) < .00001f);
     assert(std::fabs(p[1].z + 2.f) < .00001f);
-    assert(std::fabs(p[1].y) < .00001f);
+    assert(std::fabs(p[1].y - WORKSPACE_EYE_OFFSET) < .00001f);
 
     // Three desktops, flat: primary centre, first extra right, second left.
     fresh(p);
@@ -90,7 +124,7 @@ int main() {
     fresh(p);
     workspace_layout(p, 1u << 3, 2.f, WORKSPACE_FLAT);
     assert(std::fabs(p[3].x) < .00001f);
-    assert(std::fabs(p[3].y) < .00001f);
+    assert(std::fabs(p[3].y - WORKSPACE_EYE_OFFSET) < .00001f);
     fresh(p);
     workspace_layout(p, 0b111111u, 2.4f, WORKSPACE_FLAT);
     const float lower_top = p[0].y + 1.65f * 9.f / 16.f * .5f;
@@ -99,78 +133,87 @@ int main() {
     assert(std::fabs(p[3].x) < .00001f);
     assert(p[4].x > 0.f && p[5].x < 0.f);
 
-    // Recenter is rigid: sizes and pairwise distances survive, the centroid
-    // lands in front of the gaze at the configured distance, slightly below eye
-    // level.
+    // Recenter re-anchors the layout at the current head pose: sizes and
+    // pairwise distances survive, the main screen lands in front of the gaze at
+    // the layout distance, and a later layout with the new anchor reproduces it.
     fresh(p);
-    workspace_layout(p, 0b111u, 2.f, WORKSPACE_FLAT);
+    workspace_layout(p, 0b111u, 2.2f, WORKSPACE_FLAT);
     const float before01 = distance_between(p[0], p[1]);
     const float before02 = distance_between(p[0], p[2]);
     const float before12 = distance_between(p[1], p[2]);
     const float width0 = p[0].width, aspect0 = p[0].aspect;
     const WorkspaceHead head{1.5f, 1.7f, -2.f, .8f};
-    assert(workspace_recenter(p, 0b111u, head, 2.2f));
+    assert(workspace_recenter(p, 0b111u, head));
     assert(std::fabs(distance_between(p[0], p[1]) - before01) < .0001f);
     assert(std::fabs(distance_between(p[0], p[2]) - before02) < .0001f);
     assert(std::fabs(distance_between(p[1], p[2]) - before12) < .0001f);
     assert(p[0].width == width0 && p[0].aspect == aspect0);
-    float cx = (p[0].x + p[1].x + p[2].x) / 3.f;
-    float cy = (p[0].y + p[1].y + p[2].y) / 3.f;
-    float cz = (p[0].z + p[1].z + p[2].z) / 3.f;
-    const float bearing = std::atan2(cx - head.x, cz - head.z);
-    const float gaze = std::atan2(-std::sin(head.yaw), -std::cos(head.yaw));
-    assert(std::fabs(std::remainder(bearing - gaze, 6.2831853f)) < .0001f);
-    assert(std::fabs(std::hypot(cx - head.x, cz - head.z) - 2.2f) < .0001f);
-    assert(std::fabs(cy - (head.y - .05f)) < .0001f);
+    const float gaze_x = -std::sin(head.yaw), gaze_z = -std::cos(head.yaw);
+    assert(std::fabs(p[0].x - (head.x + gaze_x * 2.2f)) < .0001f);
+    assert(std::fabs(p[0].z - (head.z + gaze_z * 2.2f)) < .0001f);
+    assert(std::fabs(p[0].y - (head.y + WORKSPACE_EYE_OFFSET)) < .0001f);
 
-    // Walking five metres away and recentering restores the comfortable
-    // distance instead of leaving the panes behind (or in the user's face).
-    fresh(p);
-    workspace_layout(p, 0b111u, 2.f, WORKSPACE_FLAT);
-    const WorkspaceHead walked{0.f, 1.7f, -7.f, 0.f};
-    assert(workspace_recenter(p, 0b111u, walked, 2.2f));
-    cx = (p[0].x + p[1].x + p[2].x) / 3.f;
-    cy = (p[0].y + p[1].y + p[2].y) / 3.f;
-    cz = (p[0].z + p[1].z + p[2].z) / 3.f;
-    assert(std::fabs(std::hypot(cx - walked.x, cz - walked.z) - 2.2f) < .0001f);
-    assert(std::fabs(cy - (walked.y - .05f)) < .0001f);
-
-    // Explicit layout actions anchor the arrangement at the head pose that was
-    // current when the user picked the layout/distance (not the session origin).
-    const WorkspaceHead anchor{2.f, 1.7f, -3.f, .5f};
-    fresh(p);
-    workspace_layout(p, 1u << 0, 2.2f, WORKSPACE_FLAT, anchor);
-    assert(std::fabs(p[0].x - (2.f - 2.2f * std::sin(.5f))) < .00001f);
-    assert(std::fabs(p[0].z - (-3.f - 2.2f * std::cos(.5f))) < .00001f);
-    assert(std::fabs(p[0].y - 1.7f) < .00001f);
-    assert(std::fabs(p[0].yaw - .5f) < .00001f);
+    // Walking five metres away and recentering brings the main screen back to
+    // the layout distance instead of leaving it behind (or in the user's face).
     fresh(p);
     workspace_layout(p, 0b111u, 2.2f, WORKSPACE_FLAT);
-    const float flat01 = distance_between(p[0], p[1]);
-    const float flat02 = distance_between(p[0], p[2]);
-    const float flat12 = distance_between(p[1], p[2]);
-    fresh(p);
-    workspace_layout(p, 0b111u, 2.2f, WORKSPACE_FLAT, anchor);
-    assert(std::fabs(distance_between(p[0], p[1]) - flat01) < .0001f);
-    assert(std::fabs(distance_between(p[0], p[2]) - flat02) < .0001f);
-    assert(std::fabs(distance_between(p[1], p[2]) - flat12) < .0001f);
+    const WorkspaceHead walked{0.f, 1.7f, -7.f, 0.f};
+    assert(workspace_recenter(p, 0b111u, walked));
+    assert(std::fabs(p[0].x - walked.x) < .0001f);
+    assert(std::fabs(p[0].z - (walked.z - 2.2f)) < .0001f);
+    assert(std::fabs(p[0].y - (walked.y + WORKSPACE_EYE_OFFSET)) < .0001f);
 
-    // A very wide, off-centre group must never be pulled through the viewer:
-    // recenter keeps at least 40 cm between the nearest pane and the eyes.
-    for (int i = 0; i < WORKSPACE_SLOTS; ++i) p[i] = pane(2.214f); // 100-inch 16:9
+    // Idempotence for two panes, six panes and a wide wrap: a layout with the
+    // new anchor after recenter must not move any pane. This is the P1 bug the
+    // 3-pane flat case alone did not expose.
+    auto assert_recentered = [&](uint32_t mask, float distance, int mode) {
+        fresh(p);
+        workspace_layout(p, mask, distance, mode);
+        const WorkspaceHead target{2.f, 1.7f, -3.f, .8f};
+        assert(workspace_recenter(p, mask, target));
+        const PanelGeometry recentered[6] = {p[0], p[1], p[2], p[3], p[4], p[5]};
+        workspace_layout(p, mask, distance, mode, target);
+        for (int i = 0; i < 6; ++i) if (mask & (1u << i)) {
+            assert(std::fabs(p[i].x - recentered[i].x) < .0001f);
+            assert(std::fabs(p[i].y - recentered[i].y) < .0001f);
+            assert(std::fabs(p[i].z - recentered[i].z) < .0001f);
+        }
+    };
+    assert_recentered(1u << 0, 2.2f, WORKSPACE_FLAT);
+    assert_recentered(0b011u, 2.2f, WORKSPACE_FLAT);
+    assert_recentered(0b111u, 2.2f, WORKSPACE_WRAP);
+    assert_recentered(0b1111u, 2.4f, WORKSPACE_FLAT);
+    assert_recentered(0b11111u, 2.4f, WORKSPACE_FLAT);
+    assert_recentered(0b111111u, 2.4f, WORKSPACE_FLAT);
+    fresh(p);
+    p[0].width = 1.65f; p[1].width = 1.25f; p[2].width = 2.214f;
     workspace_layout(p, 0b111u, 1.6f, WORKSPACE_WRAP);
-    const WorkspaceHead beside{3.f, 1.7f, 0.f, 1.5707963f};
-    assert(workspace_recenter(p, 0b111u, beside, 1.6f));
-    const float gaze_x = -std::sin(beside.yaw), gaze_z = -std::cos(beside.yaw);
+    const WorkspaceHead wide{2.f, 1.7f, -3.f, .8f};
+    assert(workspace_recenter(p, 0b111u, wide));
+    const PanelGeometry wide_recentered[3] = {p[0], p[1], p[2]};
+    workspace_layout(p, 0b111u, 1.6f, WORKSPACE_WRAP, wide);
     for (int i = 0; i < 3; ++i) {
-        const float depth = (p[i].x - beside.x) * gaze_x + (p[i].z - beside.z) * gaze_z;
+        assert(std::fabs(p[i].x - wide_recentered[i].x) < .0001f);
+        assert(std::fabs(p[i].y - wide_recentered[i].y) < .0001f);
+        assert(std::fabs(p[i].z - wide_recentered[i].z) < .0001f);
+    }
+
+    // A pathological arrangement (a pane behind the viewer) must never be
+    // pulled through the eyes: recenter keeps at least 40 cm clearance and
+    // moves the whole group farther instead, without breaking rigidity.
+    fresh(p);
+    p[0] = pane(1.65f);
+    p[0].z = -1.f;
+    p[1] = pane(1.25f);
+    p[1].z = 5.f;
+    const WorkspaceHead beside{0.f, 1.7f, 0.f, 0.f};
+    assert(workspace_recenter(p, 0b011u, beside));
+    const float beside_gaze_x = -std::sin(beside.yaw), beside_gaze_z = -std::cos(beside.yaw);
+    for (int i = 0; i < 2; ++i) {
+        const float depth = (p[i].x - beside.x) * beside_gaze_x + (p[i].z - beside.z) * beside_gaze_z;
         assert(depth >= .4f - .0001f);
     }
-    // The clamp must actually move the group farther than the requested 1.6 m.
-    const float clamped_distance = std::hypot(
-        (p[0].x + p[1].x + p[2].x) / 3.f - beside.x,
-        (p[0].z + p[1].z + p[2].z) / 3.f - beside.z);
-    assert(clamped_distance > 1.6f);
+    assert(std::fabs(distance_between(p[0], p[1]) - 6.f) < .0001f);
 
     // A malformed video size or drag must not poison the whole arrangement.
     fresh(p);
@@ -183,11 +226,10 @@ int main() {
         assert(std::isfinite(p[i].aspect) && p[i].aspect > 0.f);
     }
 
-    // Degenerate input never moves a pane or reports success.
-    assert(!workspace_recenter(p, 0u, head, 2.2f));
-    WorkspaceHead inside{0.f, 0.f, -2.f, 0.f};
+    // Degenerate input never reports success.
+    assert(!workspace_recenter(p, 0u, head));
     fresh(p);
-    workspace_layout(p, 1u << 0, 2.f, WORKSPACE_FLAT);
-    assert(!workspace_recenter(p, 1u << 0, inside, 2.2f));
+    p[0].x = NAN; p[1].y = NAN; p[2].z = NAN;
+    assert(!workspace_recenter(p, 0b111u, head));
     workspace_layout(p, 0u, 2.f, WORKSPACE_AUTO); // no visible pane: no-op
 }
