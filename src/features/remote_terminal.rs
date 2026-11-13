@@ -192,6 +192,7 @@ fn terminal_color(color: vt100::Color) -> TerminalColor {
 
 const DEFAULT_FG: egui::Color32 = egui::Color32::from_rgb(220, 224, 232);
 const DEFAULT_BG: egui::Color32 = egui::Color32::from_rgb(12, 14, 18);
+const LOCAL_ECHO_FG: egui::Color32 = egui::Color32::from_rgb(170, 210, 255);
 
 fn map_terminal_color(color: TerminalColor, default: egui::Color32) -> egui::Color32 {
     match color {
@@ -291,6 +292,8 @@ fn terminal_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<&'static [
 struct View {
     visible: bool,
     status: String,
+    /// 本地已发送、但远端回显还没回来的输入；在光标处先画出来。
+    pending_input: String,
     active: bool,
     pending: bool,
     epoch: u64,
@@ -298,6 +301,8 @@ struct View {
     sessions: Vec<RemoteSession>,
     list_error: String,
     listing: bool,
+    /// 首次清单为空时自动新建一个 Shell。
+    auto_open: bool,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum SendGate {
@@ -336,6 +341,11 @@ struct State {
     ghostty: Option<crate::features::ghostty_vt::Screen>,
     /// 终端自己的屏幕网格；输出线程更新它，UI 只读它来画。
     grid: Arc<Mutex<TerminalGrid>>,
+    /// 本地即时回显：已发送但远端还没回显的输入。
+    pending_input: String,
+    /// 本次打开窗口后的清单已经回来过；避免每次刷新都自动新建。
+    auto_open_done: bool,
+    auto_open: bool,
     /// UI 第一次绘制时拿到，之后收到输出只请求一次重绘，不做 60fps 轮询。
     ctx: Option<egui::Context>,
     input: String,
@@ -367,6 +377,9 @@ impl Default for Terminal {
             parser: vt100::Parser::new(24, 80, 500),
             ghostty: crate::features::ghostty_vt::Screen::new(80, 24),
             grid: Arc::new(Mutex::new(TerminalGrid::empty(80, 24))),
+            pending_input: String::new(),
+            auto_open_done: false,
+            auto_open: false,
             ctx: None,
             input: String::new(),
             sessions: Vec::new(),
@@ -497,6 +510,8 @@ impl Terminal {
                 if let Some(ghostty) = s.ghostty.as_mut() {
                     ghostty.process(&frame.payload);
                 }
+                // 远端已经回显/重绘，以远端屏幕为准。
+                s.pending_input.clear();
                 Self::refresh_grid(&mut s);
             }
             FrameType::Exit | FrameType::Error => {
@@ -531,9 +546,22 @@ impl Terminal {
             Ok(sessions) => {
                 s.sessions = sessions;
                 s.list_error.clear();
+                if !s.auto_open_done {
+                    s.auto_open_done = true;
+                    // 远端没有任何可接回的 Shell：点开窗口就直接新建，
+                    // 不让用户先看到一个空清单。
+                    let has_running =
+                        s.sessions.iter().any(|session| session.state != "exited");
+                    s.auto_open =
+                        !has_running && !s.active && !s.pending && s.handle == 0;
+                }
             }
             // 解析失败保留上一次的列表，只报错，免得界面突然空掉。
-            Err(error) => s.list_error = error,
+            Err(error) => {
+                s.list_error = error;
+                s.auto_open_done = true;
+                s.auto_open = false;
+            }
         }
     }
     /// 处理 OPEN 的回复。新建 Shell 用 0 请求，远端在回复里给出它分配的
@@ -681,6 +709,8 @@ impl Terminal {
     pub(crate) fn show(&self) {
         let mut s = self.lock();
         s.visible = true;
+        s.auto_open_done = false;
+        s.auto_open = false;
         // 打开窗口就先拉一次列表：用户点开它通常是想看看远端有哪些 Shell。
         Self::request_list_locked(&mut s);
         Self::request_repaint(&s);
@@ -709,6 +739,7 @@ impl Terminal {
             s.visible = false;
         }
         s.input.clear();
+        s.pending_input.clear();
         s.status = if s.handle != 0 {
             "已离开远端 Shell，它仍在远端运行；再打开会接回同一个 Shell".into()
         } else {
@@ -788,6 +819,7 @@ impl Terminal {
             return;
         }
         s.handle = session;
+        s.auto_open = false;
         s.epoch = s.epoch.wrapping_add(1);
         let reattach = Self::prepare_open(&mut s);
         // 不再自带名字：OpenUUYC 主控按登录拒绝重名，开第二个 Shell 会被
@@ -821,6 +853,7 @@ impl Terminal {
         if let Ok(mut grid) = s.grid.lock() {
             *grid = TerminalGrid::empty(s.cols, s.rows);
         }
+        s.pending_input.clear();
         Self::request_repaint(s);
         s.input.clear();
         reattach
@@ -887,6 +920,7 @@ impl Terminal {
             s.pending = false;
             s.handle = 0;
             s.input.clear();
+            s.pending_input.clear();
             let (cols, rows) = (s.cols, s.rows);
             s.parser = vt100::Parser::new(rows, cols, 500);
             if let Some(ghostty) = s.ghostty.as_mut() {
@@ -925,16 +959,51 @@ impl Terminal {
             Self::request_repaint(&s);
             return;
         }
+        Self::track_local_input(&mut s, bytes);
+        Self::request_repaint(&s);
         if !Self::send(&s, FrameType::Stdin, bytes) {
+            s.pending_input.clear();
             s.status = "终端输入未发送（通道拥塞、Shell 退出或断开）".into();
             Self::request_repaint(&s);
+        }
+    }
+
+    /// 本地即时回显只维护“还没看到远端回显”的那一小段。远端一旦有输出，
+    /// 以远端屏幕为准，避免本地与远端各画一遍。
+    fn track_local_input(state: &mut State, bytes: &[u8]) {
+        if bytes == b"\r" || bytes == b"\n" {
+            state.pending_input.clear();
+            return;
+        }
+        if bytes == b"\x7f" {
+            state.pending_input.pop();
+            return;
+        }
+        // 光标键、Tab、Ctrl+字母等会改变远端光标/行内容，本地不猜，
+        // 交给远端回显。
+        if bytes.first() == Some(&0x1b)
+            || bytes == b"\t"
+            || (bytes.len() == 1 && bytes[0] < 0x20)
+        {
+            state.pending_input.clear();
+            return;
+        }
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            for character in text.chars().filter(|character| !character.is_control()) {
+                state.pending_input.push(character);
+            }
+        }
+        if state.pending_input.chars().count() > 4096 {
+            state.pending_input = state.pending_input.chars().take(4096).collect();
         }
     }
 
     /// 按终端自己的网格绘制。SSH 只传原始字节，屏幕状态由终端模拟器维护；
     /// 这里读的就是那份网格，不再每帧生成整屏快照。返回本帧按下的原始按键，
     /// 由调用者在释放网格锁之后再发给远端。
-    fn terminal_grid(ui: &mut egui::Ui, grid: &TerminalGrid) -> Vec<Vec<u8>> {
+    fn terminal_grid(
+        ui: &mut egui::Ui, grid: &TerminalGrid, pending: &str,
+    ) -> Vec<Vec<u8>> {
         const FONT_SIZE: f32 = 14.0;
         let font = egui::FontId::monospace(FONT_SIZE);
         let cell_width = ui.fonts_mut(|fonts| fonts.glyph_width(&font, 'W')).max(1.0);
@@ -1004,8 +1073,43 @@ impl Terminal {
                 DEFAULT_FG,
             );
         }
-        if grid.cursor_visible {
-            let (cursor_col, cursor_row) = grid.cursor;
+        // 本地即时回显：远端还没回显的字符先画在光标处，光标跟到末尾。
+        let (mut cursor_col, mut cursor_row) = grid.cursor;
+        if !pending.is_empty() {
+            let pending_font = font.clone();
+            for character in pending.chars() {
+                if cursor_col >= grid.cols {
+                    cursor_col = 0;
+                    cursor_row = cursor_row.saturating_add(1);
+                }
+                if cursor_row >= grid.rows {
+                    break;
+                }
+                let glyph_width =
+                    ui.fonts_mut(|fonts| fonts.glyph_width(&pending_font, character));
+                let cells = (glyph_width / cell_width).round().max(1.0) as u16;
+                if cursor_col.saturating_add(cells) > grid.cols {
+                    cursor_col = 0;
+                    cursor_row = cursor_row.saturating_add(1);
+                }
+                if cursor_row >= grid.rows {
+                    break;
+                }
+                painter.text(
+                    rect.min
+                        + egui::vec2(
+                            f32::from(cursor_col) * cell_width,
+                            f32::from(cursor_row) * cell_height,
+                        ),
+                    egui::Align2::LEFT_TOP,
+                    character,
+                    pending_font.clone(),
+                    LOCAL_ECHO_FG,
+                );
+                cursor_col = cursor_col.saturating_add(cells);
+            }
+        }
+        if grid.cursor_visible || !pending.is_empty() {
             if cursor_col < grid.cols && cursor_row < grid.rows {
                 let cursor = cell_rect(cursor_col, cursor_row, cell_width);
                 let bar = egui::Rect::from_min_max(
@@ -1087,6 +1191,7 @@ impl Terminal {
                 View {
                     visible: s.visible,
                     status: s.status.clone(),
+                    pending_input: s.pending_input.clone(),
                     active: s.active,
                     pending: s.pending,
                     epoch: s.epoch,
@@ -1094,6 +1199,7 @@ impl Terminal {
                     sessions: s.sessions.clone(),
                     list_error: s.list_error.clone(),
                     listing: s.list_request != 0,
+                    auto_open: s.auto_open,
                 },
                 Arc::clone(&s.grid),
             )
@@ -1101,6 +1207,7 @@ impl Terminal {
         let View {
             visible,
             status,
+            pending_input,
             active,
             pending,
             epoch,
@@ -1108,6 +1215,7 @@ impl Terminal {
             sessions,
             list_error,
             listing,
+            auto_open,
         } = view;
         let mut visible = visible;
         if !visible {
@@ -1180,7 +1288,7 @@ impl Terminal {
                         // are sent after the lock is released so the output
                         // path never waits on a UI callback holding state.
                         let grid = grid.lock().unwrap_or_else(|error| error.into_inner());
-                        terminal_inputs.extend(Self::terminal_grid(ui, &grid));
+                        terminal_inputs.extend(Self::terminal_grid(ui, &grid, &pending_input));
                     });
                 ui.label(
                     egui::RichText::new(
@@ -1321,6 +1429,10 @@ impl Terminal {
             self.open(session);
         } else if let Some(session) = end_session {
             self.end_session(session);
+        } else if auto_open {
+            // 远端没有可接回的 Shell：点开终端窗口就直接新建一个。
+            self.open(0);
+            self.lock().auto_open = false;
         } else if refresh {
             self.request_list();
         }
@@ -1900,6 +2012,58 @@ mod tests {
         assert_eq!(s.handle, 0);
         assert!(!s.active);
         assert!(s.grid.lock().unwrap().cells.iter().all(|cell| cell.text.is_empty()));
+    }
+
+
+    #[test]
+    fn local_echo_tracks_typing_and_backspace_immediately() {
+        let (t, mut rx) = wired();
+        {
+            let mut s = t.lock();
+            s.handle = 7;
+            s.active = true;
+        }
+        let epoch = t.lock().epoch;
+        t.send_bytes(epoch, b"abc");
+        assert_eq!(t.lock().pending_input, "abc");
+        t.send_bytes(epoch, b"\x7f");
+        assert_eq!(t.lock().pending_input, "ab");
+        t.send_bytes(epoch, b"\r");
+        assert_eq!(t.lock().pending_input, "");
+        // The bytes still went to the remote shell; local echo only mirrors them.
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn an_empty_session_list_asks_the_window_to_create_a_shell() {
+        let (t, _rx) = wired();
+        {
+            let mut s = t.lock();
+            s.list_request = 77;
+            s.auto_open_done = false;
+        }
+        t.receive(&Frame::encode(FrameType::ListSessionsResp, 77, b"[]"));
+        let s = t.lock();
+        assert!(s.auto_open, "an empty list should auto-create a shell");
+        assert!(s.auto_open_done);
+    }
+
+    #[test]
+    fn a_running_session_list_does_not_auto_create_a_shell() {
+        let (t, _rx) = wired();
+        {
+            let mut s = t.lock();
+            s.list_request = 78;
+            s.auto_open_done = false;
+        }
+        t.receive(&Frame::encode(
+            FrameType::ListSessionsResp,
+            78,
+            br#"[{"session_id":9,"state":"running"}]"#,
+        ));
+        let s = t.lock();
+        assert!(!s.auto_open);
+        assert!(s.auto_open_done);
     }
 
 }

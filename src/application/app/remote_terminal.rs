@@ -204,24 +204,32 @@ impl Picker {
         generation: u64,
         target: &str,
         result: std::result::Result<Vec<RemoteSession>, String>,
-    ) {
+    ) -> bool {
         if !self.open
             || generation != self.generation
             || generation != current_generation
             || target != self.device_id
         {
-            return;
+            return false;
         }
+        let first_load = self.last_loaded.is_none();
         self.loading = false;
         self.last_loaded = Some(Instant::now());
         match result {
             Ok(sessions) => {
-                self.sessions = sanitize(sessions);
+                let sessions = sanitize(sessions);
+                // 远端没有可接回的 Shell：首次打开时直接新建，不把空清单
+                // 摆在用户面前。只有首次加载这样做，手动刷新不会反复开。
+                let auto_new =
+                    first_load && !sessions.iter().any(|session| session.state != "exited");
+                self.sessions = sessions;
                 self.error = None;
+                auto_new
             }
             Err(error) => {
                 self.sessions.clear();
                 self.error = Some(clean(&describe_list_error(&error), MAX_ERROR));
+                false
             }
         }
     }
@@ -451,7 +459,7 @@ impl DeviceCenterApp {
         }
     }
 
-    fn launch_remote_terminal(&mut self, attach: Option<u32>) {
+    pub(super) fn launch_remote_terminal(&mut self, attach: Option<u32>) {
         let device_id = self.remote_terminal.device_id().to_owned();
         match crate::features::host::terminal::local::open_remote_in_terminal(&device_id, attach) {
             Ok(()) => {
@@ -610,6 +618,39 @@ mod tests {
         assert_eq!(picker.ending, None);
         assert_eq!(picker.sessions.len(), 1);
         assert!(picker.error.as_deref().unwrap_or_default().contains("permission denied"));
+    }
+
+
+    #[test]
+    fn an_empty_remote_list_auto_starts_a_new_shell_only_on_first_load() {
+        let (mut picker, _commands) = picker_with_session();
+        picker.sessions.clear();
+        picker.last_loaded = None;
+        assert!(
+            picker.apply_result(4, 4, "device-1", Ok(Vec::new())),
+            "first empty load should start a shell"
+        );
+        // A manual refresh must not keep spawning shells.
+        assert!(!picker.apply_result(4, 4, "device-1", Ok(Vec::new())));
+    }
+
+    #[test]
+    fn a_running_remote_session_does_not_auto_start_a_shell() {
+        let (mut picker, _commands) = picker_with_session();
+        picker.last_loaded = None;
+        assert!(!picker.apply_result(
+            4,
+            4,
+            "device-1",
+            Ok(vec![RemoteSession {
+                id: 9,
+                name: "session".into(),
+                shell: "powershell".into(),
+                state: "running".into(),
+                created_ms: 0,
+                last_active_ms: 0,
+            }])
+        ));
     }
 
 }

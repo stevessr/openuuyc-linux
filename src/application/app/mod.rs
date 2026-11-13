@@ -450,12 +450,18 @@ impl DeviceCenterApp {
                     target,
                     result,
                 } => {
-                    self.remote_terminal.apply_result(
+                    let auto_new = self.remote_terminal.apply_result(
                         self.login_generation,
                         generation,
                         &target,
                         result,
                     );
+                    if auto_new {
+                        // No running shell on the host: the user clicked
+                        // "远程终端" to get one, so start it instead of
+                        // leaving an empty picker open.
+                        self.launch_remote_terminal(None);
+                    }
                 }
                 GuiEvent::RemoteTerminalEnded {
                     generation,

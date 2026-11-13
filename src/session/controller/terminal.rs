@@ -438,7 +438,13 @@ async fn connect_terminal(
     ControllerConnection::establish(
         room, &target.controller_id, profile, policy,
         ControlConnectType::Normal, TransportChoice::Auto, None,
-        crate::media::audio::AudioSettings { volume: 0, muted: true },
+        // Terminal connections are data-only; do not carry the desktop
+        // viewer's "start muted" default into them. Launching a terminal must
+        // never mute the host or an existing stream.
+        crate::media::audio::AudioSettings {
+            volume: 100,
+            muted: false,
+        },
         None, &cancel, ControlPurpose::Terminal, false
     ).await.context("establish official UU terminal session")
 }
