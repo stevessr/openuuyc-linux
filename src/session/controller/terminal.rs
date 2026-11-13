@@ -421,6 +421,16 @@ async fn resolve_terminal_target(
     })
 }
 
+/// Terminal connections are data-only. They must never inherit the desktop
+/// viewer's "start muted" default: opening a terminal is not screen control and
+/// must not mute the host or an existing stream.
+fn terminal_audio_settings() -> crate::media::audio::AudioSettings {
+    crate::media::audio::AudioSettings {
+        volume: 100,
+        muted: false,
+    }
+}
+
 /// Establish the short-lived kind=8 connection used for terminal traffic.
 ///
 /// This is the official data-only terminal connection: no audio/video m-lines
@@ -438,13 +448,7 @@ async fn connect_terminal(
     ControllerConnection::establish(
         room, &target.controller_id, profile, policy,
         ControlConnectType::Normal, TransportChoice::Auto, None,
-        // Terminal connections are data-only; do not carry the desktop
-        // viewer's "start muted" default into them. Launching a terminal must
-        // never mute the host or an existing stream.
-        crate::media::audio::AudioSettings {
-            volume: 100,
-            muted: false,
-        },
+        terminal_audio_settings(),
         None, &cancel, ControlPurpose::Terminal, false
     ).await.context("establish official UU terminal session")
 }
@@ -872,4 +876,12 @@ mod tests {
             "1) work  /bin/bash  [运行中]  编号 17\n0) 新建 Shell\n"
         );
     }
+
+    #[test]
+    fn terminal_connections_never_start_muted() {
+        let settings = terminal_audio_settings();
+        assert!(!settings.muted);
+        assert_eq!(settings.volume, 100);
+    }
+
 }

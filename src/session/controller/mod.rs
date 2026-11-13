@@ -109,6 +109,27 @@ async fn await_media_startup<T>(
     }
 }
 
+/// Only screen-control connections may start muted. Everything else gets a
+/// neutral, audible setting so opening a terminal/file/port connection cannot
+/// mute the host or an existing stream.
+fn screen_control_audio(
+    purpose: crate::session::negotiation::ControlPurpose,
+    settings: crate::media::audio::AudioSettings,
+) -> crate::media::audio::AudioSettings {
+    if matches!(
+        purpose,
+        crate::session::negotiation::ControlPurpose::Viewing
+            | crate::session::negotiation::ControlPurpose::Audio
+    ) {
+        settings
+    } else {
+        crate::media::audio::AudioSettings {
+            volume: 100,
+            muted: false,
+        }
+    }
+}
+
 impl ControllerConnection {
     async fn close_after_startup_error(self, error: anyhow::Error) -> anyhow::Error {
         // Peer teardown can close RTP/decoder input before the signal task has
@@ -204,9 +225,12 @@ impl ControllerConnection {
             crate::session::negotiation::ControlConnectType::Normal,
             options.transport,
             None,
+            // File-transfer and port-mapping connections are not screen
+            // control; they must not carry the viewer's "start muted"
+            // default. Only the viewing path applies saved/user audio settings.
             crate::media::audio::AudioSettings {
-                volume: 0,
-                muted: true,
+                volume: 100,
+                muted: false,
             },
             None,
             cancel,
@@ -457,6 +481,10 @@ impl ControllerConnection {
             let _ = signal.close().await;
             return Err(error);
         }
+        // Only screen control (viewing/audio) may carry a muted setting.
+        // Terminal, file-transfer and port-mapping connections must never mute
+        // the host or an existing stream just because they were opened.
+        let audio_settings = screen_control_audio(purpose, audio_settings);
         // Restore before media can arrive or the playback window is exposed.
         peer.stream_control_handle()
             .audio()
@@ -792,6 +820,32 @@ fn flatten_signal_task(
     result: std::result::Result<Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
     result.context("controller signaling task failed")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_screen_control_connections_can_start_muted() {
+        use crate::media::audio::AudioSettings;
+        use crate::session::negotiation::ControlPurpose;
+        let muted = AudioSettings {
+            volume: 0,
+            muted: true,
+        };
+        assert!(screen_control_audio(ControlPurpose::Viewing, muted).muted);
+        assert!(screen_control_audio(ControlPurpose::Audio, muted).muted);
+        for purpose in [
+            ControlPurpose::Terminal,
+            ControlPurpose::FileTransfer,
+            ControlPurpose::PortMapping,
+        ] {
+            let settings = screen_control_audio(purpose, muted);
+            assert!(!settings.muted, "{purpose:?} must not start muted");
+            assert_eq!(settings.volume, 100);
+        }
+    }
 }
 
 pub mod terminal;
