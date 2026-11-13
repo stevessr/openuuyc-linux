@@ -42,8 +42,9 @@ impl DeviceCenterApp {
                     PowerAction::Wake => { ui.label("发送远程唤醒请求，随后等待设备上线。需要远端已配置网络唤醒。"); }
                     PowerAction::Shutdown | PowerAction::Reboot => {
                         ui.colored_label(AMBER, "请确保已保存远端工作；未保存的应用可能被强制关闭，所有远控连接将断开。");
-                        if confirm.device.participant_count() > 0 {
-                            ui.label(format!("设备当前有 {} 个远控参与者。", confirm.device.participant_count()));
+                        let others = self.other_participants(&confirm.device);
+                        if others > 0 {
+                            ui.label(format!("设备当前有 {others} 个远控参与者。"));
                         }
                         if self.viewer_for_device(&confirm.device.device_id).is_some() {
                             ui.label("本程序会先结束当前观看并释放控制按键，再发送电源请求。");

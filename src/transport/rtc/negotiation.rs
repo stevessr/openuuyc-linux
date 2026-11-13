@@ -108,7 +108,12 @@ pub(crate) fn apply_uu_application_attributes_for_role(
 
     for index in (application + 1..end)
         .filter(|index| {
-            lines[*index] == "a=sendrecv" || lines[*index].starts_with("a=x-uuremote-mix-kcp:")
+            lines[*index] == "a=sendrecv"
+                || lines[*index].starts_with("a=x-uuremote-mix-kcp:")
+                // Replace the peer library's default instead of leaving two
+                // competing max-message-size attributes in the application
+                // section. Repeated normalization stays byte-stable.
+                || lines[*index].starts_with("a=max-message-size:")
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -336,4 +341,42 @@ pub(super) fn register_uu_header_extensions(media_engine: &mut MediaEngine) -> R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A terminal-only offer has just the SCTP application section. The
+    /// official controller still requires the UU session attributes and the
+    /// bounded data-channel message size, and no media stream id.
+    #[test]
+    fn a_data_only_offer_gets_the_official_application_attributes() {
+        let mut sdp = [
+            "v=0",
+            "o=- 0 0 IN IP4 127.0.0.1",
+            "s=-",
+            "t=0 0",
+            "a=group:BUNDLE 0",
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel",
+            "c=IN IP4 0.0.0.0",
+            "a=ice-ufrag:test",
+            "a=ice-pwd:test",
+            "a=setup:actpass",
+            "a=mid:0",
+            "a=sctp-port:5000",
+            "a=sendrecv",
+            "a=max-message-size:262144",
+        ]
+        .join("\r\n")
+            + "\r\n";
+        apply_uu_application_attributes_for_role(&mut sdp, "*", Some(2)).unwrap();
+        assert!(sdp.contains("a=msid-semantic: WMS *"));
+        assert!(sdp.contains("a=max-message-size:524288"));
+        assert!(sdp.contains("a=x-uuremote-mix-kcp:2"));
+        assert!(!sdp.contains("a=sendrecv"));
+        assert!(!sdp.contains("a=max-message-size:262144"));
+        assert!(!sdp.contains("m=audio "));
+        assert!(!sdp.contains("m=video "));
+    }
 }

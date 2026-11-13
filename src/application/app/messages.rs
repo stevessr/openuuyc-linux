@@ -73,6 +73,17 @@ pub(super) enum GuiCommand {
         change: DeviceMutation,
     },
     Detail(String),
+    /// 列出远端主机上已有的终端会话；由 worker 在后台完成，不阻塞界面。
+    RemoteTerminalSessions {
+        generation: u64,
+        target: String,
+    },
+    /// 结束远端已有的终端会话；管理界面里显式点「结束」才发 CLOSE。
+    RemoteTerminalEnd {
+        generation: u64,
+        target: String,
+        session: u32,
+    },
     RefreshAssist,
     CancelAssistCheck,
     AssistOperation {
@@ -134,6 +145,18 @@ pub(super) enum GuiEvent {
         String,
         std::result::Result<crate::account::api::DeviceDetail, String>,
     ),
+    RemoteTerminalSessions {
+        generation: u64,
+        target: String,
+        result:
+            std::result::Result<Vec<crate::session::controller::terminal::RemoteSession>, String>,
+    },
+    RemoteTerminalEnded {
+        generation: u64,
+        target: String,
+        session: u32,
+        result: std::result::Result<(), String>,
+    },
     Working(String),
     Warning(String),
     Error(String),

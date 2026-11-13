@@ -12,16 +12,39 @@
 - 安卓设备详情 → 终端：无现成连接时建立专用纯数据终端连接（不协商音视频）；已有桌面中也可从「终端」按钮使用当前连接。
 - PICO 沉浸菜单 → 应用 → 远端终端 → 选择设备。输入弹出原生键盘；另提供 Ctrl+C、Tab、方向键和 Esc。
 
-打开界面不立即执行命令，需显式「打开 Shell」。命令需确认发送。关闭窗口只是离开（发 DETACH，和 tmux detach 一样），Shell 留在远端继续运行；再打开会按同一个句柄接回原来的 Shell，远端重放当前屏幕。只有显式点「结束 Shell」才发 CLOSE。网络断开时不能保证最后一个帧送达，服务端仍遵循既有断线/空闲回收策略。无远端创建确认则不允许输入。
+打开界面不立即执行命令，需显式「打开 Shell」。窗口里同时列出远端已经开着的会话，可直接「接入」其中一个，或「新建 Shell」；「离开 Shell（不结束）」只发 DETACH，窗口留着，可以马上接回别的会话。命令需确认发送。关闭窗口只是离开（发 DETACH，和 tmux detach 一样），Shell 留在远端继续运行；再打开会按远端返回的同一个会话编号接回原来的 Shell，远端重放当前屏幕。只有显式点「结束 Shell」才发 CLOSE。网络断开时不能保证最后一个帧送达，服务端仍遵循既有断线/空闲回收策略。无远端创建确认则不允许输入。
 
-设备详情里的「远程终端」在系统终端模拟器中运行 `remote-terminal` 子命令，按设备 ID 算出一个固定句柄（`--handle`）：关掉终端窗口只是分离，再点一次会接回同一个 Shell；句柄不存在时远端用它新建。命令行 `--attach <id>` 仍然只接清单里确实存在的会话。
+会话管理界面支持结束会话：内嵌终端窗口的远端会话列表和被控端「终端会话」页都有「结束」按钮；桌面设备详情的会话选择器在「接入」旁新增「结束」，需要二次确认。结束发送 TERM `CLOSE`（kind 4），会真正终止远端 Shell，和「离开/关闭窗口」只发 `DETACH` 不同。被控端页面还保留「结束全部」。
 
-桌面显示使用 vt100 解析；安卓/PICO 是固定 80×24 的有界单色 VT 子集，支持 UTF-8、常见光标移动和擦除，不是完整彩色终端/所有全屏 TUI 的兼容承诺。OSC 不操作剪贴板或打开链接。输出/命令不写日志、配置或诊断包。输入队列与输出缓存有界。
+设备详情里的「远程终端」不再传按设备 ID 算出来的固定句柄：官方主机不识别它，每次点击都会新建一个 Shell。现在的流程是先建立一条短命的终端连接列出远端会话，在设备详情里显示清单；选中已有会话时用系统终端运行 `remote-terminal <设备> --attach <id>`，选「新建」时不带 `--attach`。命令行对应的是 `--pick`：交互式打印清单（`0` 新建、`r` 刷新、`q` 退出），`--list` 只打印，`--attach <id>` 仍然要求该会话在清单里。编号 0 表示「新建」，所以 `--pick` 不把编号 0 的会话列为可接回项，设备详情页会显示但把「接入」置灰。关闭终端窗口或按 Ctrl+] 分离后远端 Shell 继续运行，下次从清单接回。
+
+桌面端终端窗口优先使用系统的 `libghostty-vt`（运行时 `dlopen`，没有该库或 ABI 不兼容时自动回退到内置 `vt100`；可用 `OPENUUYC_GHOSTTY_VT=0` 强制回退）解析 VT 状态，并按固定字符网格绘制：颜色、斜体/下划线、宽字符和光标由终端自己的网格直接渲染，不再每帧把整段文本塞进 Label/ScrollArea 重新排版，也没有 16ms/60fps 定时重绘；只有收到 Shell 原始字节、改尺寸或状态变化时才更新网格并请求一次重绘。点击终端网格后键盘直接逐键发送（Enter、Tab、方向键、Home/End/Delete、Ctrl+C/D/Z/L/A/E/U/K/W/R 等），不再需要单行输入框和「发送」按钮。安卓/PICO 是固定 80×24 的有界单色 VT 子集，支持 UTF-8、常见光标移动和擦除，不是完整彩色终端/所有全屏 TUI 的兼容承诺。OSC 不操作剪贴板或打开链接。输出/命令不写日志、配置或诊断包。输入队列与输出缓存有界。
+
+## 官方主机互通修复（2026-11-13）
+
+三处与官方 Android 主控实现不一致的问题导致远程终端对官方 Windows 被控端一直超时：
+
+1. **BINARY_DATA_CHANNEL 被诊断扩展独占。** 官方 TERM 帧走低优先级的 `BINARY_DATA_CHANNEL`；OpenUUYC 的远端诊断包（`OUDIAG01`）也用同一条通道。每个 data channel 只有一个 `on_message`，此前诊断控制器绑定后把非诊断包全部丢弃，终端接收端收不到 OPEN/LIST 回复，列表 10 秒 / OPEN 20 秒后报 `remote terminal request timed out`。现在 `diagnostics::remote::controller::bind` 先判断 `TERM` 前缀并转交终端接收端，其余才按诊断包解码；keystrokes 与 shell 输出仍然不写日志。
+2. **ListSessionsReq 的会话编号。** 官方主控固定用 kind 9、**session id 0、零长度负载**；旧代码用自增请求号，远端把它当作不存在的会话忽略。会话清单响应是 `SessionInfo` 的 JSON 数组（`session_id`/`state`/`last_active_ms`/`shell`/`name`/`created_at_ms`）。
+3. **OpenPayload 缺少必填 `shell`。** 官方负载是 `{shell, cols, rows, option}`，`shell`/`cols`/`rows` 必填，`option` 默认 `none`；官方主机用严格 JSON 解码（未知键也会失败）。现在按被控平台请求 `powershell`（Windows）或 `zsh`（macOS），`option` 固定 `none`。OpenResp 的负载只有 `code`/`message`，新会话编号在 TERM 帧头的 session 字段里。
+
+同时修正设备列表的占用判断：`participants_info` 的元素是 `ParticipantInfo`（`client_id`/`device_id`/`alias`/`platform`/`user_join_type`/`controlled_time`/`app_flag`），没有 `kind`。本机打开的终端连接也会以本机 `device_id` 出现在被控设备的参与者列表里；现在只有 `device_id` 不等于本机的参与者才算「其他设备使用」，与官方 `d0.e()` 的比较一致。
+
+### 实测（官方 Windows 4.46 被控端）
+
+- `remote-terminal <设备ID> --list`：返回 `2147483649 session2 powershell`、`2147483648 session1 powershell`。
+- 新建 Shell：得到 PowerShell 提示符，`echo` 回显正确，`exit` 打印「远端 Shell 已退出：0」。
+- `--attach 2147483648`：接回 `session1`，重放当前屏幕，命令继续可用。
+- 打开 Shell 期间查询设备列表：被控设备的 `participants_info` 只有本机（`device_id` 为本机、`user_join_type=1`），`OpenUUYC devices` 显示「会话参与者 1（其他设备 0）」；图形界面的「其他设备使用」由同一个 `other_participant_count` 判断驱动（单元测试覆盖），但本次没有实机点击验证 GUI 文案。
+- 未验证：macOS 被控端、断线恢复、图形界面点击后在系统终端里打开、以及第二主控接管流程。
 
 ## 本次验证
 
+- 2026-11-13：`SHELL=/bin/sh cargo +1.95.0 test --offline --lib -- --test-threads=1` 全量 469 项通过、0 失败、47 项按环境忽略；`cargo +1.95.0 build --offline --release --bin OpenUUYC` 成功，并用 release 二进制对官方 Windows 4.46 被控端复测了 `--list`、新建 Shell 与 `echo` 回显。设备列表占用判断新增 9 项单测（含本机终端参与者不计入「其他设备」、未知本机 ID 回退、其他主控仍计入）。
 - Linux `cargo +1.95.0 build --offline --bin OpenUUYC` 成功。
-- `SHELL=/bin/sh cargo +1.95.0 test --offline terminal --lib -- --test-threads=1`：52 项通过，包括真实 PTY Shell、进程组退出、会话隔离、控制端 VT 解析及可选通道取消隔离。默认环境并行首次跑测试有 2 个本机会话测试超时/回放失败，不能将隔离环境测试说成任意用户 Shell 配置均已验证。
+- `SHELL=/bin/sh cargo +1.95.0 test --offline terminal --lib -- --test-threads=1`：98 项通过，包括真实 PTY Shell、进程组退出、会话隔离、控制端 VT 解析、会话清单解析、`--pick` 菜单、宿主分配的会话编号（含 0）、内嵌终端会话列表刷新与超时，以及可选通道取消隔离。默认环境并行首次跑测试有 2 个本机会话测试超时/回放失败，不能将隔离环境测试说成任意用户 Shell 配置均已验证。
+- `cargo +1.95.0 test --offline --lib transport::rtc -- --test-threads=1`：数据通道集合、`a=msid-semantic: WMS *` 和真实 `NativePeer` 的纯数据 SDP（无 `m=audio`/`m=video`）测试通过；`session::negotiation` 的终端控制握手测试确认桌面开关为 0。
+- 设备详情页的会话选择器随 GUI 一起编译；`cargo +1.95.0 test --offline --lib application::app` 通过。实际点击对话框、系统终端接入和跨设备会话清单仍需连接更新后的 Linux 进程验证。
 - 安卓编译、JVM 测试、Lint 单独记录在交付日志；实际跨设备终端创建、权限撤销与 XR 阅读/输入仍需连接更新后的 Linux 进程验证。
 
 ## 后续加固
@@ -30,6 +53,8 @@
 - 桌面端提供 80×24、100×30、120×36 尺寸请求；协议没有独立 Resize ACK，界面不将请求称为远端确认。
 - 安卓输出按有界批次合并到 UI；每次 Shell 切换使旧输出票据失效，防止延迟回调吞掉新输出或覆盖新状态。空闲/未确认终端和过大的输入不会发送。
 - 后续验证：4 项 Rust 控制端测试和安卓 241 项 JVM 测试、Lint 通过；新增补丁未完成跨设备验证，PICO 当前仍未连接。
+- 官方 OPEN 没有请求编号：新建 Shell 的 OPEN 超时后若马上再开一个，迟到的回复无法与新请求区分，可能把编号认错并让一个 Shell 留在远端等空闲回收。官方主控的会话编号 0 可以正常收发，但 0 在线上也表示「新建」，因此列表里编号 0 的会话不提供「接入」，避免静默新开一个 Shell。
+- 内嵌终端的会话列表不再每 2 秒自动轮询（避免窗口内容/高度周期性变化造成视觉闪烁）；打开窗口或点「刷新」时请求一次，列表请求 5 秒无回复会作废，用户可再点刷新。官方主控主动推送的 `TerminalSessionChanged` 仍不在这条通道上解析。
 
 ## Codex CLI 语音与 Linux 音频输入
 

@@ -2,6 +2,7 @@
 
 pub(crate) mod clipboard;
 pub(crate) mod drag_drop;
+pub(crate) mod ghostty_vt;
 pub(crate) mod file_transfer;
 pub(crate) mod host;
 pub(crate) mod network_control;

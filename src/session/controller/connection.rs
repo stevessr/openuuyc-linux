@@ -493,7 +493,7 @@ pub(super) async fn resolve_connection_with_client(
     if (device.platform != 2 && !device.controlled_support) || !device.controllable {
         bail!("device `{alias}` does not currently allow control or viewing");
     }
-    if device.platform == 2 && device.participant_count() != 0 {
+    if device.platform == 2 && device.in_use_by_other_device(&devices.current_device.device_id) {
         bail!("Android screen sharing is already in use; end the current share first");
     }
     let _gate = shared::connection_gate(&shared::key(&client.device_id(), &device.device_id))
@@ -503,7 +503,7 @@ pub(super) async fn resolve_connection_with_client(
     // 会在 connect 时重新验证设备状态），只是不交互。
     let takeover =
         takeover.or_else(|| force_takeover.then(|| takeover::Approval::confirmed(device)));
-    if device.participant_count() != 0
+    if device.in_use_by_other_device(&devices.current_device.device_id)
         && shared::get(&shared::key(&client.device_id(), &device.device_id)).is_none()
         && !takeover
             .as_ref()

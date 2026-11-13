@@ -179,7 +179,7 @@ impl ControllerConnection {
         if let Some(session) = shared::get(&key) {
             return Self::from_shared(session, profile, false);
         }
-        if device.participant_count() > 0 && takeover.is_none() {
+        if device.in_use_by_other_device(&client.device_id()) && takeover.is_none() {
             return Err(takeover::Required(device.clone()).into());
         }
         let force_join = if let Some(approval) = takeover {

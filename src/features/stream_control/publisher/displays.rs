@@ -171,6 +171,20 @@ pub(crate) async fn receive_session(
                     ..Default::default()
                 });
             }
+            if action.action == 22 {
+                // Official SimpleAction 22 ("refresh current information") is
+                // answered by `super::receive` below with refresh_state. On this
+                // host the screen catalog is also where simulated window sources
+                // live, so re-read the inventory here first: newly opened or
+                // closed windows and renamed/resized sources reach the next
+                // catalog publish instead of waiting for the 1 s timer.
+                // A transient display-enumeration failure must not swallow the
+                // official refresh reply, so it only logs; the periodic
+                // inventory path retries on its own.
+                if let Err(error) = session.refresh() {
+                    tracing::warn!(%error, "host screen inventory refresh on request failed");
+                }
+            }
         }
         if let Some(PbPayload::RpcRequest(bytes)) = &message.payload {
             let request = PbRpcRequest::decode(bytes.as_slice())?;

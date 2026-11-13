@@ -522,17 +522,6 @@ impl DeviceCenterApp {
         let mut power = None;
         let mut exit_account = false;
         self.alert(ui);
-        {
-            let launch_error = ui.ctx().data(|data| data.get_temp::<String>(
-                egui::Id::new(("remote-terminal-launch-error", &id))
-            ));
-            crate::ui::controls::observe_notice(
-                ui.ctx(), ("remote-terminal-launch-error", &id),
-                "远程终端启动失败",
-                crate::ui::controls::DialogIcon::Warning,
-                launch_error.as_deref(),
-            );
-        }
         crate::ui::controls::observe_notice(
             ui.ctx(),
             ("device-detail-error", &id),
@@ -833,7 +822,7 @@ impl DeviceCenterApp {
                 let mut button_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                 let allowed = !self.mutation_pending && !self.logout_pending
                     && device.is_connected() && device.controllable
-                    && device.controlled_support && device.participant_count() == 0;
+                    && device.controlled_support && self.other_participants(&device) == 0;
                 remote_terminal = detail_button(
                     &mut button_ui,
                     "远程终端",
@@ -1028,14 +1017,12 @@ impl DeviceCenterApp {
             self.open_file_transfer(id.clone());
         }
         if remote_terminal {
-            if let Err(error) = crate::features::host::terminal::local::open_remote_in_terminal(&id) {
-                tracing::warn!(%error, "failed to open official UU terminal emulator");
-                ui.ctx().data_mut(|data| data.insert_temp(
-                    egui::Id::new(("remote-terminal-launch-error", &id)),
-                    format!("{error:#}"),
-                ));
-                ui.ctx().request_repaint();
-            }
+            self.remote_terminal.open(
+                ui.ctx(),
+                self.login_generation,
+                id.clone(),
+                display_alias(&device).to_owned(),
+            );
         }
         if connect || audio_only {
             self.selected_device_id = Some(id);

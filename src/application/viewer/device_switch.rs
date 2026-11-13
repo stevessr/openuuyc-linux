@@ -234,7 +234,7 @@ impl DeviceSwitcher {
                                 } else {
                                     alias.to_owned()
                                 };
-                                let occupied = device.participant_count() > 0
+                                let occupied = device.in_use_by_other_device(&self.client.device_id())
                                     && !selected
                                     && !crate::session::controller::has_gui_connection(
                                         &self.client.device_id(),

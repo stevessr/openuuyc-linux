@@ -24,6 +24,13 @@ Android device identity and encrypted credentials use separate preference namesp
 4. Only accept_control grants a short-lived, single-use join permit. reject_request, switch_is_off, not_foreground, during_control and during_request stop the attempt. Unknown or unrelated messages do not grant access.
 5. Join using POST /api/v1/room/join/by_device/{targetDeviceId}, force_join=false. ConnectOptions client type is Android (2); same-account connection type remains Normal (1), not Assistance (2). The target must also complete the Android system screen-capture dialog.
 
+The account online room is also the delivery path for the asynchronous
+`android_control_result`. A device owns exactly one online room: creating another
+releases the previous one (signaling 2005), the device becomes unreachable, and
+the phone's reply is refused with a transport error instead of being delivered.
+Reuse the room the process already holds (the presence/device room) and create
+an account-only room only when none is online.
+
 Cancellation sends android_control_request with action=cancel_request. Results carry no request nonce. An unresolved same-device request is therefore quarantined in private preferences for the original 60-second window plus a small delivery grace period before retrying. An uncertain HTTP delivery retains a fresh quarantine. This avoids treating a normal late approval from a cancelled attempt as approval for an immediate retry; it cannot authenticate arbitrarily delayed responses beyond the bounded protocol window. Explicit terminal replies release the quarantine.
 
 ## Verification boundary

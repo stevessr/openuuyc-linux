@@ -34,6 +34,7 @@ pub mod instance;
 pub(crate) mod maintenance;
 mod phone;
 mod power;
+mod remote_terminal;
 mod updates;
 mod view;
 
@@ -180,6 +181,7 @@ struct DeviceCenterApp {
     updates: updates::UpdateCheck,
     center_ui: CenterUi,
     assist: AssistUi,
+    remote_terminal: remote_terminal::Picker,
     worker: GuiWorker,
     devices: Option<DeviceList>,
     catalog: Option<catalog::Catalog>,
@@ -234,13 +236,16 @@ impl DeviceCenterApp {
         media: ConnectionMediaOptions,
         display_warning: Option<String>,
     ) -> Self {
+        let worker = GuiWorker::spawn();
+        let remote_terminal = remote_terminal::Picker::new(worker.commands.clone());
         Self {
             brand_texture: crate::ui::branding::load_texture(ctx),
             updates: updates::UpdateCheck::start(ctx),
             center_ui: CenterUi::default(),
             viewers: Default::default(),
             assist: AssistUi::default(),
-            worker: GuiWorker::spawn(),
+            remote_terminal,
+            worker,
             devices: None,
             catalog: None,
             catalog_error: None,
@@ -439,6 +444,32 @@ impl DeviceCenterApp {
                         }
                         self.extra_details.insert(id, result);
                     }
+                }
+                GuiEvent::RemoteTerminalSessions {
+                    generation,
+                    target,
+                    result,
+                } => {
+                    self.remote_terminal.apply_result(
+                        self.login_generation,
+                        generation,
+                        &target,
+                        result,
+                    );
+                }
+                GuiEvent::RemoteTerminalEnded {
+                    generation,
+                    target,
+                    session,
+                    result,
+                } => {
+                    self.remote_terminal.apply_end_result(
+                        self.login_generation,
+                        generation,
+                        &target,
+                        session,
+                        result,
+                    );
                 }
                 GuiEvent::Working(message) => {
                     if !self.logout_pending && !self.status.kind.is_alert() {
@@ -698,6 +729,8 @@ impl DeviceCenterApp {
             }
             self.sync_login_running();
         }
+        // 登录代际变了就丢掉上一次登录的终端清单；在途结果由 apply_result 拦下。
+        self.remote_terminal.sync_generation(self.login_generation);
 
         for (generation, alias, result) in self.viewers.finished() {
             tracing::info!(device = %alias, outcome = ?result, "viewing window ended");
@@ -913,6 +946,8 @@ impl DeviceCenterApp {
         self.catalog_error = None;
         self.account_name.clear();
         self.center_ui.close_details();
+        // 账号会话结束时选择器里的清单也失效，不能带到下一次登录。
+        self.remote_terminal.close();
     }
 
     fn is_viewing_target(&self, id: &str) -> bool {
@@ -1064,8 +1099,21 @@ impl DeviceCenterApp {
         }
     }
 
+    /// Participants that are not this client's own connections.
+    ///
+    /// Falls back to the raw count before the device list (and therefore this
+    /// device's ID) is known, so an unknown identity never silently reports a
+    /// device as free.
+    fn other_participants(&self, device: &DeviceInfo) -> usize {
+        self.devices.as_ref().map_or_else(
+            || device.participant_count(),
+            |list| device.other_participant_count(&list.current_device.device_id),
+        )
+    }
+
     fn connection_issue(&self, device: &DeviceInfo) -> std::result::Result<(), String> {
-        if device.platform == 2 && device.participant_count() > 0
+        if device.platform == 2
+            && self.other_participants(device) > 0
             && self.viewer_for_device(&device.device_id).is_none()
         {
             return Err("手机正在共享中，请先在手机上结束当前共享".into());
@@ -1085,7 +1133,8 @@ impl DeviceCenterApp {
     }
 
     fn needs_takeover(&self, device: &DeviceInfo) -> bool {
-        device.platform != 2 && device.participant_count() > 0
+        device.platform != 2
+            && self.other_participants(device) > 0
             && !self.devices.as_ref().is_some_and(|list| {
                 crate::session::controller::has_gui_connection(
                     &list.current_device.device_id,

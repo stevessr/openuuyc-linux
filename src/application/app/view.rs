@@ -1453,6 +1453,7 @@ impl DeviceCenterApp {
         if self.needs_login() {
             self.logout_confirmation = false;
             self.takeover_confirmation = None;
+            self.remote_terminal.close();
             return;
         }
         if self.takeover_confirmation.is_some() {
@@ -1463,6 +1464,15 @@ impl DeviceCenterApp {
             self.power_confirmation(ctx);
         } else if self.center_ui.edit.is_some() {
             self.device_edit_dialog(ctx);
+        }
+        // 设备详情页的「远程终端」选择器；和确认类对话框一样，同一时间只
+        // 显示一个，不把两个模态叠在一起。
+        if self.center_ui.edit.is_none()
+            && self.center_ui.power.is_none()
+            && !self.logout_confirmation
+            && let Some(action) = self.remote_terminal.show(ctx)
+        {
+            self.handle_remote_terminal_action(action);
         }
         if self.logout_confirmation {
             self.logout_dialog(ctx);

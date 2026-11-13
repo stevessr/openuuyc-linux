@@ -27,6 +27,7 @@ use crate::ui::chrome::{
     resize_regions, set_fullscreen, title_bar_height, title_bar_panel,
     update_nonmodal_window_resize, window_title_bar,
 };
+use crate::ui::controls::files::Icon;
 use crate::ui::controls::{ViewerCaptionIcon, viewer_caption_button as caption_button};
 use crate::ui::gfx::{UiPresenter, UiTimingAudit, split_output};
 use crate::ui::window_manager::{Event as UiEvent, Repaint as UiRepaintEvent};
@@ -2805,6 +2806,8 @@ impl Player {
         // 与 Windows 同一个宽度，够放 "3840×1620 · 35 FPS · H.265"。
         const METRICS_WIDTH: f32 = 184.0;
         const MINIMUM: f32 = 60.0;
+        // 刷新按钮在标签区右端占的固定宽度（不跟着标签滚动）。
+        const REFRESH_WIDTH: f32 = crate::ui::theme::COMPACT_HEIGHT + 3.0;
         if rect.width() < MINIMUM {
             return;
         }
@@ -2860,6 +2863,26 @@ impl Player {
         if tabs_rect.width() < 40.0 {
             return;
         }
+        // 标签区右端留给刷新按钮，剩下的宽度照旧横向滚动；太窄就干脆不放，
+        // 优先让目录自己滚。
+        let refresh_rect = (tabs_rect.width() > REFRESH_WIDTH + 40.0).then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(
+                    (tabs_rect.max.x - REFRESH_WIDTH).max(tabs_rect.min.x),
+                    tabs_rect.min.y,
+                ),
+                tabs_rect.max,
+            )
+        });
+        let tabs_rect = refresh_rect.map_or(tabs_rect, |refresh_rect| {
+            egui::Rect::from_min_max(
+                tabs_rect.min,
+                egui::pos2(
+                    (refresh_rect.min.x - 3.0).max(tabs_rect.min.x),
+                    tabs_rect.max.y,
+                ),
+            )
+        });
         let catalog = self.catalog.clone();
         let tab_ids = self.tabs.clone();
         let control = self.session.stream_control.clone();
@@ -2875,6 +2898,31 @@ impl Player {
         } else {
             "这个窗口只剩一块显示器，不能再拖出"
         };
+        // 刷新远端屏目录：窗口源在主机上按模拟屏上报（另有 1s 定时刷新），这里让
+        // 对端立刻重新枚举一次——新开/关掉的窗口、改过的标题和尺寸。只读操作，正在
+        // 切屏时也给点（切屏与重建目录不冲突），但 TEXT/PB 通道没就绪就没意义。
+        if let Some(refresh_rect) = refresh_rect {
+            let mut refresh = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(refresh_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            refresh.set_clip_rect(refresh_rect);
+            if crate::ui::controls::files::icon(
+                &mut refresh,
+                Icon::Refresh,
+                "刷新远端屏幕/窗口列表；窗口源以模拟屏上报，点击后重新枚举新增、关闭或改名的窗口",
+                snapshot.text_channel_open && snapshot.pb_connected,
+            )
+            .clicked()
+                && let Err(error) = control.request_screen_refresh()
+            {
+                self.report(
+                    "显示器操作失败",
+                    format!("刷新远端屏幕/窗口列表失败：{error:#}"),
+                );
+            }
+        }
         let requests = self.requests.clone();
         let proxy = self.proxy.clone();
         let mut open = None;

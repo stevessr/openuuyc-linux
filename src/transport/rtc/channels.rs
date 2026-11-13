@@ -62,7 +62,12 @@ impl DataChannels {
             }
             if channel.label() == crate::diagnostics::remote::CHANNEL {
                 uu_kcp.bind_stream(channel.id(), false);
-                stream_control.diagnostics().bind(channel);
+                // BINARY is shared with the official kind=8 terminal. The
+                // diagnostics handler forwards TERM frames to the terminal
+                // receiver instead of dropping them.
+                stream_control
+                    .diagnostics()
+                    .bind(channel, terminal_inbound.clone());
                 continue;
             }
             stream_control.file_transfer().bind(channel);

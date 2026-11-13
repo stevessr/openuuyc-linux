@@ -160,6 +160,9 @@ pub(crate) struct Handle {
     pub(crate) wol_setup: super::wol::setup::Handle,
     pub(crate) power: super::power::Handle,
     pub(crate) assistance: super::assist::Handle,
+    /// `transport_rpc` pushes delivered to this device's online room. It lives
+    /// here because the presence task is the only owner of that room.
+    pub(crate) transport_rpc: crate::session::transport_rpc::Inbox,
     desired: watch::Sender<Option<AccessRequest>>,
     port_changed: watch::Sender<u64>,
     ownership: Arc<Mutex<Ownership>>,
@@ -178,6 +181,7 @@ impl Default for Handle {
             wol_setup: Default::default(),
             power: Default::default(),
             assistance: Default::default(),
+            transport_rpc: Default::default(),
             desired: watch::channel(None).0,
             port_changed: watch::channel(0).0,
             ownership: Arc::new(Mutex::new(Ownership {

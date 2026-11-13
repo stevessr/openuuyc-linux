@@ -73,6 +73,15 @@ pub struct LogoutOutcome {
     pub local_error: Option<String>,
 }
 
+/// Resolves once the device room that was online at approval start is gone.
+async fn wait_device_room_offline(events: &mut tokio::sync::watch::Receiver<bool>) {
+    while *events.borrow_and_update() {
+        if events.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 fn parse_android_share_result(
     push: &serde_json::Value,
     target_id: &str,
@@ -118,6 +127,36 @@ mod android_share_tests {
         assert_eq!(parse_android_share_result(&reply("0123456789abcdef", "future_action"), "0123456789abcdef"), None);
         assert_eq!(parse_android_share_result(&reply("0123456789abcdef", "reject_request"), "0123456789abcdef"),
             Some(Err("The Android user rejected screen sharing")));
+    }
+
+    #[tokio::test]
+    async fn reused_device_room_delivers_the_approval_reply() {
+        // The presence room forwards transport RPC pushes to the inbox; the
+        // approval subscribes there instead of opening a second device room.
+        let inbox = crate::session::transport_rpc::Inbox::default();
+        let mut pushes = inbox.subscribe();
+        assert!(inbox.push(&reply("0123456789abcdef", "accept_control")));
+        let push = pushes.recv().await.unwrap();
+        assert_eq!(
+            parse_android_share_result(&push, "0123456789abcdef"),
+            Some(Ok(()))
+        );
+        assert_eq!(parse_android_share_result(&push, "fedcba9876543210"), None);
+    }
+
+    #[tokio::test]
+    async fn losing_the_online_room_stops_the_wait() {
+        let inbox = crate::session::transport_rpc::Inbox::default();
+        inbox.set_online(true);
+        let mut events = inbox.online_events();
+        let wait = tokio::spawn(async move { super::wait_device_room_offline(&mut events).await });
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+        inbox.set_online(false);
+        tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+            .await
+            .expect("room loss must wake the approval wait")
+            .unwrap();
     }
 }
 
@@ -610,7 +649,10 @@ impl AuthenticatedClient {
         if device.alias != expected.alias || device.platform != expected.platform {
             bail!("设备名称或平台已变化，请刷新后重新确认目标");
         }
-        if device.participant_count() > expected.participant_count() {
+        // Compare only participants held by other devices: this controller's
+        // own terminal/file-transfer sessions are not a new remote controller.
+        let own = self.device_id();
+        if device.other_participant_count(&own) > expected.other_participant_count(&own) {
             bail!("该设备新增了远控连接，请刷新后重新确认影响");
         }
         action.check(device, &self.features)?;
@@ -633,6 +675,13 @@ impl AuthenticatedClient {
 
     /// Ask an Android device for one screen-share approval over the official account push room.
     /// The device room is account-only: no media negotiation or input channel is started.
+    ///
+    /// The phone answers asynchronously with an `android_control_result` push that the
+    /// server delivers to this device's online room. A device owns exactly one online
+    /// room: creating another one releases the first (signaling 2005), which leaves the
+    /// device unreachable and the phone's reply undeliverable. So when this process
+    /// already keeps a room online (the GUI presence room) we subscribe to it; only a
+    /// process without an online room (CLI) opens the account-only room itself.
     pub async fn approve_android_share(
         &self,
         target_id: &str,
@@ -642,20 +691,46 @@ impl AuthenticatedClient {
         crate::account::api::validate_device_id(target_id)?;
         let local_id = self.device_id();
         let alias = "OpenUUYC Desktop".to_owned();
-        let room = self.request(|api| async move { api.create_room(0).await }).await?;
-        let room = room.validate().map(|_| room)?;
         const PUSH_QUEUE_CAPACITY: usize = 32;
         let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(PUSH_QUEUE_CAPACITY);
-        let push_target = target_id.to_owned();
-        let handler: crate::transport::signal::SignalPushHandler = std::sync::Arc::new(move |value| {
-            if parse_android_share_result(value, &push_target).is_none() { return; }
-            // Never block the signal worker. Only matching approval outcomes
-            // enter the bounded queue, so unrelated account pushes cannot starve it.
-            let _ = push_tx.try_send(value.clone());
-        });
-        let signal = crate::transport::signal::SignalSession::connect_observed(
-            room, crate::transport::signal::SignalRole::Host, cancel, Some(handler),
-        ).await?;
+        // Resident (Windows service) ownership keeps the room in another process;
+        // this process then has no online room and opens its own, exactly as a CLI
+        // caller does.
+        let reuse_online_room = self.host.transport_rpc.online();
+        let mut online_events = self.host.transport_rpc.online_events();
+        let mut forwarding = None;
+        let mut signal = None;
+        if reuse_online_room {
+            // The presence room stays online; closing it is not ours to do.
+            tracing::info!("reusing the device online room for Android share approval");
+            let mut pushes = self.host.transport_rpc.subscribe();
+            let push_target = target_id.to_owned();
+            let sender = push_tx.clone();
+            forwarding = Some(tokio::spawn(async move {
+                while let Ok(push) = pushes.recv().await {
+                    if parse_android_share_result(&push, &push_target).is_none() { continue; }
+                    if sender.send(push).await.is_err() { break; }
+                }
+            }));
+        } else {
+            tracing::info!("opening an account-only room for Android share approval");
+            let room = self.request(|api| async move { api.create_room(0).await }).await?;
+            let room = room.validate().map(|_| room)?;
+            let push_target = target_id.to_owned();
+            let sender = push_tx.clone();
+            let handler: crate::transport::signal::SignalPushHandler = std::sync::Arc::new(move |value| {
+                if parse_android_share_result(value, &push_target).is_none() { return; }
+                // Never block the signal worker. Only matching approval outcomes
+                // enter the bounded queue, so unrelated account pushes cannot starve it.
+                let _ = sender.try_send(value.clone());
+            });
+            signal = Some(crate::transport::signal::SignalSession::connect_observed(
+                room, crate::transport::signal::SignalRole::Host, cancel, Some(handler),
+            ).await?);
+        }
+        // The forwarding task and the signal handler own the only senders left;
+        // the queue closes when neither can produce an approval anymore.
+        drop(push_tx);
         let send = |action: &'static str| {
             let target_id = target_id.to_owned();
             let local_id = local_id.clone();
@@ -665,12 +740,14 @@ impl AuthenticatedClient {
         let sent = match send("request_control").await {
             Ok(sent) => sent,
             Err(error) => {
-                let _ = signal.close().await;
+                if let Some(task) = forwarding.take() { task.abort(); }
+                if let Some(signal) = signal.take() { let _ = signal.close().await; }
                 return Err(error);
             }
         };
         if sent.code != 0 {
-            let _ = signal.close().await;
+            if let Some(task) = forwarding.take() { task.abort(); }
+            if let Some(signal) = signal.take() { let _ = signal.close().await; }
             return Err(crate::account::api::ApiFailure { code: sent.code, message: sent.msg }.into());
         }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -682,6 +759,11 @@ impl AuthenticatedClient {
                 biased;
                 _ = cancel.cancelled() => break Err(anyhow::anyhow!("Android share request cancelled")),
                 _ = self.ended.cancelled() => break Err(anyhow::anyhow!("account session ended")),
+                // A released device room cannot deliver the phone's reply, so stop
+                // waiting instead of reporting a misleading 60 s timeout.
+                _ = wait_device_room_offline(&mut online_events), if reuse_online_room => {
+                    break Err(anyhow::anyhow!("本机在线房间已断开，手机的共享结果无法送达，请稍后重试"));
+                }
                 value = tokio::time::timeout(remaining, push_rx.recv()) => match value {
                     Ok(Some(value)) => value,
                     Ok(None) => break Err(anyhow::anyhow!("Android share approval push ended")),
@@ -698,7 +780,11 @@ impl AuthenticatedClient {
             // The approval protocol has no request identifier; cancellation only stops this pending request.
             let _ = send("cancel_request").await;
         }
-        let closed = signal.close().await;
+        if let Some(task) = forwarding.take() { task.abort(); }
+        let closed = match signal.take() {
+            Some(signal) => signal.close().await,
+            None => Ok(()),
+        };
         result.and(closed)
     }
 

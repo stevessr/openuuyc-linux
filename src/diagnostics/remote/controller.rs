@@ -77,7 +77,19 @@ impl Controller {
             f(&mut s.view)
         }
     }
-    pub fn bind(&self, channel: &Arc<RTCDataChannel>) {
+    /// Bind the low-priority BINARY channel.
+    ///
+    /// That channel is shared with the official `kind = 8` remote terminal: the
+    /// official controller sends and receives `TERM` frames on it. Only one
+    /// `on_message` handler can exist per data channel, so the diagnostics
+    /// decoder must forward terminal frames instead of dropping them as
+    /// "unrelated" packets — otherwise OPEN/LIST replies never reach the
+    /// terminal and every remote terminal request times out.
+    pub fn bind(
+        &self,
+        channel: &Arc<RTCDataChannel>,
+        terminal: tokio::sync::broadcast::Sender<Vec<u8>>,
+    ) {
         let stop = CancellationToken::new();
         let (tx, mut rx) = mpsc::channel(8);
         let (commands, mut requests) = mpsc::channel(1);
@@ -91,17 +103,24 @@ impl Controller {
             s.generation
         };
         let input_stop = stop.clone();
+        let terminal_frames = terminal;
         channel.on_message(Box::new(move |message| {
-            // BINARY is otherwise unused; ignore unrelated/official packets.
-            if message.data.starts_with(MAGIC) {
-                match decode(&message.data) {
+            // The terminal owns every TERM frame on this shared channel. Never
+            // log or decode its payload here: it carries keystrokes and shell
+            // output.
+            match route_frame(&message.data) {
+                Routed::Terminal(frame) => {
+                    let _ = terminal_frames.send(frame.to_vec());
+                }
+                Routed::Diagnostics(_) => match decode(&message.data) {
                     Ok(packet) => {
                         if tx.try_send(packet).is_err() {
                             input_stop.cancel()
                         }
                     }
                     Err(_) => input_stop.cancel(),
-                }
+                },
+                Routed::Ignore => {}
             }
             Box::pin(async {})
         }));
@@ -284,4 +303,59 @@ async fn download(
     // whose completion was discarded by the caller.
     std::fs::rename(&partial.0, &path)?;
     Ok((path, warnings))
+}
+
+/// Official UU `TERM` frame magic. The terminal protocol (controller side)
+/// encodes every frame with this prefix; the shared BINARY channel also
+/// carries `OUDIAG01` diagnostics packets.
+fn is_terminal_frame(data: &[u8]) -> bool {
+    data.starts_with(b"TERM")
+}
+
+/// Which handler owns one message on the shared low-priority BINARY channel.
+#[derive(Debug, PartialEq, Eq)]
+enum Routed<'a> {
+    Terminal(&'a [u8]),
+    Diagnostics(&'a [u8]),
+    Ignore,
+}
+
+/// Exactly one `on_message` can exist per data channel, so the dispatch order
+/// is the contract: terminal first, diagnostics second, everything else
+/// dropped. Terminal frames must never be offered to the diagnostics decoder.
+fn route_frame(data: &[u8]) -> Routed<'_> {
+    if is_terminal_frame(data) {
+        Routed::Terminal(data)
+    } else if data.starts_with(MAGIC) {
+        Routed::Diagnostics(data)
+    } else {
+        Routed::Ignore
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_frames_are_not_diagnostics() {
+        // A TERM header plus a kind byte must be routed to the terminal.
+        assert!(is_terminal_frame(b"TERM\x01\x05\x00\x00"));
+        assert!(!is_terminal_frame(b"OUDIAG01"));
+        assert!(!is_terminal_frame(b""));
+        assert!(!is_terminal_frame(b"TER"));
+    }
+
+    /// The shared channel has one handler; this is the dispatch it performs.
+    #[test]
+    fn the_shared_binary_channel_dispatches_terminal_before_diagnostics() {
+        let term = b"TERM\x01\x0a\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00[]";
+        assert!(matches!(route_frame(term), Routed::Terminal(frame) if frame == term));
+        let diag = b"OUDIAG01{\"type\":\"hello\"}";
+        assert!(matches!(route_frame(diag), Routed::Diagnostics(frame) if frame == diag));
+        assert_eq!(route_frame(b"random bytes"), Routed::Ignore);
+        assert_eq!(route_frame(b""), Routed::Ignore);
+        // A diagnostics-looking prefix inside a TERM frame must not win.
+        assert!(matches!(route_frame(term), Routed::Terminal(_)));
+    }
 }

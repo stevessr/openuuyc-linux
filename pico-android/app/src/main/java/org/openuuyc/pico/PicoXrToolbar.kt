@@ -253,7 +253,17 @@ internal class PicoXrToolbar(
     private var backgroundIndex=0
     fun setMr(enabled: Boolean) {mr=enabled;draw()}
     fun openScreenSettings(screen: Int,paneHint: Int?=null) {optionTitle=null;optionApply=null;pendingTakeover=null;confirmingVirtual=false;targetScreen=screen;targetPaneHint=paneHint;advanced=false;backgroundPage=false;environmentPage=false;spacePage=false;devicePage=false;screenPage=false;keyboardPage=false;dropdownOffset=0;notice="屏幕设置 · ${session()?.screenSnapshot()?.firstOrNull {it.id==screen} ?: screen}";draw()}
-    fun openScreens() {optionTitle=null;optionApply=null;pendingTakeover=null;confirmingVirtual=false;keyboardPage=false;spacePage=false;screenOffset=0;targetScreen=null;targetPaneHint=null;advanced=false;devicePage=false;environmentPage=false;backgroundPage=false;screenPage=true;menuScreens=session()?.screenSnapshot().orEmpty();screenOffset=PicoXrDropdownLayout.pageOf(menuScreens.indexOfFirst {it.id==session()?.selectedScreen()});dropdownOffset=0;notice="选择显示器";draw()}
+    fun openScreens() {
+        optionTitle=null;optionApply=null;pendingTakeover=null;confirmingVirtual=false;keyboardPage=false;spacePage=false;targetScreen=null;targetPaneHint=null;advanced=false;devicePage=false;environmentPage=false;backgroundPage=false;screenPage=true
+        menuScreens=session()?.screenSnapshot().orEmpty()
+        val selected=menuScreens.indexOfFirst {it.id==session()?.selectedScreen()}
+        // The XR dropdown opens on the page that holds the selected screen; the legacy toolbar keeps its own offset.
+        screenOffset=PicoXrDropdownLayout.clampOffset(PicoXrDropdownLayout.pageOf(selected),menuScreens.size)
+        dropdownOffset=PicoXrDropdownLayout.pageOfSelection(selected,selectionRows().size)
+        if(selected>=0) navigationCell=selected
+        notice=if(menuScreens.isEmpty()) "选择显示器 · 尚未收到屏幕列表" else "选择显示器 · 共 ${menuScreens.size} 个屏幕"
+        draw()
+    }
     fun confirmVirtualScreen() {optionTitle=null;
         if((session()?.settingsSnapshot()?.captureLevel ?: 0)<5) {status("远端未开放虚拟屏能力");return}
         confirmingVirtual=true;pendingTakeover=null;keyboardPage=false;environmentPage=false;backgroundPage=false;spacePage=false;devicePage=false;screenPage=false;dropdownOffset=0;notice="确认在远端创建1920×1080虚拟屏？";draw()
@@ -392,8 +402,17 @@ internal class PicoXrToolbar(
         confirmingVirtual->"创建虚拟屏"
         targetScreen!=null->"屏幕设置 · ${session()?.screenSnapshot()?.firstOrNull {it.id==targetScreen} ?: targetScreen}"
         devicePage->"设备"
-        screenPage->"显示器"
+        screenPage->"显示器"+screenPageIndicator()
         else->"串流设置"
+    }
+
+    /** "第 x/y 页" title hint when the screen list needs more than one visible window; display only, indices untouched. */
+    private fun screenPageIndicator(): String {
+        val rows=selectionRows().size
+        val pages=PicoXrDropdownLayout.pageCount(rows)
+        if(pages<=1) return ""
+        val page=(dropdownOffset/PicoXrDropdownLayout.visibleRows+1).coerceIn(1,pages)
+        return " · 第 $page/$pages 页"
     }
 
     private fun selectionRows(): List<PicoXrDropdownRow> {
@@ -619,7 +638,13 @@ internal class PicoXrToolbar(
                 }
             }
             screenPage->when {
-                label=="刷新屏幕"->{menuScreens=session()?.screenSnapshot().orEmpty();screenOffset=0;return}
+                label=="刷新屏幕"->{
+                    menuScreens=session()?.screenSnapshot().orEmpty()
+                    screenOffset=PicoXrDropdownLayout.clampOffset(screenOffset,menuScreens.size)
+                    dropdownOffset=PicoXrDropdownLayout.clampOffset(dropdownOffset,selectionRows().size)
+                    notice="屏幕列表已刷新 · 共 ${menuScreens.size} 个屏幕"
+                    return
+                }
                 label=="返回串流设置"->{screenPage=false;closeScreenMenu();notice="已返回串流设置";return}
                 else->menuScreens.firstOrNull {it.name.ifBlank {"屏幕 ${it.id+1}"}==label}?.let {
                     val direct=session() ?: return
@@ -866,7 +891,7 @@ internal class PicoXrToolbar(
                     8 -> screenOffset=(screenOffset-8).coerceAtLeast(0)
                     9 -> if(screenOffset+8<menuScreens.size) screenOffset+=8
                     11 -> { screenPage=false;closeScreenMenu();notice="已返回串流设置" }
-                    10 -> { menuScreens=direct.screenSnapshot();screenOffset=screenOffset.coerceAtMost(PicoXrDropdownLayout.pageOf((menuScreens.size-1).coerceAtLeast(0)));notice="选择远端屏幕 · 当前项显示勾选" }
+                    10 -> { menuScreens=direct.screenSnapshot();screenOffset=PicoXrDropdownLayout.clampOffset(screenOffset,menuScreens.size);dropdownOffset=PicoXrDropdownLayout.clampOffset(dropdownOffset,selectionRows().size);notice="选择远端屏幕 · 当前项显示勾选" }
                     else -> menuScreens.getOrNull(screenOffset+cell)?.let {
                         check(direct.switchScreen(it.id)) { "切屏未发送：屏幕已变化或通道未就绪" }
                     }

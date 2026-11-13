@@ -64,6 +64,10 @@ const FPS_144: i32 = 4;
 
 const ACTION_TYPE_ECHO_REQUEST: i32 = 0;
 const ACTION_TYPE_ECHO_RESPONSE: i32 = 1;
+// Official SimpleAction 22 ("refresh current information"): on the controlling
+// side it asks the host to re-read its screen inventory, which on a Linux host
+// is where simulated window sources appear and disappear.
+const ACTION_TYPE_SCREEN_REFRESH: i32 = 22;
 const CHROMA_420: i32 = 1;
 const CHROMA_444: i32 = 3;
 const RESOLUTION_DEFAULT: i32 = 1;
@@ -826,6 +830,46 @@ impl StreamControlHandle {
         self.network.clone()
     }
 
+    /// Ask the host to re-read its screen inventory (official SimpleAction 22,
+    /// "refresh current information"). Window sources on a Linux host are
+    /// reported as simulated screens and the host also refreshes them on its own
+    /// timer; this is the user-triggered re-enumeration of newly opened or
+    /// closed windows and changed titles/sizes.
+    ///
+    /// It is a read-only catalog refresh: no capture setting and no screen
+    /// selection is sent, and the host still answers with the regular
+    /// `refresh_state`/`refresh_secure` report.
+    // Only the Linux viewer title bar calls this today.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn request_screen_refresh(&self) -> Result<()> {
+        let (sequence, payload, active_protocol) = {
+            let mut state = lock(&self.shared);
+            let sequence = state.next_sequence;
+            state.next_sequence += 1;
+            let payload = PbControlMessage {
+                seq: sequence,
+                timestamp: 0,
+                payload: Some(PbPayload::SimpleAction(PbSimpleAction {
+                    action: ACTION_TYPE_SCREEN_REFRESH,
+                    args: String::new(),
+                    params: None,
+                })),
+            }
+            .encode_to_vec();
+            (sequence, payload, protocol(&state))
+        };
+        self.outgoing
+            .send(OutgoingControlMessage {
+                annotation_generation: None,
+                sequence,
+                payload,
+                protocol: active_protocol,
+                completion: None,
+            })
+            .map_err(|_| anyhow!("观看连接已关闭"))?;
+        Ok(())
+    }
+
     pub fn set_relay_enabled(&self, enabled: bool) -> Result<()> {
         if !feature_supported(
             &lock(&self.shared),
@@ -988,3 +1032,50 @@ mod tracks;
 mod wire;
 pub(crate) use wire::encode_touch_input;
 mod window_extension;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message as _;
+
+    fn connected_handle() -> (
+        StreamControlHandle,
+        mpsc::UnboundedReceiver<OutgoingControlMessage>,
+    ) {
+        let profile = crate::media::ConnectionMediaOptions::default()
+            .resolve(crate::media::LocalDisplayInfo::FALLBACK)
+            .unwrap();
+        let (handle, outgoing, _echo) = StreamControlHandle::new(
+            profile,
+            crate::diagnostics::performance::PerformanceMonitor::new("screen refresh test"),
+        );
+        handle.set_data_channel_open("CONTROL_DATA_CHANNEL", true);
+        handle.set_data_channel_open("TEXT_DATA_CHANNEL", true);
+        (handle, outgoing)
+    }
+
+    /// The viewer's manual refresh is exactly the official SimpleAction 22, and
+    /// it must not smuggle a capture-setting snapshot along with it: a refresh
+    /// never changes capture settings or the selected screen.
+    #[test]
+    fn screen_refresh_is_official_action_22_and_nothing_else() {
+        let (handle, mut outgoing) = connected_handle();
+
+        handle.request_screen_refresh().unwrap();
+
+        let message = outgoing.try_recv().expect("one outgoing request");
+        assert!(
+            outgoing.try_recv().is_err(),
+            "refresh must not emit a capture setting"
+        );
+        let decoded = PbControlMessage::decode(message.payload.as_slice()).unwrap();
+        assert_eq!(decoded.seq, message.sequence);
+        assert_eq!(decoded.timestamp, 0);
+        let Some(PbPayload::SimpleAction(action)) = decoded.payload else {
+            panic!("refresh must be a SimpleAction");
+        };
+        assert_eq!(action.action, ACTION_TYPE_SCREEN_REFRESH);
+        assert!(action.args.is_empty());
+        assert!(action.params.is_none());
+    }
+}

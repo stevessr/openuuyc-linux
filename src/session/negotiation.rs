@@ -86,14 +86,18 @@ fn build_control_frames_with_id(
     if selected_capabilities.is_empty() {
         bail!("cannot build control request without a UU-compatible video decoder");
     }
+    let terminal = purpose == ControlPurpose::Terminal;
     let streamer_data = serde_json::to_string(&json!({
         "control_id": app_control_id,
         "openuuyc_audio_only": purpose == ControlPurpose::Audio,
-        "openuuyc_audio_control": 1,
-        "openuuyc_annotation": if android_screen_share { 0 } else { 1 },
-        "openuuyc_display_geometry": if android_screen_share { 0 } else { 1 },
-        "openuuyc_diagnostics": if android_screen_share { 0 } else { 1 },
-        "openuuyc_drag_drop": if android_screen_share { 0 } else { 1 },
+        // The official terminal controller disables audio/video control and
+        // every desktop-only feature: the host must not start a desktop stream
+        // for a kind=8 data-only terminal connection.
+        "openuuyc_audio_control": if terminal { 0 } else { 1 },
+        "openuuyc_annotation": if terminal || android_screen_share { 0 } else { 1 },
+        "openuuyc_display_geometry": if terminal || android_screen_share { 0 } else { 1 },
+        "openuuyc_diagnostics": if terminal || android_screen_share { 0 } else { 1 },
+        "openuuyc_drag_drop": if terminal || android_screen_share { 0 } else { 1 },
         "device_capability": decoder_support
     }))?;
     let event = json!([
@@ -276,4 +280,64 @@ fn push_varint(output: &mut Vec<u8>, mut value: u64) {
         value >>= 7;
     }
     output.push(value as u8);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::capability::{CodecCapability, DeviceCapability};
+
+    fn control_frames(purpose: ControlPurpose) -> ControlFrames {
+        let profile = crate::media::ConnectionMediaOptions::default()
+            .resolve(crate::media::LocalDisplayInfo::FALLBACK)
+            .unwrap();
+        let capability = DeviceCapability {
+            video_codec_capability: vec![CodecCapability {
+                video_codec: 1,
+                width: 1920,
+                height: 1080,
+                chroma_sampling: 1,
+                bit_depth: 8,
+                codec_impl: 37,
+            }],
+            ..Default::default()
+        };
+        build_control_frames(
+            "abcdefghijklmnop",
+            1,
+            &capability,
+            profile,
+            ControlConnectType::Normal,
+            None,
+            purpose,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn streamer_data(frames: &ControlFrames) -> serde_json::Value {
+        let json = frames
+            .header
+            .strip_prefix("451-1")
+            .expect("control header prefix");
+        let event: serde_json::Value = serde_json::from_str(json).unwrap();
+        serde_json::from_str(event[1]["streamer_data"].as_str().unwrap()).unwrap()
+    }
+
+    /// The official terminal handshake is a data-only kind=8 connection: it
+    /// must not ask the host to control audio/video or desktop extensions.
+    #[test]
+    fn a_terminal_control_handshake_disables_desktop_streaming() {
+        let terminal = streamer_data(&control_frames(ControlPurpose::Terminal));
+        assert_eq!(terminal["openuuyc_audio_control"], 0);
+        assert_eq!(terminal["openuuyc_annotation"], 0);
+        assert_eq!(terminal["openuuyc_display_geometry"], 0);
+        assert_eq!(terminal["openuuyc_diagnostics"], 0);
+        assert_eq!(terminal["openuuyc_drag_drop"], 0);
+        assert_eq!(terminal["openuuyc_audio_only"], false);
+
+        let viewing = streamer_data(&control_frames(ControlPurpose::Viewing));
+        assert_eq!(viewing["openuuyc_audio_control"], 1);
+        assert_eq!(viewing["openuuyc_annotation"], 1);
+    }
 }

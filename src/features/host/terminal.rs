@@ -69,17 +69,25 @@ pub(crate) mod local {
 
     /// Console host for an official remote terminal on Windows. A new console
     /// is required because OpenUUYC's GUI executable has no parent console.
+    /// `attach` is the session the desktop picker resolved; `None` starts a
+    /// new shell. Arguments stay argv-only; no cmd.exe or shell is involved.
     #[cfg(windows)]
-    pub(crate) fn open_remote_in_terminal(device_id: &str) -> anyhow::Result<()> {
+    pub(crate) fn open_remote_in_terminal(
+        device_id: &str,
+        attach: Option<u32>,
+    ) -> anyhow::Result<()> {
         use anyhow::Context as _;
         use std::os::windows::process::CommandExt;
         crate::account::api::validate_device_id(device_id)?;
         let exe = std::env::current_exe().context("找不到 OpenUUYC 可执行文件")?;
         // CREATE_NEW_CONSOLE (Win32 process flag); no cmd.exe or shell injection.
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-        let mut child = std::process::Command::new(exe)
-            .arg("remote-terminal")
-            .arg(device_id)
+        let mut command = std::process::Command::new(exe);
+        command.arg("remote-terminal").arg(device_id);
+        if let Some(session) = attach {
+            command.arg("--attach").arg(session.to_string());
+        }
+        let mut child = command
             .creation_flags(CREATE_NEW_CONSOLE)
             .spawn()
             .context("无法启动 UU 远程终端控制台")?;
@@ -91,7 +99,10 @@ pub(crate) mod local {
     }
 
     #[cfg(not(windows))]
-    pub(crate) fn open_remote_in_terminal(_device_id: &str) -> anyhow::Result<()> {
+    pub(crate) fn open_remote_in_terminal(
+        _device_id: &str,
+        _attach: Option<u32>,
+    ) -> anyhow::Result<()> {
         anyhow::bail!(UNSUPPORTED)
     }
 }

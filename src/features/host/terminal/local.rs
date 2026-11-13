@@ -646,13 +646,16 @@ pub(crate) fn open_in_terminal(session: u32) -> Result<()> {
 /// Open the official UU controller-side terminal in a real terminal emulator.
 /// Pass the already validated device ID as an argv item, never through a shell:
 /// device aliases/IDs must not become executable terminal commands.
-pub(crate) fn open_remote_in_terminal(device_id: &str) -> Result<()> {
+///
+/// `attach` is the session the desktop picker already resolved; `None` starts
+/// a new shell. The remote host decides whether that session still exists.
+pub(crate) fn open_remote_in_terminal(device_id: &str, attach: Option<u32>) -> Result<()> {
     crate::account::api::validate_device_id(device_id)?;
     let exe = std::env::current_exe().context("找不到 OpenUUYC 可执行文件")?;
     let (program, args) = terminal_emulator().context("找不到可用的系统终端模拟器")?;
     let mut command = std::process::Command::new(&program);
     command.args(args);
-    command.args(remote_terminal_arguments(&exe, device_id));
+    command.args(remote_terminal_arguments(&exe, device_id, attach));
     let mut child = command
         .spawn()
         .with_context(|| format!("启动系统终端 {program} 失败"))?;
@@ -678,28 +681,25 @@ fn attach_arguments(exe: &std::path::Path, session: u32) -> Vec<std::ffi::OsStri
 
 /// 在系统终端里运行本程序的远程终端子命令。
 ///
-/// 带上按设备算出来的固定句柄：关掉这个终端窗口只是分离，远端 Shell 留着；
-/// 再点一次「远程终端」按同一个句柄接回去，而不是又开一个新的。句柄只由设备
-/// ID 决定，同一次登录下不同设备互不相同；31 位里撞上别的主控随机句柄的概率
-/// 可以忽略。
-fn remote_terminal_arguments(exe: &std::path::Path, device_id: &str) -> Vec<std::ffi::OsString> {
-    vec![
+/// 图形界面已经通过清单让用户选了会话：选中已有会话就带 `--attach <id>`，
+/// 选「新建」则什么都不带。关闭这个终端窗口只是分离，远端 Shell 留着，下次
+/// 从清单里还能接回来。不传固定句柄：官方主机不认按设备 ID 算出来的句柄，
+/// 每次都只会新建一个 Shell。
+fn remote_terminal_arguments(
+    exe: &std::path::Path,
+    device_id: &str,
+    attach: Option<u32>,
+) -> Vec<std::ffi::OsString> {
+    let mut arguments = vec![
         exe.as_os_str().to_owned(),
         "remote-terminal".into(),
         device_id.into(),
-        "--handle".into(),
-        stable_handle(device_id).to_string().into(),
-    ]
-}
-
-/// 由设备 ID 得到的固定会话句柄（FNV-1a，非零）。
-fn stable_handle(device_id: &str) -> u32 {
-    let mut hash = 0x811c_9dc5u32;
-    for byte in device_id.bytes() {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(0x0100_0193);
+    ];
+    if let Some(session) = attach {
+        arguments.push("--attach".into());
+        arguments.push(session.to_string().into());
     }
-    (hash & 0x7fff_ffff).max(1)
+    arguments
 }
 
 /// 找一个能运行命令的终端模拟器。`$TERMINAL` 优先，再试常见的几个。
@@ -772,28 +772,42 @@ mod tests {
         );
     }
 
-    /// 远程终端命令也重新运行当前可执行文件，参数与 CLI 的形状一致。
+    /// 远程终端命令也重新运行当前可执行文件；没选会话就不带额外参数。
     #[test]
-    fn the_remote_terminal_command_reruns_this_binary() {
+    fn the_remote_terminal_command_starts_a_new_shell() {
         let arguments = remote_terminal_arguments(
             std::path::Path::new("/opt/openuuyc/OpenUUYC"),
-            "test-device-id"
+            "test-device-id",
+            None,
         );
-        let handle = stable_handle("test-device-id");
-        assert_ne!(handle, 0);
         assert_eq!(
             arguments,
             vec![
                 std::ffi::OsString::from("/opt/openuuyc/OpenUUYC"),
                 std::ffi::OsString::from("remote-terminal"),
                 std::ffi::OsString::from("test-device-id"),
-                std::ffi::OsString::from("--handle"),
-                std::ffi::OsString::from(handle.to_string()),
             ]
         );
-        // 同一个设备总是同一个句柄，不同设备（实际使用中）不会共用。
-        assert_eq!(handle, stable_handle("test-device-id"));
-        assert_ne!(handle, stable_handle("another-device-id"));
+    }
+
+    /// 选中已有会话时用 `--attach <id>`，参数只走 argv。
+    #[test]
+    fn the_remote_terminal_command_attaches_to_a_session() {
+        let arguments = remote_terminal_arguments(
+            std::path::Path::new("/opt/openuuyc/OpenUUYC"),
+            "test-device-id",
+            Some(17),
+        );
+        assert_eq!(
+            arguments,
+            vec![
+                std::ffi::OsString::from("/opt/openuuyc/OpenUUYC"),
+                std::ffi::OsString::from("remote-terminal"),
+                std::ffi::OsString::from("test-device-id"),
+                std::ffi::OsString::from("--attach"),
+                std::ffi::OsString::from("17"),
+            ]
+        );
     }
 
     /// A private socket under a fresh directory, served from its own table:

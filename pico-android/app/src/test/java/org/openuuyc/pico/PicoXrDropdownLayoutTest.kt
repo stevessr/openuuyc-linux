@@ -82,4 +82,38 @@ class PicoXrDropdownLayoutTest {
             assertNotNull(PicoXrDropdownLayout.sliderFraction(.5f,y,i,rows.size))
         }
     }
+    @Test fun selectedScreenOpensOnItsOwnPageAndClampsToTheLastPage() {
+        val n=PicoXrDropdownLayout.visibleRows
+        assertEquals(0,PicoXrDropdownLayout.pageOfSelection(-1,13))
+        assertEquals(0,PicoXrDropdownLayout.pageOfSelection(0,13))
+        assertEquals(0,PicoXrDropdownLayout.pageOfSelection(n-1,13))
+        assertEquals(n,PicoXrDropdownLayout.pageOfSelection(n,13))
+        assertEquals(2*n,PicoXrDropdownLayout.pageOfSelection(2*n,13))
+        assertEquals(2*n,PicoXrDropdownLayout.pageOfSelection(2*n+1,13)) // 13 rows: last page starts at 2*n
+        assertEquals(2*n,PicoXrDropdownLayout.pageOfSelection(99,13))   // beyond the list still clamps
+        assertEquals(0,PicoXrDropdownLayout.pageOfSelection(4,2))       // the whole 2-row list fits one page
+        assertEquals(0,PicoXrDropdownLayout.pageOfSelection(-1,0))
+    }
+    @Test fun pageCountRoundsUpVisibleWindows() {
+        assertEquals(0,PicoXrDropdownLayout.pageCount(0))
+        assertEquals(1,PicoXrDropdownLayout.pageCount(1))
+        assertEquals(1,PicoXrDropdownLayout.pageCount(PicoXrDropdownLayout.visibleRows))
+        assertEquals(2,PicoXrDropdownLayout.pageCount(PicoXrDropdownLayout.visibleRows+1))
+        assertEquals(3,PicoXrDropdownLayout.pageCount(13))
+    }
+    @Test fun refreshedShorterListsClampTheVisiblePage() {
+        assertEquals(0,PicoXrDropdownLayout.clampOffset(12,2))
+        assertEquals(6,PicoXrDropdownLayout.clampOffset(12,9))
+        assertEquals(0,PicoXrDropdownLayout.clampOffset(-3,9))
+        assertEquals(0,PicoXrDropdownLayout.clampOffset(5,0))
+        assertEquals(6,PicoXrDropdownLayout.clampOffset(7,9)) // in-page row offsets stay where they are
+    }
+    @Test fun selectedRowIsVisibleOnThePageItOpensOn() {
+        val rows=14
+        listOf(0,3,6,7,11,12,13).forEach {selected ->
+            val offset=PicoXrDropdownLayout.pageOfSelection(selected,rows)
+            val y=(PicoXrDropdownLayout.ROW_TOP+(selected-offset)*PicoXrDropdownLayout.ROW_HEIGHT+30)/800f
+            assertEquals(selected,PicoXrDropdownLayout.hit(.5f,y,rows,offset))
+        }
+    }
 }

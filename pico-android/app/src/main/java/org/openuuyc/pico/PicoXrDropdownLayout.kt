@@ -45,6 +45,19 @@ internal object PicoXrDropdownLayout {
     }
 
     fun pageOf(selected: Int): Int = (selected.coerceAtLeast(0)/visibleRows)*visibleRows
+
+    /** Number of pages needed for [count] rows; 0 for an empty list. */
+    fun pageCount(count: Int): Int = if(count<=0) 0 else (count+visibleRows-1)/visibleRows
+
+    /** First row of the last page that can still be shown for [count] rows (0 when empty). */
+    fun lastPage(count: Int): Int = pageOf((count-1).coerceAtLeast(0))
+
+    /** Page offset that shows [selected], clamped so it never starts past the last page of [count] rows. */
+    fun pageOfSelection(selected: Int,count: Int): Int = pageOf(selected).coerceAtMost(lastPage(count))
+
+    /** Keep a scroll offset inside 0..last page, so a refreshed shorter list never leaves an empty page. */
+    fun clampOffset(offset: Int,count: Int): Int = offset.coerceIn(0,lastPage(count))
+
     const val NAVIGATE_BACK = -2
     /** Convert radial controller sectors to previous/next/back for a linear dropdown. */
     fun navigationStep(direction: Int): Int = when {

@@ -223,6 +223,9 @@ impl Default for ConnectionMediaOptions {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct ConnectionMediaProfile {
     pub audio_only: bool,
+    /// Terminal and other official data-only connections (kind 5/8/9) must not
+    /// offer audio/video m-lines; the official client aborts if one appears.
+    pub data_only: bool,
     pub muted: bool,
     pub local_display: LocalDisplayInfo,
     pub stream_fps: u32,
@@ -237,6 +240,7 @@ impl ConnectionMediaOptions {
         let stream_fps = self.frame_rate.value(display);
         Ok(ConnectionMediaProfile {
             audio_only: self.audio_only,
+            data_only: false,
             muted: self.muted,
             local_display: display,
             stream_fps,

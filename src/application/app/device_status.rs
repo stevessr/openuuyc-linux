@@ -92,7 +92,10 @@ fn resolve(
         State::Offline
     } else if !device.is_connected() {
         State::Unknown
-    } else if device.participant_count() > 0 {
+    } else if controller.map_or_else(
+        || device.participant_count() > 0,
+        |own| device.in_use_by_other_device(own),
+    ) {
         State::OtherDevice
     } else if screen_viewing_platform(device.platform)
         && (!device.controllable || (device.platform != 2 && !device.controlled_support))
@@ -119,5 +122,70 @@ impl DeviceCenterApp {
                 .get(&device.device_id)
                 .is_some_and(|p| p.waiting),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(participants: Vec<serde_json::Value>) -> DeviceInfo {
+        DeviceInfo {
+            device_id: "aeawqptwayag5pp4".into(),
+            alias: "target".into(),
+            status: "CONNECTED".into(),
+            platform: 1,
+            controllable: true,
+            controlled_support: true,
+            support_wol: false,
+            version_name: String::new(),
+            wallpaper_url: String::new(),
+            update_started_at: 0,
+            participants_info: participants,
+        }
+    }
+
+    /// The bug: a terminal connection opened by this client is reported in
+    /// `participants_info` with this device's ID, and used to make the target
+    /// read "其他设备使用" while the user was the one using it.
+    #[test]
+    fn our_own_connection_does_not_make_a_device_busy() {
+        let device = device(vec![serde_json::json!({
+            "client_id": "aecgvvwjhybhlk2t",
+            "device_id": "aeawvvwjgqbfcsbr",
+            "alias": "steve2go",
+            "platform": 1,
+            "user_join_type": 1,
+            "controlled_time": 17,
+            "app_flag": null
+        })]);
+        let status = resolve(&device, Some("aeawvvwjgqbfcsbr"), None, false, false);
+        assert!(matches!(status.state, State::Online));
+        assert_eq!(status.label(), "在线");
+    }
+
+    #[test]
+    fn another_controller_makes_a_device_busy() {
+        let device = device(vec![
+            serde_json::json!({"device_id": "aeawvvwjgqbfcsbr", "user_join_type": 1}),
+            serde_json::json!({"device_id": "aeawqpuwciag5uki", "user_join_type": 1}),
+        ]);
+        let status = resolve(&device, Some("aeawvvwjgqbfcsbr"), None, false, false);
+        assert!(matches!(status.state, State::OtherDevice));
+        assert_eq!(status.label(), "其他设备使用");
+    }
+
+    /// Without a known own ID the raw count is the only safe answer.
+    #[test]
+    fn unknown_identity_falls_back_to_every_participant() {
+        let device = device(vec![serde_json::json!({"device_id": "aeawvvwjgqbfcsbr"})]);
+        let status = resolve(&device, None, None, false, false);
+        assert!(matches!(status.state, State::OtherDevice));
+    }
+
+    #[test]
+    fn no_participants_stays_online() {
+        let status = resolve(&device(Vec::new()), Some("aeawvvwjgqbfcsbr"), None, false, false);
+        assert!(matches!(status.state, State::Online));
     }
 }

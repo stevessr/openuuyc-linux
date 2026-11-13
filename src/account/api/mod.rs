@@ -577,15 +577,32 @@ impl DeviceInfo {
         self.status == "CONNECTED"
     }
 
+    /// Every participant the server reports for this device, including this
+    /// controller's own connections. Prefer [`Self::other_participant_count`]
+    /// when deciding whether someone else is holding the device.
     pub fn participant_count(&self) -> usize {
-        // 排除 kind = 8 的远程终端连接，它们不应计入主控参与者
-        self.participants_info.iter()
-            .filter(|p| {
-                p.get("kind")
-                    .and_then(|v| v.as_i64())
-                    .map_or(true, |kind| kind != 8)
-            })
+        self.participants_info.len()
+    }
+
+    /// Participants that are not this controller's own connections.
+    ///
+    /// Official participant JSON is
+    /// `{client_id, device_id, alias, platform, user_join_type, controlled_time, app_flag}`
+    /// and carries no connection-kind field. An entry belongs to us when its
+    /// `device_id` equals the current device's ID — the same comparison the
+    /// official client uses. A terminal, file-transfer or desktop session
+    /// opened by this client must not make the target look like it is held by
+    /// another device.
+    pub fn other_participant_count(&self, own_device_id: &str) -> usize {
+        self.participants_info
+            .iter()
+            .filter(|participant| !participant_is_own(participant, own_device_id))
             .count()
+    }
+
+    /// True when a device other than `own_device_id` currently holds this one.
+    pub fn in_use_by_other_device(&self, own_device_id: &str) -> bool {
+        self.other_participant_count(own_device_id) > 0
     }
 
     pub fn platform_label(&self) -> String {
@@ -619,6 +636,18 @@ impl DeviceInfo {
         }
         Ok(&self.device_id)
     }
+}
+
+/// Whether a `participants_info` entry describes a connection from the
+/// controller's own device. Entries without a usable `device_id` are treated
+/// as someone else, matching the official client's comparison. An unknown
+/// (empty) own ID never matches, so callers fall back to counting everyone.
+fn participant_is_own(participant: &serde_json::Value, own_device_id: &str) -> bool {
+    !own_device_id.is_empty()
+        && participant
+            .get("device_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(own_device_id)
 }
 
 impl fmt::Debug for DeviceInfo {
@@ -1229,4 +1258,81 @@ fn hex_lower(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+#[cfg(test)]
+mod participant_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn device(participants: Vec<serde_json::Value>) -> DeviceInfo {
+        DeviceInfo {
+            device_id: "aeawqptwayag5pp4".into(),
+            alias: "target".into(),
+            status: "CONNECTED".into(),
+            platform: 1,
+            controllable: true,
+            controlled_support: true,
+            support_wol: false,
+            version_name: String::new(),
+            wallpaper_url: String::new(),
+            update_started_at: 0,
+            participants_info: participants,
+        }
+    }
+
+    /// A terminal connection opened by this controller is reported like any
+    /// other participant, without a connection-kind field. It belongs to the
+    /// current device and must not read as "other device in use".
+    #[test]
+    fn our_own_terminal_participant_is_not_another_device() {
+        let target = device(vec![json!({
+            "client_id": "31e3f704-308c-4112-bbf5-7d9eebfc8f4d",
+            "device_id": "aeawvvwjgqbfcsbr",
+            "alias": "steve2go",
+            "platform": 1,
+            "user_join_type": 1,
+            "controlled_time": 0,
+            "app_flag": null
+        })]);
+        assert_eq!(target.participant_count(), 1);
+        assert_eq!(target.other_participant_count("aeawvvwjgqbfcsbr"), 0);
+        assert!(!target.in_use_by_other_device("aeawvvwjgqbfcsbr"));
+    }
+
+    #[test]
+    fn another_controller_still_counts() {
+        let target = device(vec![
+            json!({"client_id": "a", "device_id": "aeawvvwjgqbfcsbr", "user_join_type": 1}),
+            json!({"client_id": "b", "device_id": "aeawqpuwciag5uki", "user_join_type": 1}),
+        ]);
+        assert_eq!(target.other_participant_count("aeawvvwjgqbfcsbr"), 1);
+        assert!(target.in_use_by_other_device("aeawvvwjgqbfcsbr"));
+    }
+
+    /// The official JSON has no `kind` field; a legacy filter must not be
+    /// needed for the common case of a single own connection.
+    #[test]
+    fn missing_or_unusable_device_ids_count_as_other_devices() {
+        let target = device(vec![
+            json!({"client_id": "a"}),
+            json!({"client_id": "b", "device_id": null}),
+            json!({"client_id": "c", "device_id": ""}),
+            json!("not an object"),
+        ]);
+        assert_eq!(target.other_participant_count("aeawvvwjgqbfcsbr"), 4);
+    }
+
+    #[test]
+    fn an_unknown_own_device_id_never_matches() {
+        let target = device(vec![json!({"device_id": ""})]);
+        assert_eq!(target.other_participant_count(""), 1);
+    }
+
+    #[test]
+    fn no_participants_means_not_in_use() {
+        let target = device(Vec::new());
+        assert_eq!(target.other_participant_count("aeawvvwjgqbfcsbr"), 0);
+        assert!(!target.in_use_by_other_device("aeawvvwjgqbfcsbr"));
+    }
 }

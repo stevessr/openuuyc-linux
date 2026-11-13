@@ -167,6 +167,15 @@ async fn run_presence(
             if push_cancel.is_cancelled() || !push_client.is_active() {
                 return;
             }
+            // The device room is the only delivery path for transport RPC
+            // replies (power receipts, Android share approval). Forward before
+            // the feature handlers below, which may consume the push.
+            if push_client.host.transport_rpc.push(push) {
+                tracing::debug!(
+                    p = push.pointer("/data/p").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    "device room transport rpc received"
+                );
+            }
             if push_client.host.assistance.push(push, &push_cancel) {
                 return;
             }
@@ -199,6 +208,9 @@ async fn run_presence(
                 let _ = push_events.send(PresenceEvent::DeviceChanged(change));
             }
         });
+        // The room exists from this point on, so approval waits must reuse it
+        // rather than create a second device room that would release this one.
+        client.host.transport_rpc.set_online(true);
         let session =
             SignalSession::connect_observed(room, SignalRole::Host, &room_cancel, Some(observer))
                 .await;
@@ -233,6 +245,7 @@ async fn run_presence(
         };
         room_cancel.cancel();
         client.host.wol.online(false);
+        client.host.transport_rpc.set_online(false);
         if task_cancel.is_cancelled() {
             return Ok(());
         }

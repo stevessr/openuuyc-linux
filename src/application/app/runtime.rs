@@ -474,6 +474,72 @@ pub(super) async fn gui_worker_loop(
                 GuiCommand::Detail(id) => {
                     device_sync.detail(id);
                 }
+                GuiCommand::RemoteTerminalSessions { generation, target } => {
+                    // 列会话要连一次终端通道，可能很慢；丢给独立任务，worker
+                    // 循环继续处理其它命令，结果再从事件通道送回界面。
+                    if generation == catalog_generation
+                        && logout_task.is_none()
+                        && let Some(client) = client.as_ref().filter(|c| c.is_active())
+                    {
+                        let client = Arc::clone(client);
+                        let events = events.clone();
+                        tokio::spawn(async move {
+                            let result =
+                                crate::session::controller::terminal::list_sessions_with_client(
+                                    &client, &target,
+                                )
+                                .await
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = events.send(GuiEvent::RemoteTerminalSessions {
+                                generation,
+                                target,
+                                result,
+                            });
+                        });
+                    } else {
+                        let _ = events.send(GuiEvent::RemoteTerminalSessions {
+                            generation,
+                            target,
+                            result: Err("当前没有可用的账号会话".into()),
+                        });
+                    }
+                }
+                GuiCommand::RemoteTerminalEnd {
+                    generation,
+                    target,
+                    session,
+                } => {
+                    // CLOSE is destructive and may take a few seconds while the
+                    // host tears the shell down; keep it off the worker loop.
+                    if generation == catalog_generation
+                        && logout_task.is_none()
+                        && let Some(client) = client.as_ref().filter(|c| c.is_active())
+                    {
+                        let client = Arc::clone(client);
+                        let events = events.clone();
+                        tokio::spawn(async move {
+                            let result =
+                                crate::session::controller::terminal::close_session_with_client(
+                                    &client, &target, session,
+                                )
+                                .await
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = events.send(GuiEvent::RemoteTerminalEnded {
+                                generation,
+                                target,
+                                session,
+                                result,
+                            });
+                        });
+                    } else {
+                        let _ = events.send(GuiEvent::RemoteTerminalEnded {
+                            generation,
+                            target,
+                            session,
+                            result: Err("当前没有可用的账号会话".into()),
+                        });
+                    }
+                }
                 GuiCommand::Mutate { generation, change } => {
                     if generation != catalog_generation
                         || mutation_task.is_some()

@@ -41,7 +41,7 @@ impl Approval {
             device.controlled_support && device.controllable,
             "设备当前未开放远程控制"
         );
-        Ok(device.participant_count() > 0)
+        Ok(device.in_use_by_other_device(&list.current_device.device_id))
     }
 }
 

@@ -159,10 +159,12 @@ enum Commands {
         /// 附着到远端已有会话；默认新建会话
         #[arg(long)]
         attach: Option<u32>,
-        /// 用固定句柄打开（接回上次的会话，没有就新建）；图形界面用它让
-        /// 「关掉终端再打开」接回同一个 Shell
+        /// 命令行固定句柄：用指定会话 ID 打开，远端没有该会话时新建；仅用于脚本，图形界面改用会话清单 + --attach
         #[arg(long, conflicts_with = "attach")]
         handle: Option<u32>,
+        /// 交互式列出远端会话，选择接回已有会话或新建 Shell
+        #[arg(long, conflicts_with_all = ["list", "attach", "handle"])]
+        pick: bool,
     },
     /// 列出或接上本机正在运行的被控终端会话
     Terminal {
@@ -423,9 +425,9 @@ fn main() -> Result<()> {
             openuuyc::application::capture_agent(&pipe, parent)
         }
         Commands::DisplayRecovery { token } => openuuyc::application::display_recovery(&token),
-        Commands::RemoteTerminal { device, list, attach, handle } => {
+        Commands::RemoteTerminal { device, list, attach, handle, pick } => {
             tokio::runtime::Runtime::new()?.block_on(
-                controller::terminal::run_saved(device, list, attach, handle)
+                controller::terminal::run_saved(device, list, attach, handle, pick)
             )
         }
         Commands::Terminal { session, list, new } => {
@@ -682,10 +684,14 @@ async fn print_devices() -> Result<()> {
     let devices = devices?;
 
     println!("当前虚拟设备：");
-    print_device(None, &devices.current_device);
+    print_device(None, &devices.current_device, &devices.current_device.device_id);
     println!("\n我的设备：");
     for (index, device) in devices.my_binded_devices.iter().enumerate() {
-        print_device(Some(index + 1), device);
+        print_device(
+            Some(index + 1),
+            device,
+            &devices.current_device.device_id,
+        );
     }
     if devices.my_binded_devices.is_empty() {
         println!("  （无）");
@@ -693,10 +699,10 @@ async fn print_devices() -> Result<()> {
     Ok(())
 }
 
-fn print_device(index: Option<usize>, device: &api::DeviceInfo) {
+fn print_device(index: Option<usize>, device: &api::DeviceInfo, own_device_id: &str) {
     let prefix = index.map_or_else(|| "  ".to_owned(), |value| format!("  [{value}] "));
     println!(
-        "{prefix}{} [{}] — {}，{}，可控 {}，会话参与者 {}",
+        "{prefix}{} [{}] — {}，{}，可控 {}，会话参与者 {}（其他设备 {}）",
         device.alias,
         device.device_id,
         device.status_label(),
@@ -706,6 +712,7 @@ fn print_device(index: Option<usize>, device: &api::DeviceInfo) {
         } else {
             "否"
         },
-        device.participant_count()
+        device.participant_count(),
+        device.other_participant_count(own_device_id)
     );
 }

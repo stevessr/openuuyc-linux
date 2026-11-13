@@ -64,6 +64,32 @@ impl From<IceServer> for RTCIceServer {
     }
 }
 
+/// Data channels a connection creates. Data-only connections (official
+/// terminal kind=8, file transfer kind=5, port mapping kind=9) keep the
+/// control/text/file/binary channels and omit the desktop streamer and the
+/// OpenUUYC-only terminal extension, matching the official controller.
+fn data_channel_labels(data_only: bool) -> Vec<&'static str> {
+    if data_only {
+        vec![
+            "CONTROL_DATA_CHANNEL",
+            "TEXT_DATA_CHANNEL",
+            "FILE_DATA_CHANNEL",
+            "BINARY_DATA_CHANNEL",
+        ]
+    } else {
+        DATA_CHANNEL_LABELS
+            .into_iter()
+            .chain([crate::features::remote_terminal::CHANNEL])
+            .collect()
+    }
+}
+
+/// SDP stream id for `a=msid-semantic`. The official data-only controller
+/// sends `*`; a desktop controller sends its audio stream id.
+fn offer_streams(data_only: bool) -> &'static str {
+    if data_only { "*" } else { "audio_0" }
+}
+
 pub struct NativePeer {
     core: ConnectionCore,
     pub(super) connection_states: Mutex<mpsc::UnboundedReceiver<RTCPeerConnectionState>>,
@@ -75,6 +101,8 @@ pub struct NativePeer {
     pub(super) ice_servers: Vec<IceServer>,
     pub(super) data_channels: DataChannels,
     pub(super) video_tracks: VideoTrackRegistry,
+    /// Terminal/file-transfer/port-mapping connections offer no media m-lines.
+    pub(super) data_only: bool,
 }
 
 impl NativePeer {
@@ -181,43 +209,51 @@ impl NativePeer {
             send_encodings: Vec::new(),
         };
         let receive_only = || transceiver(RTCRtpTransceiverDirection::Recvonly);
-        // The official controller always exposes an `audio_0` Opus sender,
-        // even when no microphone samples are produced. A bare sendrecv
-        // transceiver omits the MSID/SSRC block and the controlled client does
-        // not treat that offer as the desktop-controller profile.
-        let audio_track = Arc::new(TrackLocalStaticRTP::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_OPUS.to_owned(),
-                clock_rate: 48_000,
-                channels: 2,
-                sdp_fmtp_line: "minptime=3;stereo=1;useinbandfec=1".to_owned(),
-                ..Default::default()
-            },
-            "audio_0".to_owned(),
-            "audio_0".to_owned(),
-        ));
-        let audio_transceiver = connection
-            .add_transceiver_from_track(
-                audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>,
-                Some(transceiver(RTCRtpTransceiverDirection::Sendrecv)),
-            )
-            .await
-            .context("add official audio_0 send/receive transceiver")?;
-        // The official controller offers five recvonly video m-lines. They are
-        // not simulcast layers of one transceiver; the host answers each one
-        // independently and uses them for its desktop/auxiliary video tracks.
-        for index in 0..5 {
-            connection
-                .add_transceiver_from_kind(RTPCodecType::Video, Some(receive_only()))
+        // A data-only connection (official terminal kind=8, file transfer
+        // kind=5, port mapping kind=9) must offer no audio/video m-lines. The
+        // official client aborts the connection if a media section appears.
+        let data_only = profile.data_only;
+        let mut audio_track = None;
+        let mut audio_transceiver = None;
+        if !data_only {
+            // The official controller always exposes an `audio_0` Opus sender,
+            // even when no microphone samples are produced. A bare sendrecv
+            // transceiver omits the MSID/SSRC block and the controlled client does
+            // not treat that offer as the desktop-controller profile.
+            let track = Arc::new(TrackLocalStaticRTP::new(
+                RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_OPUS.to_owned(),
+                    clock_rate: 48_000,
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=3;stereo=1;useinbandfec=1".to_owned(),
+                    ..Default::default()
+                },
+                "audio_0".to_owned(),
+                "audio_0".to_owned(),
+            ));
+            let transceiver = connection
+                .add_transceiver_from_track(
+                    track.clone() as Arc<dyn TrackLocal + Send + Sync>,
+                    Some(transceiver(RTCRtpTransceiverDirection::Sendrecv)),
+                )
                 .await
-                .with_context(|| format!("add receive video transceiver {index}"))?;
+                .context("add official audio_0 send/receive transceiver")?;
+            audio_track = Some(track);
+            audio_transceiver = Some(transceiver);
+            // The official controller offers five recvonly video m-lines. They are
+            // not simulcast layers of one transceiver; the host answers each one
+            // independently and uses them for its desktop/auxiliary video tracks.
+            for index in 0..5 {
+                connection
+                    .add_transceiver_from_kind(RTPCodecType::Video, Some(receive_only()))
+                    .await
+                    .with_context(|| format!("add receive video transceiver {index}"))?;
+            }
         }
 
         let mut local_channels = Vec::with_capacity(DATA_CHANNEL_LABELS.len());
-        for label in DATA_CHANNEL_LABELS
-            .into_iter()
-            .chain([crate::features::remote_terminal::CHANNEL])
-        {
+        let labels = data_channel_labels(data_only);
+        for label in labels {
             let channel = connection
                 .create_data_channel(label, Some(official_data_channel_init(label)))
                 .await
@@ -232,23 +268,25 @@ impl NativePeer {
             core.control.clone(),
             Arc::downgrade(&connection),
         );
-        let microphone = data_channels.stream_control.microphone().clone();
-        data_channels.workers.spawn(async move {
-            microphone.send(audio_track).await;
-        });
-        let microphone = data_channels.stream_control.microphone().clone();
-        let audio_sender = audio_transceiver.sender().await;
-        let reports = data_channels.stream_control.microphone().clone();
-        let reports_sender = audio_sender.clone();
-        let reports_connection = Arc::downgrade(&connection);
-        data_channels.workers.spawn(async move {
-            reports
-                .send_reports(reports_connection, reports_sender)
-                .await;
-        });
-        data_channels.workers.spawn(async move {
-            microphone.feedback(audio_sender).await;
-        });
+        if let (Some(audio_track), Some(audio_transceiver)) = (audio_track, audio_transceiver) {
+            let microphone = data_channels.stream_control.microphone().clone();
+            data_channels.workers.spawn(async move {
+                microphone.send(audio_track).await;
+            });
+            let microphone = data_channels.stream_control.microphone().clone();
+            let audio_sender = audio_transceiver.sender().await;
+            let reports = data_channels.stream_control.microphone().clone();
+            let reports_sender = audio_sender.clone();
+            let reports_connection = Arc::downgrade(&connection);
+            data_channels.workers.spawn(async move {
+                reports
+                    .send_reports(reports_connection, reports_sender)
+                    .await;
+            });
+            data_channels.workers.spawn(async move {
+                microphone.feedback(audio_sender).await;
+            });
+        }
         data_channels.workers.spawn(sample_network_performance(
             Arc::clone(&connection),
             performance.clone(),
@@ -324,6 +362,7 @@ impl NativePeer {
             ice_servers: configured_ice_servers,
             data_channels,
             video_tracks,
+            data_only,
         })
     }
 
@@ -511,11 +550,11 @@ impl NativePeer {
     }
 
     pub async fn create_offer(&self) -> Result<String> {
-        self.core.offer(false, "audio_0").await
+        self.core.offer(false, offer_streams(self.data_only)).await
     }
 
     pub async fn create_restart_offer(&self) -> Result<String> {
-        self.core.offer(true, "audio_0").await
+        self.core.offer(true, offer_streams(self.data_only)).await
     }
 
     pub fn local_ice_candidates(&self) -> broadcast::Receiver<Option<RTCIceCandidateInit>> {
@@ -959,5 +998,49 @@ impl Drop for NativePeer {
         // Normal paths await close(). This also retires application tasks on
         // an exceptional owner drop instead of leaving them to hold the peer.
         self.data_channels.workers.shutdown.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_data_only_connection_offers_no_media_stream() {
+        assert_eq!(offer_streams(true), "*");
+        assert_eq!(offer_streams(false), "audio_0");
+    }
+
+    #[tokio::test]
+    async fn a_data_only_peer_offer_has_no_media_sections() {
+        let mut profile = crate::media::ConnectionMediaOptions::default()
+            .resolve(crate::media::LocalDisplayInfo::FALLBACK)
+            .unwrap();
+        profile.data_only = true;
+        let peer = NativePeer::new_with_profile(Vec::new(), TransportChoice::P2p, profile)
+            .await
+            .expect("create data-only peer");
+        let offer = peer.create_offer().await.expect("create offer");
+        assert!(offer.contains("m=application "), "offer: {offer}");
+        assert!(!offer.contains("m=audio "), "offer: {offer}");
+        assert!(!offer.contains("m=video "), "offer: {offer}");
+        assert!(offer.contains("a=msid-semantic: WMS *"), "offer: {offer}");
+        peer.close().await.expect("close peer");
+    }
+
+    #[test]
+    fn a_data_only_connection_keeps_terminal_channels_only() {
+        let labels = data_channel_labels(true);
+        assert!(labels.contains(&"CONTROL_DATA_CHANNEL"));
+        assert!(labels.contains(&"TEXT_DATA_CHANNEL"));
+        assert!(labels.contains(&"FILE_DATA_CHANNEL"));
+        assert!(labels.contains(&"BINARY_DATA_CHANNEL"));
+        assert!(!labels.contains(&"STREAMER_DATA_CHANNEL"));
+        assert!(!labels.contains(&crate::features::remote_terminal::CHANNEL));
+        // The desktop controller keeps every official channel and the
+        // OpenUUYC terminal extension.
+        let desktop = data_channel_labels(false);
+        assert!(desktop.contains(&"STREAMER_DATA_CHANNEL"));
+        assert!(desktop.contains(&crate::features::remote_terminal::CHANNEL));
     }
 }
