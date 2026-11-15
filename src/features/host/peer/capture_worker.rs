@@ -74,6 +74,8 @@ struct CaptureSlot {
     wlr_wait_total: Duration,
     wlr_copy_total: Duration,
     wlr_frames: u64,
+    wlr_wait_max: Duration,
+    wlr_copy_max: Duration,
 }
 
 /// Replaces an old frame instead of queueing it. A slow encoder should see the
@@ -219,17 +221,28 @@ mod capture_pump_tests {
             }
         }
         let elapsed = started.elapsed().as_secs_f64();
-        let (attempts, _empty, capture_time, capture_max, wlr_wait, wlr_copy, wlr_frames) =
-            pump.stats();
+        let (
+            attempts,
+            _empty,
+            capture_time,
+            capture_max,
+            wlr_wait,
+            wlr_copy,
+            wlr_frames,
+            wlr_wait_max,
+            wlr_copy_max,
+        ) = pump.stats();
         println!(
-            "live 144Hz pipeline source_fps_cap={} polls={attempts} captured={frames} encoded={encoded} capture_only={capture_only} distinct_images={distinct_images} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} wlr_frames={wlr_frames} wlr_wait_avg_ms={:.2} wlr_copy_avg_ms={:.2} encode_avg_ms={:.2}",
+            "live 144Hz pipeline source_fps_cap={} polls={attempts} captured={frames} encoded={encoded} capture_only={capture_only} distinct_images={distinct_images} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} wlr_frames={wlr_frames} wlr_wait_avg_ms={:.2} wlr_wait_max_ms={:.2} wlr_copy_avg_ms={:.2} wlr_copy_max_ms={:.2} encode_avg_ms={:.2}",
             screen.fps,
             frames as f64 / elapsed,
             encoded as f64 / elapsed,
             capture_time.as_secs_f64() * 1000.0 / attempts.max(1) as f64,
             capture_max.as_secs_f64() * 1000.0,
             wlr_wait.as_secs_f64() * 1000.0 / wlr_frames.max(1) as f64,
+            wlr_wait_max.as_secs_f64() * 1000.0,
             wlr_copy.as_secs_f64() * 1000.0 / wlr_frames.max(1) as f64,
+            wlr_copy_max.as_secs_f64() * 1000.0,
             encode_time.as_secs_f64() * 1000.0 / encoded.max(1) as f64,
         );
         assert!(frames > 0 && (capture_only || encoded > 0));
@@ -254,7 +267,8 @@ mod capture_pump_tests {
             epoch: 0,
         });
         std::thread::sleep(Duration::from_secs(2)); // deliberately don't consume
-        let (attempts, _empty, _elapsed, _max, _wait, _copy, _frames) = pump.stats();
+        let (attempts, _empty, _elapsed, _max, _wait, _copy, _frames, _wait_max, _copy_max) =
+            pump.stats();
         let replaced = pump.replaced();
         let latest = pump.take_latest();
         let frames = replaced + u64::from(latest.is_some());
@@ -293,6 +307,8 @@ impl CapturePump {
             wlr_wait_total: Duration::ZERO,
             wlr_copy_total: Duration::ZERO,
             wlr_frames: 0,
+            wlr_wait_max: Duration::ZERO,
+            wlr_copy_max: Duration::ZERO,
         }));
         let control = Arc::new(Mutex::new(CaptureConfig {
             enabled: false,
@@ -376,6 +392,8 @@ impl CapturePump {
                     } else if desktop.backend_name() == "wlroots screencopy" {
                         guard.wlr_wait_total += timings.0;
                         guard.wlr_copy_total += timings.1;
+                        guard.wlr_wait_max = guard.wlr_wait_max.max(timings.0);
+                        guard.wlr_copy_max = guard.wlr_copy_max.max(timings.1);
                         guard.wlr_frames = guard.wlr_frames.saturating_add(1);
                     }
                     guard.state = state.clone();
@@ -439,7 +457,19 @@ impl CapturePump {
         lock(&self.slot).replaced
     }
 
-    fn stats(&self) -> (u64, u64, Duration, Duration, Duration, Duration, u64) {
+    fn stats(
+        &self,
+    ) -> (
+        u64,
+        u64,
+        Duration,
+        Duration,
+        Duration,
+        Duration,
+        u64,
+        Duration,
+        Duration,
+    ) {
         let slot = lock(&self.slot);
         (
             slot.attempts,
@@ -449,6 +479,8 @@ impl CapturePump {
             slot.wlr_wait_total,
             slot.wlr_copy_total,
             slot.wlr_frames,
+            slot.wlr_wait_max,
+            slot.wlr_copy_max,
         )
     }
 }
@@ -509,7 +541,16 @@ pub(super) fn capture_loop(
     #[cfg(target_os = "linux")]
     let mut observed_replaced = 0u64;
     #[cfg(target_os = "linux")]
-    let mut observed_capture_stats = (0u64, 0u64, Duration::ZERO);
+    let mut observed_capture_stats = (
+        0u64,
+        0u64,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        0u64,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
     let mut paused_capture_at = None::<Instant>;
 
     while !cancel.is_cancelled() && handle.requested() {
@@ -829,16 +870,43 @@ pub(super) fn capture_loop(
             let replaced = pump.replaced();
             metrics.capture_replaced += replaced.saturating_sub(observed_replaced);
             observed_replaced = replaced;
-            let (attempts, empty, capture_total, capture_max, _wlr_wait, _wlr_copy, _wlr_frames) =
-                pump.stats();
+            let (
+                attempts,
+                empty,
+                capture_total,
+                capture_max,
+                wlr_wait,
+                wlr_copy,
+                wlr_frames,
+                wlr_wait_max,
+                wlr_copy_max,
+            ) = pump.stats();
             let attempt_delta = attempts.saturating_sub(observed_capture_stats.0);
             let empty_delta = empty.saturating_sub(observed_capture_stats.1);
             let elapsed_delta = capture_total.saturating_sub(observed_capture_stats.2);
+            let wlr_wait_delta = wlr_wait.saturating_sub(observed_capture_stats.3);
+            let wlr_copy_delta = wlr_copy.saturating_sub(observed_capture_stats.4);
+            let wlr_frame_delta = wlr_frames.saturating_sub(observed_capture_stats.5);
             metrics
                 .capture
                 .record_batch(attempt_delta, elapsed_delta, capture_max);
+            metrics
+                .wlr_wait
+                .record_batch(wlr_frame_delta, wlr_wait_delta, wlr_wait_max);
+            metrics
+                .wlr_copy
+                .record_batch(wlr_frame_delta, wlr_copy_delta, wlr_copy_max);
             metrics.empty_captures += empty_delta;
-            observed_capture_stats = (attempts, empty, capture_total);
+            observed_capture_stats = (
+                attempts,
+                empty,
+                capture_total,
+                wlr_wait,
+                wlr_copy,
+                wlr_frames,
+                wlr_wait_max,
+                wlr_copy_max,
+            );
             let status = pump.state();
             let packet = pump
                 .take_latest()
