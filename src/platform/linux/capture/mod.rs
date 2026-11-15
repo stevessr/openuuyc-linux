@@ -641,7 +641,7 @@ impl Desktop {
                     || self
                         .last
                         .as_deref()
-                        .is_none_or(|last| last.as_slice() != image.as_slice())
+                        .is_none_or(|last| differs(last, &image))
                 {
                     break Ok(Some((size, image)));
                 }
@@ -772,6 +772,31 @@ fn output(width: u32, height: u32, quality: i32, maximum: (u32, u32)) -> (u32, u
     crate::media::geometry::fit_size(size.0, size.1, maximum)
 }
 
+/// Whether a freshly captured frame differs from the last one.
+///
+/// X11 cannot say whether anything changed, so the frames are compared. A
+/// strided sample answers "changed" after a few kilobytes while the desktop is
+/// moving, which is the streaming case; the full compare only runs for a still
+/// picture, where the answer is "unchanged" and the poll is cheap anyway.
+fn differs(previous: &[u8], image: &[u8]) -> bool {
+    if previous.len() != image.len() {
+        return true;
+    }
+    const SAMPLES: usize = 64;
+    const WINDOW: usize = 64;
+    if image.len() < WINDOW * 2 {
+        return previous != image;
+    }
+    let step = ((image.len() / SAMPLES).max(WINDOW) & !3).max(4);
+    let last = image.len() - WINDOW;
+    for at in (0..last).step_by(step).take(SAMPLES) {
+        if previous[at..at + WINDOW] != image[at..at + WINDOW] {
+            return true;
+        }
+    }
+    previous != image
+}
+
 /// Bilinear BGRA scaling, or a crop to even dimensions when the size already
 /// fits. The encoder takes exactly the size it was opened with. The output is
 /// opaque whatever the source's fourth byte held (X leaves it undefined).
@@ -782,22 +807,25 @@ fn output(width: u32, height: u32, quality: i32, maximum: (u32, u32)) -> (u32, u
 fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
     let (source_width, source_height) = (from.0 as usize, from.1 as usize);
     let (width, height) = (to.0 as usize, to.1 as usize);
-    let mut out = vec![0u8; width * height * 4];
     if width <= source_width
         && height <= source_height
         && (source_width - width) <= 1
         && (source_height - height) <= 1
     {
+        // Grow the frame instead of zeroing it: every byte below is written,
+        // and the zero pass cost a full-size memset per frame.
+        let mut out = Vec::with_capacity(width * height * 4);
         for y in 0..height {
             let start = y * source_width * 4;
-            let line = &mut out[y * width * 4..(y + 1) * width * 4];
-            line.copy_from_slice(&source[start..start + width * 4]);
-            for pixel in line.chunks_exact_mut(4) {
+            let begin = out.len();
+            out.extend_from_slice(&source[start..start + width * 4]);
+            for pixel in out[begin..].chunks_exact_mut(4) {
                 pixel[3] = 0xff;
             }
         }
         return out;
     }
+    let mut out = vec![0u8; width * height * 4];
     let columns = taps(source_width, width);
     let rows = taps(source_height, height);
     let row_bytes = width * 4;
@@ -1140,5 +1168,23 @@ mod screen_fallback_tests {
     #[test]
     fn missing_outputs_do_not_become_a_fake_default_monitor() {
         assert!(wayland_screens(&Default::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn change_detection_samples_first_then_compares_fully() {
+        let frame = vec![0u8; 256 * 1024];
+        assert!(!differs(&frame, &frame.clone()));
+        // A difference inside a sampled window is answered without the full
+        // compare, which is the streaming case.
+        let mut early = frame.clone();
+        early[0] = 1;
+        assert!(differs(&frame, &early));
+        // A difference the samples miss still has to be reported.
+        let mut late = frame.clone();
+        let end = late.len() - 1;
+        late[end] = 1;
+        assert!(differs(&frame, &late));
+        // A geometry change is a change even when the bytes agree.
+        assert!(differs(&frame, &frame[..128]));
     }
 }
