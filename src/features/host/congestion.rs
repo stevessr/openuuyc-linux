@@ -135,6 +135,16 @@ impl Controller {
             feedback_count: 0,
         }
     }
+    /// The same timeline as now(), for an instant captured earlier.
+    fn at(&self, instant: Instant) -> Timestamp {
+        Timestamp::from_micros(
+            1_000_000
+                + instant
+                    .saturating_duration_since(self.origin)
+                    .as_micros()
+                    .min(i64::MAX as u128 - 1_000_000) as i64,
+        )
+    }
     fn now(&self) -> Timestamp {
         Timestamp::from_micros(
             1_000_000
@@ -277,7 +287,24 @@ impl Controller {
         burst: Option<u64>,
         audio: bool,
     ) {
-        let now = self.now();
+        self.sent_at(sequence, bytes, pacing, burst, audio, Instant::now());
+    }
+    /// Records a packet with the instant it was handed to the socket.
+    ///
+    /// Timing it after the write returns folds this host's own pacing and
+    /// socket queueing into the one-way delay the estimator measures, which
+    /// reads as a standing queue on the link: the delay-based controller then
+    /// backs off on every report and collapses to its floor.
+    pub fn sent_at(
+        &mut self,
+        sequence: i64,
+        bytes: usize,
+        pacing: PacedPacketInfo,
+        burst: Option<u64>,
+        audio: bool,
+        handed_at: Instant,
+    ) {
+        let now = self.at(handed_at);
         if let Some(group) = burst {
             self.burst.sent(group, sequence, bytes, now.us());
         }

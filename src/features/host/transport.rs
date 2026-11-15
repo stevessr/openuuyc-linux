@@ -891,6 +891,10 @@ impl Transport {
         } else {
             None
         };
+        // Stamped before the write: the socket queue and the pacer's drain are
+        // this host's delay, and the estimator must not read them back as
+        // queueing on the link.
+        let handed_at = std::time::Instant::now();
         let size = tokio::select! {
             _=self.0.cancel.cancelled()=>return Err(Error::ErrIoEOF),
             result=parent.write(&packet, attributes)=>result?,
@@ -899,7 +903,7 @@ impl Transport {
             let wire = size + self.network_overhead();
             lock(&self.0.send_rate).record(wire);
             if let Some(sequence) = sequence {
-                lock(&self.0.controller).sent(sequence, wire, pacing, burst, false);
+                lock(&self.0.controller).sent_at(sequence, wire, pacing, burst, false, handed_at);
             }
             let (primary, fec) = {
                 let history = lock(&self.0.history);
