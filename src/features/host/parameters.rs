@@ -19,7 +19,11 @@ impl Bounds {
         Self {
             reservation: NETWORK_FLOOR.min(maximum),
             maximum,
-            initial: (maximum / 5)
+            // Half the ceiling, not a fifth: the first seconds were visibly
+            // soft and took several seconds to climb, while GoogCC pulls the
+            // rate back within a few hundred milliseconds if the link cannot
+            // take it.
+            initial: (maximum / 2)
                 .clamp(NETWORK_FLOOR, STARTUP_CEILING)
                 .min(maximum),
             probe: 0,
