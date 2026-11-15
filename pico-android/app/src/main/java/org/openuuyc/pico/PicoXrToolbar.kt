@@ -854,8 +854,8 @@ internal class PicoXrToolbar(
                                     if(direct==null) {status("先连接 Linux OpenUUYC");return@post}
                                     direct.quickApps.runtime {value,error->
                                         if(value==null) status(error ?: "远端不支持后端设置") else {
-                                            val keys=listOf("open_xr_first","open_xr_only","steam_vr")
-                                            options("VR 后端 · 下次连接生效",listOf("OpenXR 优先 / SteamVR 备用","仅内置 OpenXR","SteamVR 备用"),keys.indexOf(value.optString("preference"))) {choice->
+                                            val keys=listOf("open_xr_first","steam_vr_first","steam_vr","open_xr_only")
+                                            options("VR 后端 · 下次连接生效",listOf("OpenVR → SteamVR","SteamVR → OpenVR","仅 SteamVR","仅 OpenVR"),keys.indexOf(value.optString("preference"))) {choice->
                                                 direct.quickApps.setRuntime(keys[choice],::status)
                                             };draw()
                                         }

@@ -299,6 +299,6 @@ Linux 默认枚举可见的 Desktop Application（保留 Hidden/NoDisplay 隐藏
 
 传输实现使用官方 FTP Send/Receive/Ask/Block/Complete 消息，任务 ID 独立校验，文件块走 FILE_DATA_CHANNEL、控制应答走 TEXT_DATA_CHANNEL；没有可用文件通道时才回退文本通道。发送队列有背压、接收队列有上限，数据与元数据均在工作线程处理；单连接同时一个传输，超时或取消发送终止消息。保存位置由系统文档选择器决定，不接受远端指定本地路径。
 
-### OpenXR 优先，SteamVR 备用
+### 运行时后端：OpenVR 与 SteamVR
 
-新增 Linux 设置与每条已授权连接的 VR 后端选项：OpenXR 优先（默认）、仅 OpenXR、SteamVR 备用；普通安卓应用菜单可复制该设备的 Steam 游戏启动选项。详见 [内置 OpenXR 组件构建、安装与验证范围](../drivers/openxr/README.md)。该选项不代表完整 PCVR 已可用，不改系统全局 OpenXR 清单；当前 Monado 运行库已经实际构建/加载，但还没有 PICO 设备驱动和 Vulkan 串流合成器目标。
+新增 Linux 设置与每条已授权连接的 VR 后端选项：OpenVR → SteamVR（默认，内置 OpenVR 优先、失败回退 SteamVR）、SteamVR → OpenVR（SteamVR 优先、失败回退内置 OpenVR）、仅 SteamVR、仅 OpenVR；普通安卓应用菜单可复制该设备的 Steam 游戏启动选项。详见 [内置 OpenXR 组件构建、安装与验证范围](../drivers/openxr/README.md)。该选项不代表完整 PCVR 已可用，不改系统全局 OpenXR 清单；当前 Monado 运行库已经实际构建/加载，但还没有 PICO 设备驱动和 Vulkan 串流合成器目标。

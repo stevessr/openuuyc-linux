@@ -52,8 +52,8 @@ internal object PicoQuickAppsMenu {
         session.quickApps.runtime {value,error->
             if(activity.isDestroyed || activity.isFinishing) return@runtime
             if(value==null) {status(error ?: "远端不支持 VR 后端设置");return@runtime}
-            val choices=arrayOf("OpenXR 优先，SteamVR 备用","仅内置 OpenXR","SteamVR 备用")
-            val keys=arrayOf("open_xr_first","open_xr_only","steam_vr")
+            val choices=arrayOf("OpenVR → SteamVR","SteamVR → OpenVR","仅 SteamVR","仅 OpenVR")
+            val keys=arrayOf("open_xr_first","steam_vr_first","steam_vr","open_xr_only")
             AlertDialog.Builder(activity).setTitle("此设备的 VR 后端 · 下次连接生效")
                 .setSingleChoiceItems(choices,keys.indexOf(value.optString("preference"))) {dialog,index->
                     session.quickApps.setRuntime(keys[index],status);dialog.dismiss()

@@ -38,9 +38,9 @@ OpenVR ABI 依据 Valve 官方 SDK v2.12.14，来源与许可见 `vendor/`。下
 
 已加入使用真实 runtime 眼位/FOV 的双眼 GLES 投影探针（本地网格，不是远端媒体）和内部 debug 仪器测试。控制协议改为带 `id` 的 `{ "id": 1, "op": "start" }` / `stop` 请求；周期状态使用 id=0，仅能撤销授权，不能自行开启追踪。PICO 侧限制单个会话占用；迟到回复、停止后的旧回复与超时均不能重新开启。详见 `pico-android/docs/PCVR-VALIDATION-2026-10-29.md` 的实际测试范围。
 
-## OpenXR-first 后端集成
+## 运行时后端策略
 
-默认策略已改为内置 OpenXR 优先，SteamVR 仅作备用。Monado/xrizer 源码组件已经实际构建、安装，进程级运行时选择与原生 loader 探针详见 [OpenXR 组件](../openxr/README.md)。此目录的 OpenVR 驱动仅是备用追踪诊断，不再作为必须依赖的主路线。后续 OpenXR 设备驱动已通过私有共享快照接入，详见 OpenXR 文档的 device bridge follow-up；仍不能将设备可识别解释为双眼视频链路就绪。
+偏好提供四档：OpenVR → SteamVR（默认，内置 OpenVR/OpenXR 优先、失败回退 SteamVR）、SteamVR → OpenVR（SteamVR 优先、失败回退内置）、仅 SteamVR、仅 OpenVR；箭头表示回退方向，独占档不回退，任一档都不改全局运行时。Monado/xrizer 源码组件已经实际构建、安装，进程级运行时选择与原生 loader 探针详见 [OpenXR 组件](../openxr/README.md)。此目录的 OpenVR 驱动仅是备用追踪诊断，不再作为必须依赖的主路线。后续 OpenXR 设备驱动已通过私有共享快照接入，详见 OpenXR 文档的 device bridge follow-up；仍不能将设备可识别解释为双眼视频链路就绪。
 
 双眼接收基础：单路 SBS access unit 保持左右眼配对，携带每眼渲染 pose/FOV；最大 4 MiB、48 KB 分片、丢失/过期/乱序恢复要求 IDR。PICO 使用硬件 MediaCodec 向一个 Android Surface swapchain 输出，两份 ProjectionView 引用同一图像的左右区域；使用码流携带的渲染视图而不是把当前头姿误当渲染姿态。250 ms 无解码帧停止提交，保留工具栏/射线，禁止点击隐藏的桌面四边形。该路径尚未经过真实头显/游戏帧验证。
 
