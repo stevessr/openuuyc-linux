@@ -546,6 +546,14 @@ impl Desktop {
         }
     }
 
+    // Wlr request-to-buffer_done and copy-to-ready durations.
+    pub fn last_phases(&self) -> (Duration, Duration) {
+        match &self.backend {
+            Backend::Wlr(grab) => grab.last_phases(),
+            _ => (Duration::ZERO, Duration::ZERO),
+        }
+    }
+
     /// Why no picture has come yet, when the backend can tell: the portal
     /// reports how far its PipeWire stream got. The others capture on request
     /// and have nothing to wait for.
@@ -1123,7 +1131,11 @@ mod session_tests {
     fn captures_frames_for_a_few_seconds() {
         let screens = super::screens().unwrap();
         let mut desktop = super::Desktop::open_selected(&screens[0]).unwrap();
-        println!("backend: {} source_fps_cap: {}", desktop.backend_name(), screens[0].fps);
+        println!(
+            "backend: {} source_fps_cap: {}",
+            desktop.backend_name(),
+            screens[0].fps
+        );
         let started = std::time::Instant::now();
         let (mut frames, mut size) = (0, None);
         let (mut wait, mut copy) = (std::time::Duration::ZERO, std::time::Duration::ZERO);

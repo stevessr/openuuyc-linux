@@ -206,6 +206,12 @@ struct State {
     /// How long the last frame waited for the compositor, and how long its
     /// pixels took to leave the mapping. Read by the live session test.
     timings: (Duration, Duration),
+    // When the frame in flight was requested and when its copy was submitted,
+    // so the two halves of the protocol round trip can be told apart.
+    requested_at: Option<Instant>,
+    copied_at: Option<Instant>,
+    // Last request-to-buffer_done and copy-to-ready durations.
+    phases: (Duration, Duration),
 }
 
 impl Grab {
@@ -321,6 +327,12 @@ impl Grab {
         self.state.timings
     }
 
+    // How long the compositor took to answer a request with buffer_done, and
+    // how long its copy then took to reach ready.
+    pub fn last_phases(&self) -> (Duration, Duration) {
+        self.state.phases
+    }
+
     /// What the DMA-BUF path did: the output's transform, how many
     /// (format, modifier) pairs the compositor advertised, whether the last
     /// frame offered a buffer, whether one is allocated, and whether the path
@@ -425,6 +437,8 @@ impl Grab {
             .outputs
             .get(self.output)
             .context("采集的输出已消失")?;
+        self.state.requested_at = Some(Instant::now());
+        self.state.copied_at = None;
         self.state.frame =
             Some(manager.capture_output(i32::from(self.cursor), &output.proxy, &handle, ()));
         Ok(())
@@ -873,7 +887,12 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                 width,
                 height,
             } => state.offered = Some((format, width, height)),
-            zwlr_screencopy_frame_v1::Event::Ready { .. } => state.ready = true,
+            zwlr_screencopy_frame_v1::Event::Ready { .. } => {
+                if let Some(copied) = state.copied_at.take() {
+                    state.phases.1 = copied.elapsed();
+                }
+                state.ready = true;
+            }
             zwlr_screencopy_frame_v1::Event::Failed => state.failed = true,
             // A dma-buf offer is not taken up: see the module comment.
             _ => {}
@@ -921,6 +940,10 @@ impl State {
             self.shm_buffer = Some(allocate(shm, format, width, height, stride, handle)?);
         }
         let shm = self.shm_buffer.as_ref().context("没有共享缓冲")?;
+        if let Some(requested) = self.requested_at.take() {
+            self.phases.0 = requested.elapsed();
+        }
+        self.copied_at = Some(Instant::now());
         if let Some(frame) = &self.frame {
             frame.copy_with_damage(&shm.buffer);
         }
