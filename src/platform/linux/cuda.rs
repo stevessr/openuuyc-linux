@@ -6,6 +6,8 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::sync::{Arc, OnceLock};
 
+pub(crate) mod vmm;
+
 type CuResult = c_int;
 pub(crate) type DevicePtr = u64;
 
@@ -245,6 +247,13 @@ impl Context {
             pci_bus,
         };
         context.trim()?;
+        match vmm::Allocation::dmabuf_supported(&context) {
+            Ok(true) => tracing::debug!("CUDA device supports VMM DMA-BUF export"),
+            Ok(false) => tracing::debug!(
+                "CUDA DMA_BUF_SUPPORTED=0; compositor capture keeps shared-memory buffers"
+            ),
+            Err(error) => tracing::debug!(%error, "CUDA VMM DMA-BUF capability unavailable"),
+        }
         Ok(context)
     }
 
