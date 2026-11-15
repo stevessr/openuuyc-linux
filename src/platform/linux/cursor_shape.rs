@@ -190,10 +190,21 @@ fn convert(reply: &GetCursorImageAndNameReply) -> Result<Shape> {
 /// The Windows system cursor a themed X cursor stands for, by its name in the
 /// cursor theme (both the X11 core and the CSS names are in use), so the
 /// controller can show its own native pointer for common shapes.
+///
+/// Themes spell the same shape in different ways and with different casing
+/// (`text`, `xterm`, `IBeam`, `vertical-text`, `wayland-text`, `text_cursor`),
+/// so the name is folded to lowercase before it is matched. A name this table
+/// does not know still reports 0: the controller then shows the sampled image.
 fn system_kind(name: &str) -> i32 {
-    match name {
+    let name = name.trim().to_ascii_lowercase();
+    match name.as_str() {
         "left_ptr" | "default" | "arrow" | "top_left_arrow" => 32512,
-        "xterm" | "text" | "ibeam" => 32513,
+        // Text cursors. Themes name the I-beam after the X11 core cursor
+        // (`xterm`), the CSS property (`text`, `vertical-text`), the shape
+        // itself (`ibeam`, `i-beam`), or the protocol (`wayland-text`);
+        // KDE/GNOME ship the last one for Wayland surfaces.
+        "xterm" | "text" | "ibeam" | "i-beam" | "text_cursor" | "text-cursor" | "wayland-text"
+        | "vertical-text" | "vertical_text" => 32513,
         "watch" | "wait" => 32514,
         "crosshair" | "cross" | "tcross" => 32515,
         "sb_up_arrow" | "up-arrow" => 32516,
@@ -215,5 +226,44 @@ fn system_kind(name: &str) -> i32 {
         "left_ptr_watch" | "progress" => 32650,
         "question_arrow" | "help" | "whats_this" => 32651,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::system_kind;
+
+    #[test]
+    fn text_cursors_are_named_differently_by_theme() {
+        for name in [
+            "xterm",
+            "text",
+            "ibeam",
+            "IBeam",
+            "text_cursor",
+            "text-cursor",
+            "wayland-text",
+            "vertical-text",
+            "  XTerm  ",
+        ] {
+            assert_eq!(system_kind(name), 32513, "cursor name {name:?}");
+        }
+    }
+
+    #[test]
+    fn other_shapes_keep_their_own_type() {
+        assert_eq!(system_kind("left_ptr"), 32512);
+        assert_eq!(system_kind("default"), 32512);
+        assert_eq!(system_kind("watch"), 32514);
+        assert_eq!(system_kind("nwse-resize"), 32642);
+        assert_eq!(system_kind("pointer"), 32649);
+    }
+
+    #[test]
+    fn unknown_cursor_names_report_nothing() {
+        assert_eq!(system_kind(""), 0);
+        assert_eq!(system_kind("openuuyc-unknown-shape"), 0);
+        // A theme's placeholder arrow must not be mistaken for a text cursor.
+        assert_eq!(system_kind("left_ptr_watch"), 32650);
     }
 }

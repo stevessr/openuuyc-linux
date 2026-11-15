@@ -3,6 +3,7 @@
 //! account/session ownership in this layer.
 pub(crate) mod audio_thread;
 pub(crate) mod capture;
+pub(crate) mod compositor_focus;
 pub(crate) mod cuda;
 pub(crate) mod cursor_shape;
 pub(crate) mod deadline;
@@ -31,6 +32,7 @@ pub(crate) mod startup_notify;
 pub(crate) mod surface;
 pub(crate) mod system_power;
 pub(crate) mod terminal;
+pub(crate) mod text_focus;
 pub(crate) mod transfer;
 mod vaapi_encoder;
 mod video_layer;

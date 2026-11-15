@@ -9,16 +9,32 @@ use std::time::Duration;
 
 const MAX_REPLY: usize = 256 * 1024;
 
-fn ipc(message: Value) -> Result<Value> {
+pub(crate) fn ipc(message: Value) -> Result<Value> {
+    ipc_many(&[message])?
+        .pop()
+        .context("niri IPC returned no reply")
+}
+
+/// Sends several requests over one connection and returns their replies in
+/// order, so a caller that needs a window plus its output pays one connect.
+pub(crate) fn ipc_many(messages: &[Value]) -> Result<Vec<Value>> {
     let socket =
         std::env::var_os("NIRI_SOCKET").context("not in a niri session (NIRI_SOCKET absent)")?;
     let mut stream = UnixStream::connect(socket).context("connect to niri IPC")?;
     stream.set_read_timeout(Some(Duration::from_millis(750)))?;
     stream.set_write_timeout(Some(Duration::from_millis(750)))?;
-    serde_json::to_writer(&mut stream, &message)?;
-    stream.write_all(b"\n")?;
-    let mut line = Vec::new();
     let mut reader = BufReader::new(stream);
+    let mut replies = Vec::with_capacity(messages.len());
+    for message in messages {
+        serde_json::to_writer(reader.get_mut(), message)?;
+        reader.get_mut().write_all(b"\n")?;
+        replies.push(read_reply(&mut reader)?);
+    }
+    Ok(replies)
+}
+
+fn read_reply(reader: &mut BufReader<UnixStream>) -> Result<Value> {
+    let mut line = Vec::new();
     // Read only one line and cap it *during* reading, not afterwards.
     loop {
         let available = reader.fill_buf()?;

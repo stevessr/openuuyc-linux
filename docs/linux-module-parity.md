@@ -13,8 +13,8 @@ UUWay 是 Wine 桥接被控端；本项目保留原生 Rust 架构，不直接�
 | 音频 | media/audio、linux/loopback | 同采样率减拷贝；录放设备切换、断线恢复 |
 | 虚拟麦克风 | linux/virtual_audio | 当前明确不支持，需实现 PipeWire source 与生命周期 |
 | 键鼠/触摸 | linux/input、features/remote_input | 权限拒绝、焦点、断开释放按键、多点触摸 |
-| 中文输入 | host/input、features/clipboard | 已提交文本整段粘贴，键盘事件仍经过本机输入法；需验证原生 Wayland 与 XWayland 实际应用 |
-| 光标 | linux/cursor_shape、features/remote_cursor | 形状、热点、缩放、多屏边界 |
+| 中文输入 | host/input、features/clipboard | 已提交文本整段粘贴，键盘事件仍经过本机输入法；文本光标识别见下文，需验证原生 Wayland 与 XWayland 实际应用 |
+| 光标 | linux/cursor_shape、features/remote_cursor | 形状、热点、缩放、多屏边界；窗口源按采集循环实时几何上报，原生 Wayland 输入框识别走 AT-SPI 回退 |
 | 剪贴板 | features/clipboard | 双向文本、循环抑制、Wayland 权限 |
 | 文件传输 | features/file_transfer、linux/transfer | 双向目录、取消、冲突、路径安全 |
 | 拖放 | linux/drag_drop | Wayland 当前明确拒绝；不能以 X11 实现宣称支持 |
@@ -128,6 +128,48 @@ identifier，同名窗口不会认错）。IPC 给出窗口在其工作区视图
 （niri 的 `FocusWindow` 会切工作区并滚进视口，同一窗口每秒最多试一次），
 再按新位置换算。其他合成器没有实测过的 IPC 不接：能枚举能看，输入注入
 明确报错而非投错位置。
+
+### 输入框识别与虚拟键盘
+
+控制端（PICO 智能输入法、手机端虚拟键盘）只认被控端 CONTROL 通道上的
+`cursorType == 32513`（Windows I-beam）与 `cursorScreen`。Linux 被控端：
+
+- X11/XWayland：`platform/linux/cursor_shape.rs` 用 XFixes 读光标名，先
+  `trim + 小写` 归一化再映射；I-beam 组包含 `xterm`、`text`、`ibeam`、
+  `i-beam`、`text_cursor`、`text-cursor`、`wayland-text`、`vertical-text`、
+  `vertical_text`。未知名字仍报 0，不臆造形状。
+- 光标发布（`features/host/peer/cursor.rs`）改用采集循环 `Published.screen`
+  的实时几何匹配指针所在源，窗口源移动/缩放后下一帧即生效，不再等 1 秒目录
+  刷新。
+- 原生 Wayland：XFixes 看不到合成器光标，新增
+  `platform/linux/text_focus.rs` 经 AT-SPI 无障碍总线订阅焦点事件，查询
+  `Accessible.GetRole/GetState` 与 `Component.GetExtents`，识别
+  ENTRY/PASSWORD_TEXT/TEXT/EDITBAR/TERMINAL/DOCUMENT_* 且同时
+  FOCUSED+EDITABLE+SHOWING+VISIBLE 的对象。Wayland 会话里，只要被观看屏幕
+  上有聚焦输入框就按文本光标上报；X11 仍要求指针落在输入框矩形内。
+  `OPENUUYC_ATSPI=0` 关闭，无无障碍总线时静默退回 XFixes。
+- 合成器原生通道（`platform/linux/compositor_focus.rs`）：Wayland 没有给第三方
+  观测他人文本焦点的协议（`zwp_text_input_v3` 只覆盖自身 surface，
+  `zwp_input_method_v2` 与用户输入法互斥），所以只取合成器本就公开的焦点信息。
+  niri 走 `NIRI_SOCKET`，一次连接取回 `FocusedWindow`、`Workspaces`、`Outputs`，
+  把 workspace view 坐标加回输出逻辑原点；Hyprland 走
+  `hyprctl -j activewindow`。两者给出聚焦窗口的全局矩形，用于把 AT-SPI 的
+  窗口相对坐标（`COORD_TYPE_WINDOW`）换算成屏幕坐标，并丢弃不与聚焦窗口相交
+  的迟到焦点事件。KWin（Plasma）走 D-Bus
+  `org.kde.kwin.VirtualKeyboard` 的 `active` 与
+  `activeClientSupportsTextInput`，直接回答“当前是否有文本输入焦点”，
+  无障碍总线拿不到矩形时按聚焦窗口上报。探测在独立线程里每 250 ms 刷新一次
+  快照（合成器 IPC 是往返调用，实测未缓存最差约 5 ms），光标循环只读快照，
+  实测 30 Hz 热路径约 50-200 ns；缺任一通道只是少一层信息。
+- 只读事件：不读取文字、不记录事件内容、不注入也不修改无障碍开关。
+
+边界：需要应用开启无障碍（GTK/Qt 通常受桌面无障碍开关控制）；AT-SPI 与
+XFixes 的坐标空间在分数缩放、多屏混合缩放下可能不一致；只读文档或未暴露
+EDITABLE 的控件按非输入框处理；KWin 的属性由 Plasma 虚拟键盘驱动，未启用
+虚拟键盘的桌面上它只会给出 false，因此只把 true 当正向信号；Wayland 的
+“聚焦即文本光标”是保守启发式，
+可能在被观看屏幕上没有输入框时仍报文本光标。真实 GTK/Qt 应用与 PICO 智能
+输入法仍待桌面验收。
 
 ### 触摸映射（niri）
 
