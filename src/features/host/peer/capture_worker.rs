@@ -71,6 +71,9 @@ struct CaptureSlot {
     empty: u64,
     capture_total: Duration,
     capture_max: Duration,
+    wlr_wait_total: Duration,
+    wlr_copy_total: Duration,
+    wlr_frames: u64,
 }
 
 /// Replaces an old frame instead of queueing it. A slow encoder should see the
@@ -184,10 +187,18 @@ mod capture_pump_tests {
             if let Some(packet) = pump.take_latest().filter(|p| p.revision == 1) {
                 frames += 1;
                 if let Ok(pixels) = packet.frame.image.pixels() {
+                    // Sample a 32x32 grid instead of scanning the whole
+                    // 16 MiB image: this test must measure capture cadence, not
+                    // make the debug-build consumer CPU-bound doing its hash.
+                    let (width, height) =
+                        (packet.frame.width as usize, packet.frame.height as usize);
                     let mut hash = 0xcbf29ce484222325u64;
-                    for (index, byte) in pixels.iter().enumerate() {
-                        if index % 64 == 0 {
-                            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+                    for y in (0..height).step_by((height / 32).max(1)) {
+                        for x in (0..width).step_by((width / 32).max(1)) {
+                            let offset = (y * width + x) * 4;
+                            if let Some(byte) = pixels.get(offset) {
+                                hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+                            }
                         }
                     }
                     if previous_hash.is_some_and(|previous| previous != hash) {
@@ -208,14 +219,17 @@ mod capture_pump_tests {
             }
         }
         let elapsed = started.elapsed().as_secs_f64();
-        let (attempts, _empty, capture_time, capture_max) = pump.stats();
+        let (attempts, _empty, capture_time, capture_max, wlr_wait, wlr_copy, wlr_frames) =
+            pump.stats();
         println!(
-            "live 144Hz pipeline source_fps_cap={} polls={attempts} captured={frames} encoded={encoded} capture_only={capture_only} distinct_images={distinct_images} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} encode_avg_ms={:.2}",
+            "live 144Hz pipeline source_fps_cap={} polls={attempts} captured={frames} encoded={encoded} capture_only={capture_only} distinct_images={distinct_images} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} wlr_frames={wlr_frames} wlr_wait_avg_ms={:.2} wlr_copy_avg_ms={:.2} encode_avg_ms={:.2}",
             screen.fps,
             frames as f64 / elapsed,
             encoded as f64 / elapsed,
             capture_time.as_secs_f64() * 1000.0 / attempts.max(1) as f64,
             capture_max.as_secs_f64() * 1000.0,
+            wlr_wait.as_secs_f64() * 1000.0 / wlr_frames.max(1) as f64,
+            wlr_copy.as_secs_f64() * 1000.0 / wlr_frames.max(1) as f64,
             encode_time.as_secs_f64() * 1000.0 / encoded.max(1) as f64,
         );
         assert!(frames > 0 && (capture_only || encoded > 0));
@@ -240,7 +254,7 @@ mod capture_pump_tests {
             epoch: 0,
         });
         std::thread::sleep(Duration::from_secs(2)); // deliberately don't consume
-        let (attempts, _empty, _elapsed, _max) = pump.stats();
+        let (attempts, _empty, _elapsed, _max, _wait, _copy, _frames) = pump.stats();
         let replaced = pump.replaced();
         let latest = pump.take_latest();
         let frames = replaced + u64::from(latest.is_some());
@@ -276,6 +290,9 @@ impl CapturePump {
             empty: 0,
             capture_total: Duration::ZERO,
             capture_max: Duration::ZERO,
+            wlr_wait_total: Duration::ZERO,
+            wlr_copy_total: Duration::ZERO,
+            wlr_frames: 0,
         }));
         let control = Arc::new(Mutex::new(CaptureConfig {
             enabled: false,
@@ -327,6 +344,7 @@ impl CapturePump {
                         cfg.maximum,
                     );
                     let elapsed = started.elapsed();
+                    let timings = desktop.last_timings();
                     let frame = match result {
                         Ok(frame) => frame,
                         Err(error) => {
@@ -355,6 +373,10 @@ impl CapturePump {
                     guard.capture_max = guard.capture_max.max(elapsed);
                     if frame.is_none() {
                         guard.empty = guard.empty.saturating_add(1);
+                    } else if desktop.backend_name() == "wlroots screencopy" {
+                        guard.wlr_wait_total += timings.0;
+                        guard.wlr_copy_total += timings.1;
+                        guard.wlr_frames = guard.wlr_frames.saturating_add(1);
                     }
                     guard.state = state.clone();
                     if publish && let Some(frame) = frame {
@@ -417,13 +439,16 @@ impl CapturePump {
         lock(&self.slot).replaced
     }
 
-    fn stats(&self) -> (u64, u64, Duration, Duration) {
+    fn stats(&self) -> (u64, u64, Duration, Duration, Duration, Duration, u64) {
         let slot = lock(&self.slot);
         (
             slot.attempts,
             slot.empty,
             slot.capture_total,
             slot.capture_max,
+            slot.wlr_wait_total,
+            slot.wlr_copy_total,
+            slot.wlr_frames,
         )
     }
 }
@@ -804,7 +829,8 @@ pub(super) fn capture_loop(
             let replaced = pump.replaced();
             metrics.capture_replaced += replaced.saturating_sub(observed_replaced);
             observed_replaced = replaced;
-            let (attempts, empty, capture_total, capture_max) = pump.stats();
+            let (attempts, empty, capture_total, capture_max, _wlr_wait, _wlr_copy, _wlr_frames) =
+                pump.stats();
             let attempt_delta = attempts.saturating_sub(observed_capture_stats.0);
             let empty_delta = empty.saturating_sub(observed_capture_stats.1);
             let elapsed_delta = capture_total.saturating_sub(observed_capture_stats.2);

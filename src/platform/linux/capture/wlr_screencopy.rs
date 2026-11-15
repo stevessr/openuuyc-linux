@@ -406,7 +406,7 @@ impl Grab {
             }
             let wait_started = Instant::now();
             let outcome = self.wait(deadline - now);
-            waited = wait_started.elapsed();
+            waited += wait_started.elapsed();
             outcome?;
         }
     }

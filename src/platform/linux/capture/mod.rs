@@ -538,6 +538,14 @@ impl Desktop {
         self.backend.name()
     }
 
+    /// Last compositor wait and SHM copy timings; zero for non-Wlr backends.
+    pub fn last_timings(&self) -> (Duration, Duration) {
+        match &self.backend {
+            Backend::Wlr(grab) => grab.last_timings(),
+            _ => (Duration::ZERO, Duration::ZERO),
+        }
+    }
+
     /// Why no picture has come yet, when the backend can tell: the portal
     /// reports how far its PipeWire stream got. The others capture on request
     /// and have nothing to wait for.
