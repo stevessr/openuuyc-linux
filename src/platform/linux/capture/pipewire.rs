@@ -397,12 +397,15 @@ fn buffers() -> Pod {
         // A flags choice holds one value: the mask. The count `SPA_CHOICE_FLAGS`
         // writes is not part of the pod -- `SPA_POD_CHOICE_N_VALUES` derives it
         // from the body size, which `choice` sets from the value count here.
+        // The first flag is the preferred one. Offering shared memory next to
+        // DMA-BUF keeps a compositor that cannot hand out a dmabuf working
+        // instead of failing the stream.
         p.choice(
             CHOICE_FLAGS,
             TYPE_INT,
             1,
             &[if dmabuf_requested() {
-                1 << DATA_MEM_DMABUF
+                (1 << DATA_MEM_DMABUF) | (1 << DATA_MEM_FD) | (1 << DATA_MEM_PTR)
             } else {
                 (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
             }],
@@ -480,8 +483,15 @@ unsafe fn parse_format(pod: *const c_void) -> Option<NegotiatedFormat> {
     })
 }
 
+/// Whether the portal stream asks for DMA-BUF buffers.
+///
+/// On by default: a DMA-BUF frame is imported on the GPU and never crosses the
+/// CPU, while shared memory costs a full-frame copy per frame. The request
+/// degrades on its own -- the stream advertises the shared-memory format next
+/// to the DMA-BUF one and reads whatever the portal actually hands over -- so
+/// OPENUUYC_CAPTURE_DMABUF=0 is only needed to force the old path.
 fn dmabuf_requested() -> bool {
-    std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value != "0")
+    !std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value == "0")
 }
 
 /// Import into the baseline's owned BGRA picture while the PipeWire buffer is
@@ -552,7 +562,10 @@ fn read_dmabuf_picture(
         thread_local! {
             static GPU_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
-        if std::env::var("OPENUUYC_GPU_CONVERT").as_deref() == Ok("1")
+        // On by default: the converter writes the final geometry straight into
+        // the encoder's frame, so neither a resize nor a readback touches the
+        // CPU. A driver that cannot import falls back once, on this thread.
+        if std::env::var("OPENUUYC_GPU_CONVERT").as_deref() != Ok("0")
             && !GPU_FAILED.with(|failed|failed.get()) {
 
             thread_local! {
@@ -1170,13 +1183,18 @@ impl Stream {
                     &*this._events,
                     this.callbacks.cast(),
                 );
-                let format = if dmabuf_requested() {
-                    enum_format()
+                // Format pods are alternatives: the portal picks the first one
+                // it can serve, so the DMA-BUF enumeration leads and the
+                // shared-memory one keeps Mutter and KWin working unchanged.
+                let mut formats = if dmabuf_requested() {
+                    vec![enum_format().aligned(), enum_format_shm().aligned()]
                 } else {
-                    enum_format_shm()
-                }
-                .aligned();
-                let mut params = [format.as_ptr().cast::<c_void>()];
+                    vec![enum_format_shm().aligned()]
+                };
+                let mut params: Vec<*const c_void> = formats
+                    .iter_mut()
+                    .map(|format| format.as_ptr().cast::<c_void>())
+                    .collect();
                 let connected = (api.stream_connect)(
                     this.stream,
                     DIRECTION_INPUT,
@@ -1435,11 +1453,14 @@ mod tests {
         assert_eq!(words[8], CHOICE_FLAGS);
         assert_eq!(words[11], TYPE_INT);
         let mask = words[12];
+        // DMA-BUF is the preferred flag, and shared memory stays on offer so a
+        // compositor that cannot hand out a dmabuf still delivers frames.
         let expected = if dmabuf_requested() {
-            1 << DATA_MEM_DMABUF
+            (1 << DATA_MEM_DMABUF) | (1 << DATA_MEM_FD) | (1 << DATA_MEM_PTR)
         } else {
             (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
         };
         assert_eq!(mask, expected);
+        assert_eq!(mask & (1 << DATA_MEM_DMABUF) != 0, dmabuf_requested());
     }
 }
