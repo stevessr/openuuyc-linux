@@ -676,13 +676,12 @@ impl Desktop {
                     self.last = None;
                     return Ok(None);
                 }
-                let grabbed = match grab
-                    .next(cursor, deadline.saturating_duration_since(Instant::now()))?
-                {
-                    Some(size) => size,
-                    // 超时没有新画面：这一轮就不出帧。
-                    None => return Ok(None),
-                };
+                let grabbed =
+                    match grab.next(cursor, deadline.saturating_duration_since(Instant::now()))? {
+                        Some(size) => size,
+                        // 超时没有新画面：这一轮就不出帧。
+                        None => return Ok(None),
+                    };
                 let size = output(grabbed.0, grabbed.1, quality, maximum);
                 let image = scale(grab.pixels(), grabbed, size);
                 Ok(Some((size, image)))
@@ -1094,13 +1093,30 @@ mod session_tests {
         println!("backend: {}", desktop.backend_name());
         let started = std::time::Instant::now();
         let (mut frames, mut size) = (0, None);
+        let (mut wait, mut copy) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         while started.elapsed() < std::time::Duration::from_secs(4) {
             if let Some(frame) = desktop.next(50, 4, false, false, (3840, 2160)).unwrap() {
                 frames += 1;
                 size = Some((frame.width, frame.height));
+                if let super::Backend::Wlr(grab) = &desktop.backend {
+                    let (waited, copied) = grab.last_timings();
+                    wait += waited;
+                    copy += copied;
+                }
             }
         }
-        println!("frames: {frames} size: {size:?}");
+        let per_frame = |total: std::time::Duration| {
+            if frames == 0 {
+                0.0
+            } else {
+                total.as_secs_f64() * 1000.0 / f64::from(frames)
+            }
+        };
+        println!(
+            "frames: {frames} size: {size:?} wait_ms: {:.2} copy_ms: {:.2}",
+            per_frame(wait),
+            per_frame(copy)
+        );
         assert!(frames > 0);
     }
 

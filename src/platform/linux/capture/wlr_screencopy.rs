@@ -199,6 +199,9 @@ struct State {
     dmabuf_failed: bool,
     /// Geometry the encoder asked for; `None` keeps the source size.
     target: Option<(i32, (u32, u32))>,
+    /// How long the last frame waited for the compositor, and how long its
+    /// pixels took to leave the mapping. Read by the live session test.
+    timings: (Duration, Duration),
 }
 
 impl Grab {
@@ -308,6 +311,12 @@ impl Grab {
         self.state.target = target;
     }
 
+    /// How long the last frame waited and how long reading it from the
+    /// mapping took.
+    pub fn last_timings(&self) -> (Duration, Duration) {
+        self.state.timings
+    }
+
     /// What the DMA-BUF path did: the output's transform, how many
     /// (format, modifier) pairs the compositor advertised, whether the last
     /// frame offered a buffer, whether one is allocated, and whether the path
@@ -326,6 +335,7 @@ impl Grab {
 
     pub fn next(&mut self, timeout: Duration) -> Result<Option<Picture>> {
         let deadline = Instant::now() + timeout;
+        let mut waited = Duration::ZERO;
         loop {
             // Kept rather than taken: the compositor is not going to change
             // its mind on its own, and `Ok(None)` every frame would leave the
@@ -334,6 +344,7 @@ impl Grab {
                 bail!("{error}");
             }
             if std::mem::take(&mut self.state.ready) {
+                let copy_started = Instant::now();
                 let transform = self
                     .state
                     .outputs
@@ -372,6 +383,7 @@ impl Grab {
                 // its own, ahead of its `destroy`: the compositor can complete
                 // that copy and use up the damage the first real frame waits
                 // for, and a still desktop then sends no frame at all.
+                self.state.timings = (waited, copy_started.elapsed());
                 self.request()?;
                 if let Some(picture) = picture {
                     return Ok(Some(picture));
@@ -388,7 +400,10 @@ impl Grab {
             if now >= deadline {
                 return Ok(None);
             }
-            self.wait(deadline - now)?;
+            let wait_started = Instant::now();
+            let outcome = self.wait(deadline - now);
+            waited = wait_started.elapsed();
+            outcome?;
         }
     }
 
