@@ -91,6 +91,7 @@ impl Sender {
         let sources = std::mem::take(&mut self.sources);
         let k = sources.len();
         let shard_size = sources.iter().map(|(_, s)| s.len()).max().unwrap_or(0);
+        let clean_low_rtt = !self.keyframe && rtt_ms < 20 && loss <= f64::EPSILON;
         let loss = (loss.clamp(0.0, 1.0) * 255.0).round() as usize;
         let table = if rtt_ms > 120 || self.keyframe || k >= 71 {
             &HIGH[..]
@@ -98,13 +99,20 @@ impl Sender {
             &LOW[..]
         };
         let mut desired = table[(k - 1) * 256 + loss] as usize;
-        if !self.keyframe && rtt_ms < 20 {
+        if clean_low_rtt {
             desired = 0;
         }
-        // Thresholds are quantized to /256 by T1EAD1A before T542CF4.
-        let floor = ((k * 12 + 128) >> 8).max(1);
-        let ceiling = ((k * 89 + 128) >> 8).max(1);
-        desired = desired.clamp(floor, ceiling).min(k).min(256 - k);
+        // On a fresh low-RTT link with no loss, desired is explicitly zero.
+        // Do not resurrect FEC with the generic minimum: it was still sending
+        // repair packets on the exact path the policy marked clean, consuming
+        // a material part of a 300 kbps media budget and adding pacer work.
+        // All lossy/high-RTT/keyframe groups retain the bounded minimum.
+        if desired != 0 {
+            // Thresholds are quantized to /256 by T1EAD1A before T542CF4.
+            let floor = ((k * 12 + 128) >> 8).max(1);
+            let ceiling = ((k * 89 + 128) >> 8).max(1);
+            desired = desired.clamp(floor, ceiling).min(k).min(256 - k);
+        }
         let block = Block {
             id: self.block,
             sources,

@@ -39,7 +39,11 @@ impl Default for Burst {
             evaluated: 0,
             changed: None,
             increase_since: None,
-            bytes: 63000,
+            // A 63 KiB burst can occupy 1.7 s at the 300 kbps floor and
+            // made the receiver's delay estimator see a link queue. The pacer
+            // still groups feedback, but its immediate allowance stays below
+            // one MTU train at low rate.
+            bytes: 12_000,
         }
     }
 }
@@ -165,7 +169,7 @@ impl Burst {
         let overuse = y >= 0.03 && yy > 0.0 && xy / (xx * yy).sqrt() >= 0.5;
         let next = if overuse {
             self.increase_since = None;
-            (self.bytes as f64 * 0.85).round().max(24000.0) as usize
+            (self.bytes as f64 * 0.85).round().max(12_000.0) as usize
         } else {
             let hits = self
                 .samples

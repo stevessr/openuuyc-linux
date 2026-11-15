@@ -723,9 +723,12 @@ impl Transport {
                 .max(required)
                 .max(if pacer.debt > 0.0 { pacer.rate } else { 0.0 });
             pacer.rate = rate;
-            // T38197A: send a burst, then repay the full media debt. Idle
-            // time cannot accumulate credit for a later oversized burst.
-            if !pacer.draining && pacer.debt < burst.min(rate * 0.040) {
+            // Send only a very short train before repaying its media debt.
+            // A 40ms train built local/receiver queues and was reported as
+            // delay overuse even with no loss; 8ms is enough to avoid a timer
+            // per packet without creating a queue-sized step on the link.
+            const MAX_INITIAL_TRAIN: f64 = 0.008;
+            if !pacer.draining && pacer.debt < burst.min(rate * MAX_INITIAL_TRAIN) {
                 pacer.debt += bytes;
                 let group = pacer.group;
                 drop(pacer);
