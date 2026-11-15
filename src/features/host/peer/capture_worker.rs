@@ -20,6 +20,312 @@ use tokio_util::sync::CancellationToken;
 
 mod metrics;
 
+#[cfg(target_os = "linux")]
+fn capture_backend_name(state: &CaptureState) -> String {
+    state.backend.clone()
+}
+#[cfg(not(target_os = "linux"))]
+fn capture_backend_name(state: &capture::Desktop) -> String {
+    state.backend_name().to_string()
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct CaptureConfig {
+    enabled: bool,
+    revision: u64,
+    quality: i32,
+    maximum: (u32, u32),
+    fps: u32,
+    cursor: bool,
+    hdr: bool,
+    gpu_frames: bool,
+    epoch: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct CaptureState {
+    screen: capture::Screen,
+    device: capture::Device,
+    generation: u64,
+    available: bool,
+    hdr_available: bool,
+    cursor: Option<crate::platform::cursor_shape::Snapshot>,
+    backend: String,
+}
+
+#[cfg(target_os = "linux")]
+struct Captured {
+    frame: capture::Frame,
+    state: CaptureState,
+    revision: u64,
+}
+
+#[cfg(target_os = "linux")]
+struct CaptureSlot {
+    latest: Option<Captured>,
+    state: CaptureState,
+    replaced: u64,
+    attempts: u64,
+    empty: u64,
+    capture_total: Duration,
+    capture_max: Duration,
+}
+
+/// Replaces an old frame instead of queueing it. A slow encoder should see the
+/// newest desktop image, not build latency by draining an old FIFO.
+#[cfg(target_os = "linux")]
+fn replace_latest<T>(slot: &mut Option<T>, frame: T) -> bool {
+    slot.replace(frame).is_some()
+}
+
+/// Capture owns Desktop and its native handles on a dedicated thread. The
+/// encoder consumes a one-slot latest-frame mailbox: acquisition never waits
+/// for NVENC, and a slow encoder drops stale frames rather than building a FIFO.
+#[cfg(target_os = "linux")]
+struct CapturePump {
+    control: Arc<Mutex<CaptureConfig>>,
+    slot: Arc<Mutex<CaptureSlot>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod capture_pump_tests {
+    use super::{CaptureConfig, CapturePump, capture, replace_latest};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[test]
+    fn a_slow_consumer_never_accumulates_a_fifo() {
+        let mut slot = None;
+        assert!(!replace_latest(&mut slot, 1));
+        assert_eq!(slot.take(), Some(1));
+        assert!(!replace_latest(&mut slot, 2));
+        assert!(replace_latest(&mut slot, 3));
+        assert_eq!(slot.take(), Some(3));
+    }
+
+    /// Live end-to-end test for the producer and the overwrite policy.
+    #[test]
+    #[ignore = "needs a Wayland desktop session"]
+    fn producer_keeps_capturing_while_consumer_is_slow() {
+        let screen = capture::screens().unwrap().remove(0);
+        let desktop = capture::Desktop::open_selected(&screen).unwrap();
+        let pump = CapturePump::new(desktop, Arc::new(Mutex::new(None))).unwrap();
+        pump.configure(CaptureConfig {
+            enabled: true,
+            revision: 1,
+            quality: 4,
+            maximum: (3840, 2160),
+            fps: 60,
+            cursor: false,
+            hdr: false,
+            gpu_frames: false,
+            epoch: 0,
+        });
+        std::thread::sleep(Duration::from_secs(2)); // deliberately don't consume
+        let (attempts, _empty, _elapsed, _max) = pump.stats();
+        let replaced = pump.replaced();
+        let latest = pump.take_latest();
+        println!(
+            "producer_attempts={attempts} replaced={replaced} latest={}",
+            latest.is_some()
+        );
+        assert!(attempts >= 30);
+        assert!(replaced > 0 || latest.is_some());
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CapturePump {
+    fn new(
+        mut desktop: capture::Desktop,
+        pointer: Arc<Mutex<Option<crate::platform::cursor_shape::Snapshot>>>,
+    ) -> Result<Self> {
+        let state = CaptureState {
+            screen: desktop.screen.clone(),
+            device: desktop.device.clone(),
+            generation: desktop.generation,
+            available: desktop.available,
+            hdr_available: desktop.hdr_available(),
+            cursor: desktop.cursor.clone(),
+            backend: desktop.backend_name().to_string(),
+        };
+        let slot = Arc::new(Mutex::new(CaptureSlot {
+            latest: None,
+            state,
+            replaced: 0,
+            attempts: 0,
+            empty: 0,
+            capture_total: Duration::ZERO,
+            capture_max: Duration::ZERO,
+        }));
+        let control = Arc::new(Mutex::new(CaptureConfig {
+            enabled: false,
+            revision: 0,
+            quality: 1,
+            maximum: (1920, 1080),
+            fps: 30,
+            cursor: false,
+            hdr: false,
+            gpu_frames: false,
+            epoch: 0,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_slot = slot.clone();
+        let thread_control = control.clone();
+        let thread_stop = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("openuuyc-capture".into())
+            .spawn(move || {
+                let mut next = Instant::now();
+                while !thread_stop.load(Ordering::Acquire) {
+                    let cfg = *lock(&thread_control);
+                    if !cfg.enabled {
+                        std::thread::sleep(Duration::from_millis(2));
+                        next = Instant::now();
+                        continue;
+                    }
+                    let now = Instant::now();
+                    if now < next {
+                        std::thread::sleep(
+                            next.saturating_duration_since(now)
+                                .min(Duration::from_millis(2)),
+                        );
+                        continue;
+                    }
+                    let period = Duration::from_secs_f64(1.0 / f64::from(cfg.fps.max(1)));
+                    next = if now.saturating_duration_since(next) >= period {
+                        now + period
+                    } else {
+                        next + period
+                    };
+                    desktop.set_gpu_frames(cfg.gpu_frames);
+                    let started = Instant::now();
+                    let result = desktop.next(
+                        ((period.as_millis() as u32).clamp(1, 50)),
+                        cfg.quality,
+                        cfg.cursor,
+                        cfg.hdr,
+                        cfg.maximum,
+                    );
+                    let elapsed = started.elapsed();
+                    let frame = match result {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            tracing::warn!(%error, "capture producer failed");
+                            None
+                        }
+                    };
+                    *lock(&pointer) = desktop.cursor.clone();
+                    let state = CaptureState {
+                        screen: desktop.screen.clone(),
+                        device: desktop.device.clone(),
+                        generation: desktop.generation,
+                        available: desktop.available,
+                        hdr_available: desktop.hdr_available(),
+                        cursor: desktop.cursor.clone(),
+                        backend: desktop.backend_name().to_string(),
+                    };
+                    // Serialize publication with configure(): a capture that
+                    // was in flight during a pause/settings change cannot put
+                    // its stale frame back into the slot after invalidation.
+                    let current = lock(&thread_control);
+                    let publish = current.enabled && current.epoch == cfg.epoch;
+                    let mut guard = lock(&thread_slot);
+                    guard.attempts = guard.attempts.saturating_add(1);
+                    guard.capture_total += elapsed;
+                    guard.capture_max = guard.capture_max.max(elapsed);
+                    if frame.is_none() {
+                        guard.empty = guard.empty.saturating_add(1);
+                    }
+                    guard.state = state.clone();
+                    if publish && let Some(frame) = frame {
+                        if replace_latest(
+                            &mut guard.latest,
+                            Captured {
+                                frame,
+                                state,
+                                revision: cfg.revision,
+                            },
+                        ) {
+                            guard.replaced = guard.replaced.saturating_add(1);
+                        }
+                    }
+                }
+            })
+            .context("spawn capture producer")?;
+        Ok(Self {
+            control,
+            slot,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn configure(&self, cfg: CaptureConfig) {
+        let mut control = lock(&self.control);
+        let invalidate = !cfg.enabled
+            || control.enabled != cfg.enabled
+            || control.revision != cfg.revision
+            || control.quality != cfg.quality
+            || control.maximum != cfg.maximum
+            || control.fps != cfg.fps
+            || control.cursor != cfg.cursor
+            || control.hdr != cfg.hdr
+            || control.gpu_frames != cfg.gpu_frames;
+        let mut cfg = cfg;
+        cfg.epoch = control.epoch.wrapping_add(if invalidate { 1 } else { 0 });
+        *control = cfg;
+        if invalidate {
+            // Keep lock order (control, then slot) identical to publication so
+            // a just-finished old capture cannot repopulate the slot after clear.
+            lock(&self.slot).latest = None;
+        }
+    }
+
+    fn state(&self) -> CaptureState {
+        lock(&self.slot).state.clone()
+    }
+
+    fn hdr_available(&self) -> bool {
+        lock(&self.slot).state.hdr_available
+    }
+
+    fn take_latest(&self) -> Option<Captured> {
+        lock(&self.slot).latest.take()
+    }
+
+    fn replaced(&self) -> u64 {
+        lock(&self.slot).replaced
+    }
+
+    fn stats(&self) -> (u64, u64, Duration, Duration) {
+        let slot = lock(&self.slot);
+        (
+            slot.attempts,
+            slot.empty,
+            slot.capture_total,
+            slot.capture_max,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CapturePump {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!("capture producer panicked during shutdown");
+            }
+        }
+        lock(&self.slot).latest = None;
+    }
+}
+
 pub(super) fn capture_loop(
     mut screen: capture::Screen,
     handle: Lease,
@@ -38,7 +344,10 @@ pub(super) fn capture_loop(
 ) -> Result<()> {
     let _activity = crate::platform::host_service::activity::Work::new();
     let mut runtime = encoder::Runtime::new()?;
-    let mut desktop = None;
+    #[cfg(target_os = "linux")]
+    let mut desktop = None::<CapturePump>;
+    #[cfg(not(target_os = "linux"))]
+    let mut desktop = None::<capture::Desktop>;
     let mut encoder = None::<encoder::Encoder>;
     let mut current: Option<((u32, u32), ((u64, Backend, Format), Color))> = None;
     let mut next = Instant::now();
@@ -57,6 +366,10 @@ pub(super) fn capture_loop(
     let mut frame_metadata = std::collections::BTreeMap::new();
     let mut last_diagnostics = None;
     let mut metrics = metrics::Metrics::default();
+    #[cfg(target_os = "linux")]
+    let mut observed_replaced = 0u64;
+    #[cfg(target_os = "linux")]
+    let mut observed_capture_stats = (0u64, 0u64, Duration::ZERO);
     let mut paused_capture_at = None::<Instant>;
 
     while !cancel.is_cancelled() && handle.requested() {
@@ -90,8 +403,16 @@ pub(super) fn capture_loop(
             let opened_at = Instant::now();
             let connecting = !connected.load(Ordering::Acquire);
             runtime.begin_gpu_work(negotiated.gpu_compatibility);
-            desktop = Some(capture::Desktop::open_selected(&screen)?);
-            generation = desktop.as_ref().unwrap().generation;
+            let opened = capture::Desktop::open_selected(&screen)?;
+            generation = opened.generation;
+            #[cfg(target_os = "linux")]
+            {
+                desktop = Some(CapturePump::new(opened, pointer.clone())?);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                desktop = Some(opened);
+            }
             tracing::info!(
                 elapsed_ms = opened_at.elapsed().as_millis(),
                 connecting,
@@ -101,15 +422,21 @@ pub(super) fn capture_loop(
             // the current revision before configuring or encoding any frame.
             continue;
         }
-        if let Some(desktop) = desktop.as_ref() {
+        let hdr_available = desktop.as_ref().is_some_and(|desktop| {
+            #[cfg(target_os = "linux")]
+            {
+                desktop.hdr_available()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                desktop.hdr_available()
+            }
+        });
+        if desktop.is_some() {
             // T CCDCA0/CF3450 gate HDR on the actual source, not only the
             // requested setting. Keep the request so same-source HDR recovery
             // can re-enable the negotiated format without rewriting user intent.
-            negotiated.apply_source(
-                &mut wanted,
-                (screen.width, screen.height),
-                desktop.hdr_available(),
-            )?;
+            negotiated.apply_source(&mut wanted, (screen.width, screen.height), hdr_available)?;
         }
         let settings = (
             wanted.revision,
@@ -120,6 +447,7 @@ pub(super) fn capture_loop(
         );
         let changed = requested != Some(settings);
         if changed {
+            cached = None;
             automatic = (wanted.quality == 5).then(|| {
                 crate::features::host::parameters::AutoQuality::new(
                     wanted.auto_quality,
@@ -222,6 +550,20 @@ pub(super) fn capture_loop(
             || !wanted.sending
             || !wanted.capturing
         {
+            #[cfg(target_os = "linux")]
+            if let Some(pump) = desktop.as_ref() {
+                pump.configure(CaptureConfig {
+                    enabled: false,
+                    revision: wanted.revision,
+                    quality: wanted.quality,
+                    maximum: wanted.maximum,
+                    fps: wanted.fps,
+                    cursor: wanted.cursor_capture,
+                    hdr: wanted.color.is_hdr(),
+                    gpu_frames: false,
+                    epoch: 0,
+                });
+            }
             if !wanted.capturing {
                 if last_diagnostics.take().is_some() {
                     handle.video(None);
@@ -265,8 +607,16 @@ pub(super) fn capture_loop(
         }
         if desktop.is_none() {
             runtime.begin_gpu_work(negotiated.gpu_compatibility);
-            desktop = Some(capture::Desktop::open_selected(&screen)?);
-            generation = desktop.as_ref().unwrap().generation;
+            let opened = capture::Desktop::open_selected(&screen)?;
+            generation = opened.generation;
+            #[cfg(target_os = "linux")]
+            {
+                desktop = Some(CapturePump::new(opened, pointer.clone())?);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                desktop = Some(opened);
+            }
             // Readiness can change after the preparation gate above. Apply the
             // same policy and reread settings after either native open path.
             continue;
@@ -277,6 +627,20 @@ pub(super) fn capture_loop(
             // Keep source/cursor/recovery observations alive during a transport
             // pause, without preprocessing the desktop at the full video rate.
             // Do not advance WindowAdmission: it counts actual candidate frames.
+            #[cfg(target_os = "linux")]
+            if let Some(pump) = desktop.as_ref() {
+                pump.configure(CaptureConfig {
+                    enabled: false,
+                    revision: wanted.revision,
+                    quality: wanted.quality,
+                    maximum: wanted.maximum,
+                    fps: wanted.fps,
+                    cursor: wanted.cursor_capture,
+                    hdr: wanted.color.is_hdr(),
+                    gpu_frames: false,
+                    epoch: 0,
+                });
+            }
             if paused_capture_at.is_some_and(|at| at.elapsed() < Duration::from_millis(100)) {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
@@ -285,33 +649,67 @@ pub(super) fn capture_loop(
         } else {
             paused_capture_at = None;
         }
-        let wait_ms = ((1000.0 / f64::from(wanted.fps)).round() as u32).max(1);
         let capture_started = Instant::now();
-        // Advance the planned deadline, not the (usually late) wake-up time.
-        // Otherwise sleep/dispatch overhead is added to every frame period.
-        // A whole missed period resets the clock instead of replaying a backlog.
+        // This deadline paces the encoder consumer. On Linux, the capture
+        // producer runs independently and leaves only its latest frame here.
         next = if capture_started.saturating_duration_since(next) >= period {
             capture_started + period
         } else {
             next + period
         };
-        // A DMA-BUF frame is only worth its GPU conversion when the encoder
-        // reads that surface directly; NVENC downloads it, which is far slower
-        // than the shared-memory copy it would replace.
-        let gpu_frames = matches!(encoder.as_ref(), Some(encoder::Encoder::Vaapi(..)));
-        if let Some(desktop) = desktop.as_mut() {
-            desktop.set_gpu_frames(gpu_frames);
-        }
-        let captured = desktop.as_mut().context("缺少采集源")?.next(
-            wait_ms,
-            wanted.quality,
-            wanted.cursor_capture,
-            wanted.color.is_hdr(),
-            wanted.maximum,
-        );
-        metrics.capture.record(capture_started.elapsed());
-        let captured = captured?;
-        let capture_state = desktop.as_ref().context("缺少采集源")?;
+        #[cfg(target_os = "linux")]
+        let (captured, capture_state) = {
+            let pump = desktop.as_ref().context("缺少采集源")?;
+            let gpu_frames = matches!(encoder.as_ref(), Some(encoder::Encoder::Vaapi(..)));
+            pump.configure(CaptureConfig {
+                enabled: true,
+                revision: wanted.revision,
+                quality: wanted.quality,
+                maximum: wanted.maximum,
+                fps: wanted.fps,
+                cursor: wanted.cursor_capture,
+                hdr: wanted.color.is_hdr(),
+                gpu_frames,
+                epoch: 0,
+            });
+            let replaced = pump.replaced();
+            metrics.capture_replaced += replaced.saturating_sub(observed_replaced);
+            observed_replaced = replaced;
+            let (attempts, empty, capture_total, capture_max) = pump.stats();
+            let attempt_delta = attempts.saturating_sub(observed_capture_stats.0);
+            let empty_delta = empty.saturating_sub(observed_capture_stats.1);
+            let elapsed_delta = capture_total.saturating_sub(observed_capture_stats.2);
+            metrics
+                .capture
+                .record_batch(attempt_delta, elapsed_delta, capture_max);
+            metrics.empty_captures += empty_delta;
+            observed_capture_stats = (attempts, empty, capture_total);
+            let status = pump.state();
+            let packet = pump
+                .take_latest()
+                .filter(|packet| packet.revision == wanted.revision);
+            if let Some(packet) = packet {
+                metrics
+                    .capture_to_encode
+                    .record(packet.frame.captured.elapsed());
+                (Some(packet.frame), packet.state)
+            } else {
+                (None, status)
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (captured, capture_state) = {
+            let wait_ms = ((1000.0 / f64::from(wanted.fps)).round() as u32).max(1);
+            let captured = desktop.as_mut().context("缺少采集源")?.next(
+                wait_ms,
+                wanted.quality,
+                wanted.cursor_capture,
+                wanted.color.is_hdr(),
+                wanted.maximum,
+            );
+            metrics.capture.record(capture_started.elapsed());
+            (captured?, desktop.as_ref().context("缺少采集源")?)
+        };
         *lock(&pointer) = capture_state.cursor.clone();
         if generation != capture_state.generation {
             generation = capture_state.generation;
@@ -334,9 +732,9 @@ pub(super) fn capture_loop(
             state.capturing = true;
             changed
         });
-        handle.source(&screen, capture_state.backend_name());
+        handle.source(&screen, &capture_backend_name(&capture_state));
         if wanted.color.is_hdr()
-            != (requested_hdr && capture_state.hdr_available() && wanted.format.depth == 10)
+            != (requested_hdr && capture_state.hdr_available && wanted.format.depth == 10)
         {
             // Capture recovery or source refresh changed the effective format.
             // Rebuild preprocessing/encoder before admitting this frame.
@@ -363,7 +761,10 @@ pub(super) fn capture_loop(
                 frame
             }
             None => {
-                metrics.empty_captures += 1;
+                #[cfg(not(target_os = "linux"))]
+                {
+                    metrics.empty_captures += 1;
+                }
                 let Some(mut frame) = cached.clone() else {
                     continue;
                 };
@@ -391,7 +792,7 @@ pub(super) fn capture_loop(
             continue;
         }
         let size = output_size(frame.width, frame.height, wanted.quality);
-        let source_device = &desktop.as_ref().context("缺少采集源")?.device;
+        let source_device = &capture_state.device;
         // NVENC owns a separate D3D11 context even on the capture adapter.
         // Transfer explicitly orders capture/preprocessing before encoding,
         // instead of relying on NVENC's handling of the capture context.
@@ -443,7 +844,7 @@ pub(super) fn capture_loop(
                         active.implementation(),
                         active.maximum_size(),
                         &screen,
-                        desktop.as_ref().context("缺少采集源")?.backend_name(),
+                        &capture_backend_name(&capture_state),
                     );
                     current = Some((size, (candidate_id, wanted.color)));
                     frame_metadata.clear();
@@ -506,7 +907,7 @@ pub(super) fn capture_loop(
                         created.implementation(),
                         created.maximum_size(),
                         &screen,
-                        desktop.as_ref().context("缺少采集源")?.backend_name(),
+                        &capture_backend_name(&capture_state),
                     );
                     Some(created)
                 }
@@ -692,7 +1093,7 @@ pub(super) fn capture_loop(
                 format: wanted.format,
                 budget_size,
                 encoder: Some(candidate.capability.backend),
-                capture: desktop.as_ref().map_or("DXGI", |d| d.backend_name()).into(),
+                capture: capture_backend_name(&capture_state),
             };
             publication.send_if_modified(|old| {
                 if *old != state {

@@ -93,6 +93,10 @@ struct Shm {
     swap: bool,
 }
 
+// SAFETY: the mapping and Wayland proxies are exclusively owned by Desktop;
+// moving that owner to the capture thread does not share the raw mapping.
+unsafe impl Send for Shm {}
+
 impl Shm {
     fn matches(&self, format: u32, width: u32, height: u32, stride: u32) -> bool {
         self.format == format

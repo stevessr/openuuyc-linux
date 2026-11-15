@@ -9,9 +9,12 @@ pub(super) struct Stage {
 }
 impl Stage {
     pub fn record(&mut self, elapsed: Duration) {
-        self.count += 1;
-        self.total += elapsed;
-        self.maximum = self.maximum.max(elapsed);
+        self.record_batch(1, elapsed, elapsed);
+    }
+    pub fn record_batch(&mut self, count: u64, total: Duration, maximum: Duration) {
+        self.count = self.count.saturating_add(count);
+        self.total += total;
+        self.maximum = self.maximum.max(maximum);
     }
     fn average_ms(&self) -> f64 {
         self.total.as_secs_f64() * 1000.0 / self.count.max(1) as f64
@@ -24,6 +27,7 @@ impl Stage {
 pub(super) struct Metrics {
     started: Instant,
     pub capture: Stage,
+    pub capture_to_encode: Stage,
     pub transfer: Stage,
     pub rate: Stage,
     pub encode: Stage,
@@ -34,12 +38,14 @@ pub(super) struct Metrics {
     pub admission_drops: u64,
     pub transfer_busy: u64,
     pub backpressure_waits: u64,
+    pub capture_replaced: u64,
 }
 impl Default for Metrics {
     fn default() -> Self {
         Self {
             started: Instant::now(),
             capture: Stage::default(),
+            capture_to_encode: Stage::default(),
             transfer: Stage::default(),
             rate: Stage::default(),
             encode: Stage::default(),
@@ -50,6 +56,7 @@ impl Default for Metrics {
             admission_drops: 0,
             transfer_busy: 0,
             backpressure_waits: 0,
+            capture_replaced: 0,
         }
     }
 }
@@ -73,7 +80,10 @@ impl Metrics {
                 admission_drops = self.admission_drops,
                 transfer_busy = self.transfer_busy,
                 backpressure_waits = self.backpressure_waits,
+                capture_replaced = self.capture_replaced,
                 capture_avg_ms = self.capture.average_ms(),
+                capture_to_encode_avg_ms = self.capture_to_encode.average_ms(),
+                capture_to_encode_max_ms = self.capture_to_encode.maximum_ms(),
                 capture_max_ms = self.capture.maximum_ms(),
                 transfer_avg_ms = self.transfer.average_ms(),
                 transfer_max_ms = self.transfer.maximum_ms(),

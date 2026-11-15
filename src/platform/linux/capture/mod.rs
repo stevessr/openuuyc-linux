@@ -937,6 +937,13 @@ fn scale_row(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_is_send_for_latest_frame_handoff() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::Frame>();
+        assert_send::<super::Desktop>();
+    }
+
     use super::{Kind, consent_needed, scale, usable};
 
     #[test]

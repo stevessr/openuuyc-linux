@@ -47,6 +47,10 @@ pub(super) struct Device {
     bo_get_modifier: GbmBoGetModifier,
 }
 
+// SAFETY: GBM handles are moved with the uniquely owned capture Desktop; no
+// other thread uses them, and libgbm permits destruction from the owner thread.
+unsafe impl Send for Device {}
+
 impl Device {
     /// Opens the first render node that yields a GBM device, or the one whose
     /// PCI address matches `pci_bus` when a CUDA device has to import the
@@ -230,6 +234,10 @@ pub(super) struct Buffer {
     offset: u32,
     modifier: u64,
 }
+
+// SAFETY: the buffer object and its exported fd are uniquely owned and only
+// touched by the capture thread that owns the Desktop.
+unsafe impl Send for Buffer {}
 
 impl Buffer {
     pub(super) fn fd(&self) -> BorrowedFd<'_> {

@@ -742,6 +742,10 @@ struct Shm {
     swap: bool,
 }
 
+// SAFETY: the mapping and Wayland proxies are exclusively owned by Desktop;
+// moving that owner to the capture thread does not share the raw mapping.
+unsafe impl Send for Shm {}
+
 impl Shm {
     fn pixels(&self) -> &[u8] {
         // Safe because the mapping is live for as long as self is, and the
