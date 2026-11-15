@@ -130,13 +130,15 @@ impl Api {
                 nv::NV_ENC_TUNING_INFO(0),
             )
         } else {
-            // AV1 benefits from P3; AVC/HEVC retain P1's lower encode cost.
-            // Quality tiers change rate/size, never switch to latency-tolerant HQ.
+            // P1 is the driver's fastest, softest preset: at the bitrates a
+            // remote link affords it is the visible blur. The ULTRA_LOW_LATENCY
+            // tuning already removes lookahead and B-frames, so P4 (AVC/HEVC)
+            // and P3 (AV1) buy sharper frames without adding a frame of delay.
             (
                 if codec == Codec::Av1 {
                     nv::NV_ENC_PRESET_P3_GUID
                 } else {
-                    nv::NV_ENC_PRESET_P1_GUID
+                    nv::NV_ENC_PRESET_P4_GUID
                 },
                 nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
             )
