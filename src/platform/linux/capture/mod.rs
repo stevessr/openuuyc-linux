@@ -265,7 +265,10 @@ fn wayland_screens(layout: &crate::platform::CompositorLayout) -> Result<Vec<Scr
             left: output.left,
             top: output.top,
             primary: found.is_empty(),
-            fps: 60,
+            // The compositor layout does not expose mode refresh. Do not turn
+            // "unknown" into a false 60 Hz capture ceiling; negotiated source
+            // damage and encoder capability still bound actual output.
+            fps: 165,
             dpi_scale: None,
             hdr: false,
             adapter: 0,
@@ -1277,6 +1280,10 @@ mod screen_fallback_tests {
         assert_eq!(screens[0].left, -1920);
         assert_eq!(screens[0].width, 1920);
         assert_eq!(screens[0].identity.as_deref(), Some("x11/DP-1"));
+        assert_eq!(
+            screens[0].fps, 165,
+            "unknown compositor mode must not cap high refresh"
+        );
         assert!(!screens[0].hdr);
     }
     #[test]

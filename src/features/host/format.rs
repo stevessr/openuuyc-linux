@@ -13,6 +13,28 @@ pub(crate) struct Choice {
     pub fps: u32,
     hardware_decode: bool,
 }
+fn next_fps_tier(fps: u32) -> u32 {
+    match fps {
+        145.. => 144,
+        121..=144 => 120,
+        91..=120 => 90,
+        61..=90 => 60,
+        31..=60 => 30,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod fps_tier_tests {
+    #[test]
+    fn fallback_preserves_144_and_120_tiers() {
+        assert_eq!(super::next_fps_tier(165), 144);
+        assert_eq!(super::next_fps_tier(144), 120);
+        assert_eq!(super::next_fps_tier(120), 90);
+        assert_eq!(super::next_fps_tier(30), 0);
+    }
+}
+
 impl Choice {
     pub fn maximum_for(&self, requested: Option<(u32, u32)>) -> (u32, u32) {
         // S543710: a complete RPC pair replaces the initial PB decoder size.
@@ -362,12 +384,7 @@ impl Negotiated {
                         selected = Some((choice, fps, maximum, color));
                         break 'color;
                     }
-                    fps = match fps {
-                        144.. => 90,
-                        90..=143 => 60,
-                        60..=89 => 30,
-                        _ => 0,
-                    };
+                    fps = next_fps_tier(fps);
                 }
             }
         }

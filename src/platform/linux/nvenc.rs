@@ -127,6 +127,52 @@ mod tests {
     use super::*;
 
     /// Needs an NVIDIA GPU: `cargo test -- --ignored nvenc_colour`.
+    /// Sustained device test including a full 2560x1600 BGRA upload per frame.
+    /// Run cargo test --lib nvenc_sustains_144fps -- --ignored --nocapture.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU; measures 144 fps upload+encode throughput"]
+    fn nvenc_sustains_144fps_at_2560x1600() {
+        let context = super::super::cuda::display_context().unwrap();
+        let (width, height) = (2560u32, 1600u32);
+        let rate = Rate {
+            target: 80_000_000,
+            peak: 80_000_000,
+            fps: 144,
+            quality: 4,
+            quality_target: crate::media::encoding::QualityTarget {
+                bitrate: 80_000_000,
+                fps: 144,
+            },
+        };
+        let pixels = Arc::new(vec![0x70u8; (width * height * 4) as usize]);
+        let image = Image::Cpu {
+            pixels,
+            width,
+            height,
+        };
+        let mut encoder = Encoder::new(
+            &context,
+            (width, height),
+            crate::media::encoding::Format::AVC,
+            rate,
+        )
+        .unwrap();
+        let frames = 360u32;
+        let started = std::time::Instant::now();
+        for index in 0..frames {
+            let timestamp = i64::from(index) * (10_000_000 / 144);
+            let encoded = encoder.encode(&image, timestamp, index == 0).unwrap();
+            assert_eq!(encoded.len(), 1, "unexpected delayed output");
+        }
+        let elapsed = started.elapsed();
+        let achieved = f64::from(frames) / elapsed.as_secs_f64();
+        println!("144Hz NVENC 2560x1600: {frames} frames / {elapsed:?} = {achieved:.1} fps");
+        assert!(
+            achieved >= 144.0,
+            "NVENC path reached only {achieved:.1} fps"
+        );
+    }
+
     /// NVENC converts the BGRA input itself; its matrix and range must be the
     /// ones the stream's VUI declares (BT.601, limited range for SDR).
     #[test]
