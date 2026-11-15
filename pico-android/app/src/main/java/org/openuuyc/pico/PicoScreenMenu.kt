@@ -28,12 +28,12 @@ internal object PicoScreenMenu {
         // the list scrolls inside a bounded height so title and 刷新列表 stay visible.
         val listHeight=minOf(screens.size*rowHeight,run {
             val location=IntArray(2);anchor.getLocationOnScreen(location)
-            // Leave room for the anchor, the "远端屏幕" title, the 刷新列表 button and the panel padding.
+            // Leave room for the anchor, the "远端屏幕/窗口" title, the 刷新列表 button and the panel padding.
             val belowAnchor=metrics.heightPixels-location[1]-anchor.height-dp(150)
             minOf(belowAnchor,(metrics.heightPixels*0.62f).toInt()).coerceAtLeast(rowHeight*3)
         })
         root.addView(TextView(activity).apply {
-            text=if(screens.size*rowHeight>listHeight) "远端屏幕 · 共 ${screens.size} 个，可上下滑动" else "远端屏幕"
+            text=if(screens.size*rowHeight>listHeight) "远端屏幕/窗口 · 共 ${screens.size} 个，可上下滑动" else "远端屏幕/窗口"
             textSize=18f;setTextColor(PicoTheme.TEXT);setPadding(dp(8),0,0,dp(10))
         })
         if(screens.isEmpty()) root.addView(TextView(activity).apply { text="尚未收到屏幕列表";setTextColor(PicoTheme.MUTED) })

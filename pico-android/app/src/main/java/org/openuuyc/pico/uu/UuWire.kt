@@ -419,9 +419,13 @@ internal object UuWire {
                     val r = Reader(packed); val numbers = mutableListOf<Int>(); while (!r.done()) numbers.add(r.long().toInt()); numbers
                 }.orEmpty()
             }.filter { it in 50..500 }.distinct()
+            // OpenUUYC private extension (PbScreen.openuuyc_device, tag 101). Official
+            // controllers ignore it; without it the screen stays a plain display.
+            val device = f.data(101)?.let(::fields)
             UuRemoteScreen(f.number(1).toInt(), f.number(12).toInt(), f.data(10)?.toString(Charsets.UTF_8).orEmpty(),
                 f.number(2, 60).toInt(), mode(f.data(4)), f[3].orEmpty().mapNotNull { mode(it.data) }.distinct(),
-                dpiInfo?.number(1)?.toInt() ?: 0, dpis, f.number(5).toInt())
+                dpiInfo?.number(1)?.toInt() ?: 0, dpis, f.number(5).toInt(),
+                device?.data(2)?.toString(Charsets.UTF_8).orEmpty(), device?.number(3)?.toInt() ?: 0)
         }}.filter { it.id >= 0 && it.track in -1..4 }
         val simple = rootFields.data(3)?.let(::fields)
         val flags = simple?.data(4)?.let(::fields)

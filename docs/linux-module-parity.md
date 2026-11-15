@@ -109,6 +109,23 @@ GetImage），窗口作为普通 `Screen` 条目（identity `x11-window/<XID>`�
 矩形（每帧更新），目录快照只作兜底；X11 的矩形在 X 像素空间，Wayland 的
 在合成器逻辑空间，各走各的注入路径。
 
+### 窗口独立设备上报
+
+被控端设置新增 `window_device`（「窗口独立设备」，默认关闭，持久化在
+`features/host/settings.rs` 的 Record）。开启后，`publisher::screen_states`
+只对 `Screen::is_window_source()`（identity 前缀 `x11-window/` 或
+`wl-window/`）的条目写 OpenUUYC 私有字段 `PbScreen.openuuyc_device`
+（tag 101；`PbScreenDevice{version=1,name="应用窗口",kind=1}`）。显示器不写该
+字段；官方主控忽略未知字段，行为不变。
+
+主控端（Rust 播放器与 PICO）解析该字段后，把窗口源标签显示为
+「应用窗口 · 窗口标题」，独立窗口标题也使用该标签；普通屏、虚拟屏、超级屏
+标签不变。该字段只影响展示与分组，screen id、视频轨、输入注入和官方互通
+均不变。开关关闭时不发字段，等同于旧行为。
+
+边界：只做展示/分组，不是第二台真实设备，也不建立独立账号设备或独立会话；
+官方 UU 主控不会显示这个分组。
+
 ## 窗口级取流（Wayland）
 
 Wayland 侧新增 `capture/wlr_window.rs`：绑定 `ext_foreign_toplevel_list_v1`

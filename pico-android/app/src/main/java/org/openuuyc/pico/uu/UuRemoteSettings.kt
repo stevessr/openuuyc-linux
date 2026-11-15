@@ -7,8 +7,14 @@ internal data class UuDisplayMode(val width: Int, val height: Int) {
 }
 internal data class UuRemoteScreen(
     val id: Int, val track: Int, val name: String, val fps: Int,
-    val current: UuDisplayMode?, val modes: List<UuDisplayMode>, val dpi: Int, val dpis: List<Int>, val screenType: Int = 0
-) { override fun toString() = name.ifBlank { "屏幕 ${id + 1}" } }
+    val current: UuDisplayMode?, val modes: List<UuDisplayMode>, val dpi: Int, val dpis: List<Int>, val screenType: Int = 0,
+    // OpenUUYC private screen tag 101: kind == 1 means an independent window device.
+    val deviceName: String = "", val deviceKind: Int = 0
+) {
+    override fun toString() = if (deviceKind == 1 && deviceName.isNotBlank()) {
+        "$deviceName · ${name.ifBlank { "窗口 ${id + 1}" }}"
+    } else name.ifBlank { "屏幕 ${id + 1}" }
+}
 internal data class UuCaptureSettings(
     val fps: Int = 60, val quality: Int = 5, val bitrateMbps: Int = 30,
     val codec: Int = 0, val cursor: Boolean = true, val maxWidth: Int = 1920, val maxHeight: Int = 1080
