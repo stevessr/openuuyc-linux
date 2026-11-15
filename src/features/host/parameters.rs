@@ -94,8 +94,18 @@ pub(crate) fn fixed(
     size: (u32, u32),
     fps: u32,
 ) -> Bounds {
+    let standard = standard(format, quality, size, fps);
     if quality != 6 {
-        return standard(format, quality, size, fps);
+        // A preset quality carries a requested rate as well: the controller
+        // asks for 8 Mbps at "normal" while the preset anchor allows 3.3, and
+        // dropping that request starved the encoder. The anchor stays a floor,
+        // never a ceiling the controller asked to raise.
+        let ceiling = if custom == 0 {
+            standard.maximum
+        } else {
+            standard.maximum.max(custom.clamp(1_000_000, 500_000_000))
+        };
+        return Bounds::video(ceiling);
     }
     Bounds::video(custom.clamp(1_000_000, 500_000_000))
 }
@@ -253,6 +263,24 @@ impl WindowAdmission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_preset_quality_still_honours_a_higher_requested_rate() {
+        // The controller asked for 8 Mbps at preset quality 2 while the AVC
+        // anchor alone allows 8 at 60 FPS for 1080p, so a higher request has to
+        // raise the ceiling instead of being dropped.
+        let anchored = fixed(Format::AVC, 2, 0, (1920, 1080), 60).maximum;
+        assert_eq!(anchored, 8_000_000);
+        assert_eq!(
+            fixed(Format::AVC, 2, 12_000_000, (1920, 1080), 60).maximum,
+            12_000_000
+        );
+        // A request below the anchor never lowers it.
+        assert_eq!(
+            fixed(Format::AVC, 2, 2_000_000, (1920, 1080), 60).maximum,
+            anchored
+        );
+    }
 
     #[test]
     fn higher_default_auto_tier_still_downgrades_when_link_is_weak() {
