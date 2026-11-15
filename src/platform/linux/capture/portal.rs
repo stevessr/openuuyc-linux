@@ -301,7 +301,7 @@ impl Grab {
                 .open_pipe_wire_remote(&session.session, OpenPipeWireRemoteOptions::default()),
         )
         .context("无法打开屏幕共享的 PipeWire 连接")?;
-        let stream = Stream::connect(fd, node)?;
+        let stream = Stream::connect(fd, node, screen.fps)?;
         Ok(Self { stream, session })
     }
 

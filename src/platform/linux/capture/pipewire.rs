@@ -322,7 +322,11 @@ impl Pod {
     }
 }
 
-fn enum_format() -> Pod {
+fn framerate_choice(fps: u32) -> [u32; 6] {
+    [fps.clamp(1, 1000), 1, 1, 1, 1000, 1]
+}
+
+fn enum_format(fps: u32) -> Pod {
     Pod::object(OBJECT_FORMAT, PARAM_ENUM_FORMAT, |p| {
         p.key(FORMAT_MEDIA_TYPE);
         p.value(TYPE_ID, &[MEDIA_TYPE_VIDEO]);
@@ -361,12 +365,12 @@ fn enum_format() -> Pod {
             &[1920, 1080, 1, 1, 16384, 16384],
         );
         p.key(FORMAT_VIDEO_FRAMERATE);
-        p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &[60, 1, 0, 1, 1000, 1]);
+        p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &framerate_choice(fps));
     })
 }
 
 /// The shared-memory format offer, used when the compositor will not do DMA-BUF.
-fn enum_format_shm() -> Pod {
+fn enum_format_shm(fps: u32) -> Pod {
     Pod::object(OBJECT_FORMAT, PARAM_ENUM_FORMAT, |p| {
         p.key(FORMAT_MEDIA_TYPE);
         p.value(TYPE_ID, &[MEDIA_TYPE_VIDEO]);
@@ -387,7 +391,7 @@ fn enum_format_shm() -> Pod {
             &[1920, 1080, 1, 1, 16384, 16384],
         );
         p.key(FORMAT_VIDEO_FRAMERATE);
-        p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &[60, 1, 0, 1, 1000, 1]);
+        p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &framerate_choice(fps));
     })
 }
 
@@ -1095,7 +1099,7 @@ unsafe impl Send for Stream {}
 
 impl Stream {
     /// Connect to `node` on the PipeWire remote behind `fd` (from the portal).
-    pub fn connect(fd: std::os::fd::OwnedFd, node: u32) -> Result<Self> {
+    pub fn connect(fd: std::os::fd::OwnedFd, node: u32, fps: u32) -> Result<Self> {
         use std::os::fd::IntoRawFd;
         let api = api()?;
         let shared = Arc::new(Shared {
@@ -1187,9 +1191,9 @@ impl Stream {
                 // it can serve, so the DMA-BUF enumeration leads and the
                 // shared-memory one keeps Mutter and KWin working unchanged.
                 let mut formats = if dmabuf_requested() {
-                    vec![enum_format().aligned(), enum_format_shm().aligned()]
+                    vec![enum_format(fps).aligned(), enum_format_shm(fps).aligned()]
                 } else {
-                    vec![enum_format_shm().aligned()]
+                    vec![enum_format_shm(fps).aligned()]
                 };
                 let mut params: Vec<*const c_void> = formats
                     .iter_mut()
@@ -1326,6 +1330,13 @@ mod tests {
     }
 
     #[test]
+    fn high_refresh_preference_is_offered_to_pipewire() {
+        assert_eq!(framerate_choice(165), [165, 1, 1, 1, 1000, 1]);
+        assert_eq!(framerate_choice(144), [144, 1, 1, 1, 1000, 1]);
+        assert_eq!(framerate_choice(0), [1, 1, 1, 1, 1000, 1]);
+    }
+
+    #[test]
     fn enum_format_parses_back() {
         // A fixed format written the way enum_format writes a choice's first
         // element must be read by parse_format.
@@ -1347,7 +1358,7 @@ mod tests {
                 modifier: None
             })
         );
-        let choices = enum_format().aligned();
+        let choices = enum_format(144).aligned();
         let size = unsafe { choices.as_ptr().cast::<u32>().read() } as usize;
         assert_eq!((size + 8) % 8, 0);
     }

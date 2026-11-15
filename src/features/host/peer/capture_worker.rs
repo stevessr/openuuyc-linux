@@ -94,6 +94,8 @@ struct CapturePump {
 #[cfg(all(test, target_os = "linux"))]
 mod capture_pump_tests {
     use super::{CaptureConfig, CapturePump, capture, encoder, replace_latest};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -158,13 +160,103 @@ mod capture_pump_tests {
             gpu_frames: false,
             epoch: 0,
         });
+        // A one-pixel XWayland test patch changes every 165Hz period. This is
+        // opt-in only; it verifies screencopy under known continuous damage.
+        let stimulus_stop = Arc::new(AtomicBool::new(false));
+        let stop_stimulus = stimulus_stop.clone();
+        let output = screen.clone();
+        let stimulus_updates = Arc::new(AtomicU64::new(0));
+        let count_stimulus = stimulus_updates.clone();
+        let stimulus = std::thread::spawn(move || {
+            use x11rb::connection::Connection as _;
+            use x11rb::protocol::xproto::{
+                ChangeGCAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, Rectangle,
+                WindowClass,
+            };
+            let (connection, screen_num) = x11rb::connect(None).expect("connect XWayland");
+            let root = &connection.setup().roots[screen_num];
+            let window = connection.generate_id().expect("window id");
+            let gc = connection.generate_id().expect("graphics context id");
+            let x = output.left.saturating_add(8).clamp(0, i16::MAX as i32) as i16;
+            let y = output.top.saturating_add(8).clamp(0, i16::MAX as i32) as i16;
+            connection
+                .create_window(
+                    root.root_depth,
+                    window,
+                    root.root,
+                    x,
+                    y,
+                    256,
+                    256,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    root.root_visual,
+                    &CreateWindowAux::new()
+                        .background_pixel(root.black_pixel)
+                        .override_redirect(1),
+                )
+                .expect("create damage stimulus");
+            connection
+                .create_gc(gc, window, &CreateGCAux::new().foreground(root.black_pixel))
+                .expect("create stimulus GC");
+            connection.map_window(window).expect("map stimulus");
+            connection.flush().expect("show stimulus");
+            let began = std::time::Instant::now();
+            let mut tick = 0u64;
+            while !stop_stimulus.load(Ordering::Acquire) {
+                let color = if tick & 1 == 0 {
+                    root.white_pixel
+                } else {
+                    root.black_pixel
+                };
+                connection
+                    .change_gc(gc, &ChangeGCAux::new().foreground(color))
+                    .expect("change GC");
+                connection
+                    .poly_fill_rectangle(
+                        window,
+                        gc,
+                        &[Rectangle {
+                            x: 0,
+                            y: 0,
+                            width: 256,
+                            height: 256,
+                        }],
+                    )
+                    .expect("paint damage stimulus");
+                connection.flush().expect("flush damage stimulus");
+                tick += 1;
+                count_stimulus.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(
+                    (began + Duration::from_secs_f64(tick as f64 / 165.0))
+                        .saturating_duration_since(std::time::Instant::now()),
+                );
+            }
+            connection.free_gc(gc).expect("free stimulus GC");
+            connection.destroy_window(window).expect("remove stimulus");
+            connection.flush().expect("flush stimulus removal");
+        });
         let started = std::time::Instant::now();
         let mut frames = 0u64;
         let mut encoded = 0u64;
+        let mut distinct_images = 0u64;
+        let mut previous_hash = None::<u64>;
         let mut encode_time = Duration::ZERO;
         while started.elapsed() < Duration::from_secs(4) {
             if let Some(packet) = pump.take_latest().filter(|p| p.revision == 1) {
                 frames += 1;
+                if let Ok(pixels) = packet.frame.image.pixels() {
+                    let mut hash = 0xcbf29ce484222325u64;
+                    for (index, byte) in pixels.iter().enumerate() {
+                        if index % 64 == 0 {
+                            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+                        }
+                    }
+                    if previous_hash.is_some_and(|previous| previous != hash) {
+                        distinct_images += 1;
+                    }
+                    previous_hash = Some(hash);
+                }
                 let begin = std::time::Instant::now();
                 encoded += encoder
                     .encode(&packet.frame.image, frames as i64 * 69_444, false)
@@ -176,10 +268,13 @@ mod capture_pump_tests {
             }
         }
         let elapsed = started.elapsed().as_secs_f64();
+        stimulus_stop.store(true, Ordering::Release);
+        stimulus.join().expect("stimulus thread");
         let (attempts, _empty, capture_time, capture_max) = pump.stats();
         println!(
-            "live 144Hz pipeline source_fps_cap={} polls={attempts} captured={frames} encoded={encoded} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} encode_avg_ms={:.2}",
+            "live 144Hz pipeline source_fps_cap={} stimulus_updates={} polls={attempts} captured={frames} encoded={encoded} distinct_images={distinct_images} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} encode_avg_ms={:.2}",
             screen.fps,
+            stimulus_updates.load(Ordering::Relaxed),
             frames as f64 / elapsed,
             encoded as f64 / elapsed,
             capture_time.as_secs_f64() * 1000.0 / attempts.max(1) as f64,
