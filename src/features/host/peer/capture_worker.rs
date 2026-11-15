@@ -479,6 +479,20 @@ pub(super) fn capture_loop(
         }
         wanted.maximum = candidate.maximum_for(wanted.requested_maximum);
         wanted.fps = wanted.fps.min(candidate.fps).min(screen.fps).max(1);
+        if changed {
+            tracing::info!(
+                requested_fps = wanted.requested_fps,
+                configured_fps = wanted.fps,
+                configured_limit = wanted.fps_limit,
+                monitor_fps_cap = screen.fps,
+                encoder_fps_cap = candidate.fps,
+                negotiated_maximum_fps = wanted.maximum_fps,
+                width = wanted.maximum.0,
+                height = wanted.maximum.1,
+                ?candidate.capability.backend,
+                "host frame rate negotiated"
+            );
+        }
         metrics.report(wanted.fps, screen.adapter, candidate.capability.adapter);
         let period = Duration::from_secs_f64(1.0 / f64::from(wanted.fps));
         if paced_fps != wanted.fps {
