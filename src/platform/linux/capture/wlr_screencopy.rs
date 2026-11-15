@@ -206,6 +206,10 @@ struct State {
     /// How long the last frame waited for the compositor, and how long its
     /// pixels took to leave the mapping. Read by the live session test.
     timings: (Duration, Duration),
+    // Diagnostic: use plain copy instead of copy_with_damage. A damage-gated
+    // copy only answers when the output changed, which caps delivery at the
+    // rate the compositor chooses to consider damaged.
+    plain_copy: bool,
     // When the frame in flight was requested and when its copy was submitted,
     // so the two halves of the protocol round trip can be told apart.
     requested_at: Option<Instant>,
@@ -223,6 +227,7 @@ impl Grab {
         connection.display().get_registry(&handle, ());
         let mut state = State {
             connection: Some(connection),
+            plain_copy: false,
             ..Default::default()
         };
         queue
@@ -319,6 +324,14 @@ impl Grab {
     /// straight into it instead of the caller scaling on the CPU.
     pub fn set_target(&mut self, target: Option<(i32, (u32, u32))>) {
         self.state.target = target;
+    }
+
+    // Copies immediately instead of waiting for output damage. Worth it while
+    // the desktop is changing, where a damage-gated copy can withhold ready
+    // for more than an output period; wasteful on a still desktop, where the
+    // caller switches back to the damage-gated request.
+    pub fn set_plain_copy(&mut self, on: bool) {
+        self.state.plain_copy = on;
     }
 
     /// How long the last frame waited and how long reading it from the
@@ -945,7 +958,11 @@ impl State {
         }
         self.copied_at = Some(Instant::now());
         if let Some(frame) = &self.frame {
-            frame.copy_with_damage(&shm.buffer);
+            if self.plain_copy {
+                frame.copy(&shm.buffer);
+            } else {
+                frame.copy_with_damage(&shm.buffer);
+            }
         }
         Ok(())
     }

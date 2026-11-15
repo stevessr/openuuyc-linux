@@ -582,6 +582,14 @@ impl Desktop {
         }
     }
 
+    // Whether a changing desktop should be copied immediately instead of
+    // waiting for output damage. Ignored by backends without that choice.
+    pub(crate) fn set_plain_copy(&mut self, on: bool) {
+        if let Backend::Wlr(grab) = &mut self.backend {
+            grab.set_plain_copy(on);
+        }
+    }
+
     pub fn next(
         &mut self,
         timeout: u32,

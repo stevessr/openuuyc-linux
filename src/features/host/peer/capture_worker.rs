@@ -80,6 +80,34 @@ struct CaptureSlot {
     wlr_stage_b: Duration,
 }
 
+/// Whether a frame differs from the previous one, judged from a strided
+/// sample of its pixels. A few kilobytes are read per frame, which is enough
+/// to tell a moving desktop from a still one without comparing 16 MiB.
+#[cfg(target_os = "linux")]
+fn sampled_change(previous: &mut Option<Vec<u8>>, pixels: &[u8], width: u32, height: u32) -> bool {
+    // Whole rows, spread over the frame: a small moving window spans many rows,
+    // while a scatter of byte windows would step right over it. A hundred rows
+    // of a 2560-wide picture are about 1 MB, which costs well under a
+    // millisecond and only decides which copy request to send.
+    const ROWS: usize = 100;
+    let row = width as usize * 4;
+    let lines = height as usize;
+    if row == 0 || lines == 0 || pixels.len() < row * lines {
+        return false;
+    }
+    let step = (lines / ROWS).max(1);
+    let mut current = Vec::with_capacity(ROWS * row);
+    for line in (0..lines).step_by(step).take(ROWS) {
+        let start = line * row;
+        current.extend_from_slice(&pixels[start..start + row]);
+    }
+    let changed = previous
+        .as_ref()
+        .is_none_or(|old| old.len() != current.len() || old != &current);
+    *previous = Some(current);
+    changed
+}
+
 /// Replaces an old frame instead of queueing it. A slow encoder should see the
 /// newest desktop image, not build latency by draining an old FIFO.
 #[cfg(target_os = "linux")]
@@ -103,6 +131,28 @@ mod capture_pump_tests {
     use super::{CaptureConfig, CapturePump, capture, encoder, replace_latest};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn the_change_sample_notices_a_small_moving_area() {
+        use super::sampled_change;
+        let (width, height) = (640u32, 400u32);
+        let row = width as usize * 4;
+        let frame = vec![0u8; row * height as usize];
+        let mut previous = None;
+        assert!(sampled_change(&mut previous, &frame, width, height));
+        assert!(!sampled_change(&mut previous, &frame, width, height));
+        // A 40x40 patch is smaller than one sampled row's step but spans rows,
+        // which is why whole rows are compared rather than byte windows.
+        let mut changed = frame.clone();
+        for y in 100..140 {
+            for x in 100..140 {
+                changed[y * row + x * 4] = 0xff;
+            }
+        }
+        assert!(sampled_change(&mut previous, &changed, width, height));
+        // A geometry change cannot be compared against the old sample.
+        assert!(!sampled_change(&mut previous, &frame[..row], width, height));
+    }
 
     #[test]
     fn a_slow_consumer_never_accumulates_a_fifo() {
@@ -337,6 +387,9 @@ impl CapturePump {
             .name("openuuyc-capture".into())
             .spawn(move || {
                 let mut next = Instant::now();
+                let mut sample: Option<Vec<u8>> = None;
+                let mut last_change: Option<Instant> = None;
+                let mut plain_copy = false;
                 while !thread_stop.load(Ordering::Acquire) {
                     let cfg = *lock(&thread_control);
                     if !cfg.enabled {
@@ -359,6 +412,18 @@ impl CapturePump {
                         next + period
                     };
                     desktop.set_gpu_frames(cfg.gpu_frames);
+                    // A damage-gated copy withholds ready until the output
+                    // changes, which caps delivery below the refresh rate while
+                    // the desktop moves; an immediate copy keeps up but copies
+                    // every frame even when nothing changed. Switch on a sampled
+                    // comparison, which costs a few kilobytes per frame.
+                    // While the desktop moves, copy immediately: a damage-gated
+                    // request withholds ready for more than an output period.
+                    // Once nothing has changed for half a second, go back to
+                    // the damage-gated request so a still desktop stops paying
+                    // for a full-frame copy on every poll; the next damaged
+                    // frame then switches it on again.
+                    desktop.set_plain_copy(plain_copy);
                     let started = Instant::now();
                     let result = desktop.next(
                         (period.as_millis() as u32).clamp(1, 50),
@@ -370,6 +435,19 @@ impl CapturePump {
                     let elapsed = started.elapsed();
                     let timings = desktop.last_timings();
                     let phases = desktop.last_phases();
+                    if let Ok(Some(frame)) = &result {
+                        if !plain_copy {
+                            // A damage-gated request answered, so something
+                            // changed: switch to immediate copies.
+                            last_change = Some(Instant::now());
+                        } else if let Ok(pixels) = frame.image.pixels()
+                            && sampled_change(&mut sample, &pixels, frame.width, frame.height)
+                        {
+                            last_change = Some(Instant::now());
+                        }
+                        plain_copy =
+                            last_change.is_some_and(|at| at.elapsed() < Duration::from_millis(500));
+                    }
                     let frame = match result {
                         Ok(frame) => frame,
                         Err(error) => {
