@@ -958,7 +958,9 @@ impl State {
                 .map(|(_, modifier)| *modifier)
                 .collect();
             ensure!(!modifiers.is_empty(), "合成器没有公布该格式的 modifier");
-            let device = gbm::Device::open()?;
+            // No CUDA device to match here yet: the DMA-BUF buffer is
+            // converted through VA-API, so any render node will do.
+            let device = gbm::Device::open(None)?;
             let buffer = device.allocate(width, height, format, &modifiers)?;
             let params = dmabuf.create_params(handle, ());
             // The protocol carries the modifier as two 32-bit halves.

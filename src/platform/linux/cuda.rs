@@ -38,6 +38,34 @@ impl Default for Memcpy2d {
     }
 }
 
+/// `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD`: a Linux dma-buf descriptor.
+const EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: i32 = 1;
+
+/// The handle union of `CUDA_EXTERNAL_MEMORY_HANDLE_DESC`, as wide as the
+/// largest member the driver defines on any platform (two pointers).
+#[repr(C)]
+union ExternalHandle {
+    fd: c_int,
+    _pad: [u8; 16],
+}
+
+#[repr(C)]
+struct ExternalHandleDesc {
+    kind: i32,
+    handle: ExternalHandle,
+    size: u64,
+    flags: u32,
+    reserved: [u32; 16],
+}
+
+#[repr(C)]
+struct ExternalBufferDesc {
+    offset: u64,
+    size: u64,
+    flags: u32,
+    reserved: [u32; 16],
+}
+
 struct Api {
     _library: libloading::Library,
     device_get_count: unsafe extern "C" fn(*mut c_int) -> CuResult,
@@ -53,6 +81,11 @@ struct Api {
         unsafe extern "C" fn(*mut DevicePtr, *mut usize, usize, usize, c_uint) -> CuResult,
     mem_free: unsafe extern "C" fn(DevicePtr) -> CuResult,
     memcpy_2d: unsafe extern "C" fn(*const Memcpy2d) -> CuResult,
+    import_external_memory:
+        unsafe extern "C" fn(*mut *mut c_void, *const ExternalHandleDesc) -> CuResult,
+    external_memory_mapped_buffer:
+        unsafe extern "C" fn(*mut DevicePtr, *mut c_void, *const ExternalBufferDesc) -> CuResult,
+    destroy_external_memory: unsafe extern "C" fn(*mut c_void) -> CuResult,
     get_error_string: unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResult,
 }
 
@@ -113,6 +146,9 @@ fn load() -> Result<Api> {
             mem_alloc_pitch: symbol!("cuMemAllocPitch_v2"),
             mem_free: symbol!("cuMemFree_v2"),
             memcpy_2d: symbol!("cuMemcpy2D_v2"),
+            import_external_memory: symbol!("cuImportExternalMemory"),
+            external_memory_mapped_buffer: symbol!("cuExternalMemoryGetMappedBuffer"),
+            destroy_external_memory: symbol!("cuDestroyExternalMemory"),
             get_error_string: symbol!("cuGetErrorString"),
             _library: library,
         };
@@ -288,6 +324,9 @@ pub(crate) struct Buffer {
     pub pitch: usize,
     pub width: u32,
     pub height: u32,
+    /// The imported dma-buf, when the pointer belongs to one. Its mapping is
+    /// released with the external memory object, not on its own.
+    external: Option<usize>,
 }
 
 impl Buffer {
@@ -314,6 +353,61 @@ impl Buffer {
             pitch,
             width,
             height,
+            external: None,
+        })
+    }
+
+    /// Imports a Linux dma-buf as a pitched device buffer. Nothing is copied:
+    /// the pointer addresses the memory the compositor draws into.
+    pub fn import(
+        context: &Arc<Context>,
+        fd: i32,
+        size: u64,
+        width: u32,
+        height: u32,
+        pitch: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(fd >= 0 && size > 0, "DMA-BUF 描述无效");
+        let api = context.api;
+        let _current = context.enter()?;
+        let handle = ExternalHandleDesc {
+            kind: EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+            handle: ExternalHandle { fd },
+            size,
+            flags: 0,
+            reserved: [0; 16],
+        };
+        let mut memory = std::ptr::null_mut();
+        check(
+            api,
+            unsafe { (api.import_external_memory)(&mut memory, &handle) },
+            "cuImportExternalMemory",
+        )?;
+        let buffer = ExternalBufferDesc {
+            offset: 0,
+            size,
+            flags: 0,
+            reserved: [0; 16],
+        };
+        let mut ptr = 0;
+        let mapped = check(
+            api,
+            unsafe { (api.external_memory_mapped_buffer)(&mut ptr, memory, &buffer) },
+            "cuExternalMemoryGetMappedBuffer",
+        );
+        if let Err(error) = mapped {
+            // The import succeeded, so the object has to go even though the
+            // mapping did not.
+            unsafe { (api.destroy_external_memory)(memory) };
+            return Err(error);
+        }
+        Ok(Self {
+            context: context.clone(),
+            ptr,
+            pitch,
+            width,
+            height,
+            external: Some(memory as usize),
         })
     }
 
@@ -384,6 +478,9 @@ impl Drop for Buffer {
         if let Ok(_current) = self.context.enter() {
             unsafe {
                 (api.mem_free)(self.ptr);
+                if let Some(memory) = self.external {
+                    (api.destroy_external_memory)(memory as *mut c_void);
+                }
             }
         }
     }

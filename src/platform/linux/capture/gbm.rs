@@ -48,8 +48,11 @@ pub(super) struct Device {
 }
 
 impl Device {
-    /// Opens the first render node that yields a GBM device.
-    pub(super) fn open() -> Result<Self> {
+    /// Opens the first render node that yields a GBM device, or the one whose
+    /// PCI address matches `pci_bus` when a CUDA device has to import the
+    /// buffer it allocates: a dma-buf can only be imported by the GPU that
+    /// owns it.
+    pub(super) fn open(pci_bus: Option<&str>) -> Result<Self> {
         let library = unsafe {
             Library::new("libgbm.so.1")
                 .or_else(|_| Library::new("libgbm.so"))
@@ -83,6 +86,11 @@ impl Device {
                 .context("libgbm 缺少 gbm_bo_get_modifier")?;
             let mut last = None;
             for index in 128..=135u32 {
+                if let Some(wanted) = pci_bus
+                    && !same_device(index, wanted)
+                {
+                    continue;
+                }
                 let path = format!("/dev/dri/renderD{index}");
                 let fd = match std::fs::OpenOptions::new()
                     .read(true)
@@ -178,6 +186,30 @@ impl Device {
     }
 }
 
+/// Whether a render node belongs to the PCI device `pci_bus` names.
+///
+/// CUDA reports `domain:bus:device.function` with a full 32-bit domain, sysfs
+/// names the same device with a 16-bit one, so only the trailing
+/// `bus:device.function` is compared.
+fn same_device(index: u32, pci_bus: &str) -> bool {
+    let Ok(node) = std::fs::read_link(format!("/sys/class/drm/renderD{index}/device")) else {
+        return false;
+    };
+    let Some(name) = node
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return false;
+    };
+    let tail = |value: &str| {
+        value
+            .get(value.len().saturating_sub(7)..)
+            .unwrap_or(value)
+            .to_string()
+    };
+    tail(&name) == tail(pci_bus)
+}
+
 impl Drop for Device {
     fn drop(&mut self) {
         // Safe because the device handle is still owned here.
@@ -240,7 +272,7 @@ mod tests {
     #[test]
     #[ignore = "needs a DRM render node"]
     fn a_buffer_exports_a_dmabuf() {
-        let device = Device::open().expect("gbm device");
+        let device = Device::open(None).expect("gbm device");
         let buffer = device
             .allocate(64, 64, DRM_FORMAT_XRGB8888, &[DRM_FORMAT_MOD_LINEAR])
             .expect("dmabuf");
@@ -248,5 +280,27 @@ mod tests {
         assert_eq!(buffer.format(), DRM_FORMAT_XRGB8888);
         assert!(buffer.stride() >= 64 * 4);
         assert!(buffer.raw_fd() >= 0);
+    }
+
+    #[test]
+    #[ignore = "needs a DRM render node and a CUDA device"]
+    fn a_dmabuf_imports_into_cuda() {
+        let context = crate::platform::linux::cuda::Context::shared(0).expect("cuda context");
+        let device = Device::open(Some(context.pci_bus())).expect("gbm device");
+        let (width, height) = (256u32, 128u32);
+        let buffer = device
+            .allocate(width, height, DRM_FORMAT_XRGB8888, &[DRM_FORMAT_MOD_LINEAR])
+            .expect("dmabuf");
+        let imported = crate::platform::linux::cuda::Buffer::import(
+            &context,
+            buffer.raw_fd(),
+            u64::from(buffer.stride()) * u64::from(height),
+            width,
+            height,
+            buffer.stride() as usize,
+        )
+        .expect("import");
+        assert!(imported.ptr != 0);
+        assert!(imported.pitch >= width as usize * 4);
     }
 }
