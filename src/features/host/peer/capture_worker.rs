@@ -93,7 +93,7 @@ struct CapturePump {
 
 #[cfg(all(test, target_os = "linux"))]
 mod capture_pump_tests {
-    use super::{CaptureConfig, CapturePump, capture, replace_latest};
+    use super::{CaptureConfig, CapturePump, capture, encoder, replace_latest};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -105,6 +105,88 @@ mod capture_pump_tests {
         assert!(!replace_latest(&mut slot, 2));
         assert!(replace_latest(&mut slot, 3));
         assert_eq!(slot.take(), Some(3));
+    }
+
+    /// Capture and NVENC together on the live Wayland desktop. This measures
+    /// actual damage delivery separately from the standalone encoder ceiling.
+    #[test]
+    #[ignore = "requires a Wayland session and NVIDIA NVENC"]
+    fn live_capture_and_nvenc_rate_at_144hz() {
+        use crate::features::host::format::{Backend, Color, Format};
+        use crate::media::encoding::{QualityTarget, Rate};
+
+        let screen = capture::screens()
+            .unwrap()
+            .into_iter()
+            .max_by_key(|screen| {
+                (
+                    screen.fps,
+                    u64::from(screen.width) * u64::from(screen.height),
+                )
+            })
+            .unwrap();
+        let desktop = capture::Desktop::open_selected(&screen).unwrap();
+        let size = crate::media::geometry::output_size(screen.width, screen.height, 4);
+        let device = desktop.device.clone();
+        let mut encoder = encoder::Encoder::hardware_format(
+            &device,
+            Backend::Nvidia,
+            size,
+            Format::AVC,
+            Rate {
+                target: 80_000_000,
+                peak: 80_000_000,
+                fps: 144,
+                quality: 4,
+                quality_target: QualityTarget {
+                    bitrate: 80_000_000,
+                    fps: 144,
+                },
+            },
+            Color::Sdr,
+        )
+        .unwrap();
+        let pump = CapturePump::new(desktop, Arc::new(Mutex::new(None))).unwrap();
+        pump.configure(CaptureConfig {
+            enabled: true,
+            revision: 1,
+            quality: 4,
+            maximum: (3840, 2160),
+            fps: 165,
+            cursor: false,
+            hdr: false,
+            gpu_frames: false,
+            epoch: 0,
+        });
+        let started = std::time::Instant::now();
+        let mut frames = 0u64;
+        let mut encoded = 0u64;
+        let mut encode_time = Duration::ZERO;
+        while started.elapsed() < Duration::from_secs(4) {
+            if let Some(packet) = pump.take_latest().filter(|p| p.revision == 1) {
+                frames += 1;
+                let begin = std::time::Instant::now();
+                encoded += encoder
+                    .encode(&packet.frame.image, frames as i64 * 69_444, false)
+                    .unwrap()
+                    .len() as u64;
+                encode_time += begin.elapsed();
+            } else {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let (attempts, _empty, capture_time, capture_max) = pump.stats();
+        println!(
+            "live 144Hz pipeline source_fps_cap={} polls={attempts} captured={frames} encoded={encoded} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} encode_avg_ms={:.2}",
+            screen.fps,
+            frames as f64 / elapsed,
+            encoded as f64 / elapsed,
+            capture_time.as_secs_f64() * 1000.0 / attempts.max(1) as f64,
+            capture_max.as_secs_f64() * 1000.0,
+            encode_time.as_secs_f64() * 1000.0 / encoded.max(1) as f64,
+        );
+        assert!(frames > 0 && encoded > 0);
     }
 
     /// Live end-to-end test for the producer and the overwrite policy.
