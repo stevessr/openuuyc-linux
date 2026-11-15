@@ -858,7 +858,12 @@ fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
         }
         return out;
     }
-    let mut out = vec![0u8; width * height * 4];
+    let length = width * height * 4;
+    // Every output channel, including alpha, is written by scale_row. Keeping
+    // the backing bytes uninitialized avoids clearing a full output frame only
+    // to overwrite it immediately in the row workers.
+    let mut out: Vec<std::mem::MaybeUninit<u8>> = Vec::with_capacity(length);
+    out.resize_with(length, std::mem::MaybeUninit::uninit);
     let columns = taps(source_width, width);
     let rows = taps(source_height, height);
     let row_bytes = width * 4;
@@ -890,7 +895,17 @@ fn scale(source: &[u8], from: (u32, u32), to: (u32, u32)) -> Vec<u8> {
             }
         }
     });
-    out
+    // SAFETY: the worker covers every row exactly once; scale_row writes all
+    // four channels of every output pixel before the scope joins successfully.
+    // No initialized output vector is created if a worker panics.
+    let mut initialized = std::mem::ManuallyDrop::new(out);
+    unsafe {
+        Vec::from_raw_parts(
+            initialized.as_mut_ptr().cast::<u8>(),
+            initialized.len(),
+            initialized.capacity(),
+        )
+    }
 }
 
 /// For each output position along one axis: the two source positions it
@@ -913,7 +928,7 @@ fn scale_row(
     source_width: usize,
     columns: &[(usize, usize, u32)],
     (y0, y1, fy): (usize, usize, u32),
-    line: &mut [u8],
+    line: &mut [std::mem::MaybeUninit<u8>],
 ) {
     let top_row = &source[y0 * source_width * 4..(y0 + 1) * source_width * 4];
     let bottom_row = &source[y1 * source_width * 4..(y1 + 1) * source_width * 4];
@@ -929,9 +944,9 @@ fn scale_row(
             let top = u32::from(a[channel]) * wx0 + u32::from(b[channel]) * wx1;
             let bottom = u32::from(c[channel]) * wx0 + u32::from(d[channel]) * wx1;
             let value = ((u64::from(top >> 8) * wy0 + u64::from(bottom >> 8) * wy1) >> 24) as u32;
-            pixel[channel] = value.min(255) as u8;
+            pixel[channel].write(value.min(255) as u8);
         }
-        pixel[3] = 0xff;
+        pixel[3].write(0xff);
     }
 }
 

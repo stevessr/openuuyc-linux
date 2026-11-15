@@ -768,9 +768,12 @@ pub(super) fn capture_loop(
                 let Some(mut frame) = cached.clone() else {
                     continue;
                 };
-                if last_frame.is_some_and(|at| {
-                    at.elapsed() < Duration::from_secs_f64(1.0 / f64::from(wanted.fps.min(30)))
-                }) {
+                // A static desktop needs no repeated inter frame. Keep one
+                // low-rate refresh for decoder continuity, but honor an
+                // immediate receiver keyframe request without waiting.
+                let refresh_due =
+                    last_frame.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+                if !keyframe.load(Ordering::Acquire) && !refresh_due {
                     continue;
                 }
                 frame.captured = Instant::now();
