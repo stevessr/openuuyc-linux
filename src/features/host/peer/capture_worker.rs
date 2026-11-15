@@ -119,7 +119,7 @@ mod capture_pump_tests {
             revision: 1,
             quality: 4,
             maximum: (3840, 2160),
-            fps: 60,
+            fps: 165,
             cursor: false,
             hdr: false,
             gpu_frames: false,
@@ -129,11 +129,12 @@ mod capture_pump_tests {
         let (attempts, _empty, _elapsed, _max) = pump.stats();
         let replaced = pump.replaced();
         let latest = pump.take_latest();
+        let frames = replaced + u64::from(latest.is_some());
         println!(
-            "producer_attempts={attempts} replaced={replaced} latest={}",
+            "producer_attempts={attempts} frames_delivered={frames} overwritten={replaced} latest={}",
             latest.is_some()
         );
-        assert!(attempts >= 30);
+        assert!(attempts >= 200);
         assert!(replaced > 0 || latest.is_some());
     }
 }
