@@ -16,6 +16,7 @@
 //! order.
 //!
 //! Frames are BGRA, in system memory or, from NvFBC, in CUDA device memory.
+mod gbm;
 mod nvfbc;
 mod pipewire;
 mod portal;
@@ -550,6 +551,18 @@ impl Desktop {
     }
 
     /// The next picture, or `None` when nothing changed before `timeout` ms.
+    /// Lets the capture path keep frames on the GPU.
+    ///
+    /// Only the wlroots backend has a second form: a DMA-BUF buffer that the
+    /// compositor draws into and the GPU converter turns into NV12. It is worth
+    /// switching on only when the encoder reads that surface without a
+    /// readback; otherwise the shared-memory copy is far cheaper.
+    pub(crate) fn set_gpu_frames(&mut self, on: bool) {
+        if let Backend::Wlr(grab) = &mut self.backend {
+            grab.enable_dmabuf(on);
+        }
+    }
+
     pub fn next(
         &mut self,
         timeout: u32,
@@ -595,10 +608,14 @@ impl Desktop {
         {
             self.backend = Backend::NvFbc(nvfbc::Grab::open(&self.screen, cursor, wanted)?);
         }
-        // The portal converter derives its output from each picture's own size.
-        // Hand it the current request so a controller quality that differs from
-        // the source is scaled on the GPU instead of read back to the CPU.
+        // The portal and DMA-BUF converters derive their output from each
+        // picture's own size. Hand them the current request so a controller
+        // quality that differs from the source is scaled on the GPU instead of
+        // read back to the CPU.
         if let Backend::Portal(grab) = &self.backend {
+            grab.set_target(Some((quality, maximum)));
+        }
+        if let Backend::Wlr(grab) = &mut self.backend {
             grab.set_target(Some((quality, maximum)));
         }
         self.cursor = match self.sampler.sample() {
@@ -672,19 +689,36 @@ impl Desktop {
             }
             // The compositor answers a copy request only when it next draws,
             // so a still desktop reports no picture.
-            Backend::Wlr(grab) => grab
-                .next(deadline.saturating_duration_since(Instant::now()))
-                .map(|picture| {
-                    picture.map(|picture| {
+            Backend::Wlr(grab) => {
+                match grab.next(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(Some(picture)) => {
+                        // A DMA-BUF frame already went through the GPU
+                        // converter, which produced the requested geometry.
+                        if let Some(frame) = picture.nv12 {
+                            let size = frame.size();
+                            self.available = true;
+                            self.last_size = size;
+                            return Ok(Some(Frame {
+                                width: size.0,
+                                height: size.1,
+                                image: Image::Nv12(frame),
+                                captured: Instant::now(),
+                                is_new: true,
+                                hdr_metadata: None,
+                            }));
+                        }
                         let size = output(picture.width, picture.height, quality, maximum);
                         let image = if size == (picture.width, picture.height) {
                             picture.pixels
                         } else {
                             scale(&picture.pixels, (picture.width, picture.height), size)
                         };
-                        (size, image)
-                    })
-                }),
+                        Ok(Some((size, image)))
+                    }
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
             // PipeWire only delivers a picture when the monitor changed.
             Backend::Portal(grab) => {
                 match grab.next(deadline.saturating_duration_since(Instant::now())) {
@@ -1068,6 +1102,48 @@ mod session_tests {
         }
         println!("frames: {frames} size: {size:?}");
         assert!(frames > 0);
+    }
+
+    /// Needs a Wayland session whose compositor serves `zwlr_screencopy` and a
+    /// VA-API encoder: `cargo test --lib session_tests::captures_dmabuf_frames -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn captures_dmabuf_frames() {
+        for screen in super::screens().unwrap() {
+            let mut desktop = match super::Desktop::open_selected(&screen) {
+                Ok(desktop) => desktop,
+                Err(error) => {
+                    println!("{}: open failed: {error:#}", screen.display_name);
+                    continue;
+                }
+            };
+            let backend = desktop.backend_name();
+            desktop.set_gpu_frames(true);
+            let started = std::time::Instant::now();
+            let (mut frames, mut nv12) = (0, 0);
+            while started.elapsed() < std::time::Duration::from_secs(2) {
+                if let Some(frame) = desktop.next(50, 4, false, false, (3840, 2160)).unwrap() {
+                    frames += 1;
+                    if matches!(frame.image, super::Image::Nv12(_)) {
+                        nv12 += 1;
+                    }
+                }
+            }
+            let state = match &desktop.backend {
+                super::Backend::Wlr(grab) => {
+                    let (transform, version, seen, formats, offered, buffer, failed) =
+                        grab.dmabuf_report();
+                    format!(
+                        "transform={transform:?} version={version} seen={seen} formats={formats} offered={offered} buffer={buffer} failed={failed}"
+                    )
+                }
+                _ => "n/a".into(),
+            };
+            println!(
+                "{}: backend={backend} frames={frames} nv12={nv12} {state}",
+                screen.display_name
+            );
+        }
     }
 
     /// Needs an Xorg session with a mapped window (Xvfb also works):

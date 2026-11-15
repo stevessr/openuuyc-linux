@@ -295,6 +295,13 @@ pub(super) fn capture_loop(
         } else {
             next + period
         };
+        // A DMA-BUF frame is only worth its GPU conversion when the encoder
+        // reads that surface directly; NVENC downloads it, which is far slower
+        // than the shared-memory copy it would replace.
+        let gpu_frames = matches!(encoder.as_ref(), Some(encoder::Encoder::Vaapi(..)));
+        if let Some(desktop) = desktop.as_mut() {
+            desktop.set_gpu_frames(gpu_frames);
+        }
         let captured = desktop.as_mut().context("缺少采集源")?.next(
             wait_ms,
             wanted.quality,

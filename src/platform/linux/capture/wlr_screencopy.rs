@@ -3,13 +3,16 @@
 //! asks the local user for nothing, and it needs no permission the session does
 //! not already have.
 //!
-//! Frames come back in shared memory. The protocol's other half — a dma-buf the
-//! compositor draws into — would keep the picture on the GPU, but the pixels
-//! still have to be read here for the encoder's own conversion, and a device
-//! buffer mapped into a process on the discrete GPU of this machine reads at
-//! about 85 MB/s: a 16 MB frame took 195 ms, against 1.4 ms for the same frame
-//! through shared memory. dma-buf pays off only once the conversion moves onto
-//! the GPU too, which the encoder does not do yet.
+//! Frames come back in shared memory by default. The protocol's other half — a
+//! dma-buf the compositor draws into — keeps the picture on the GPU, but only
+//! pays off when nothing reads it back: a device buffer mapped into a process
+//! on the discrete GPU of this machine reads at about 85 MB/s, so a 16 MB frame
+//! takes 195 ms against 1.4 ms through shared memory. This backend therefore
+//! asks for a dma-buf only when the encoder takes NV12 frames straight from the
+//! GPU (VA-API), and converts them there through the same EGL/VideoProc path
+//! the portal stream uses. A driver that cannot allocate or import it keeps the
+//! shared-memory path, and a rotated or flipped output stays on shared memory
+//! because the GPU conversion does not undo the transform.
 //!
 //! The compositor copies its own framebuffer, not the picture the monitor
 //! shows: a rotated or flipped output arrives sideways, and the transform
@@ -26,6 +29,7 @@
 //! and the caller scales afterwards like it does for the portal.
 use super::Picture;
 use super::Screen;
+use super::gbm;
 use anyhow::{Context, Result, bail, ensure};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
@@ -33,6 +37,9 @@ use wayland_client::backend::WaylandError;
 use wayland_client::protocol::wl_output::Transform;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
@@ -170,6 +177,28 @@ struct State {
     /// `flags` said the frame is copied upside down.
     y_invert: bool,
     error: Option<String>,
+    /// The transform the selected output advertises, kept here because the
+    /// buffer choice happens on `State`.
+    transform: Option<Transform>,
+    dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+    /// The (format, modifier) pairs the compositor says it can import.
+    dmabuf_formats: Vec<(u32, u64)>,
+    /// How many format and modifier events arrived, and at which version the
+    /// global was bound; read by the live session test.
+    dmabuf_formats_seen: usize,
+    dmabuf_version: u32,
+    /// The frame in flight offered DMA-BUF with this format and size.
+    offered: Option<(u32, u32, u32)>,
+    /// Set by the worker when the encoder takes NV12 frames without a readback.
+    gpu_frames: bool,
+    /// The buffer this grab copies into, with the device it was allocated from.
+    dma: Option<(gbm::Device, gbm::Buffer, wl_buffer::WlBuffer)>,
+    /// Whether the frame in flight was copied into `dma`.
+    dmabuf_frame: bool,
+    /// One failed attempt keeps the shared-memory path for the rest of the grab.
+    dmabuf_failed: bool,
+    /// Geometry the encoder asked for; `None` keeps the source size.
+    target: Option<(i32, (u32, u32))>,
 }
 
 impl Grab {
@@ -204,6 +233,7 @@ impl Grab {
         ensure!(state.shm.is_some(), "合成器没有提供 wl_shm");
         ensure!(!state.outputs.is_empty(), "合成器没有提供任何输出");
         let output = pick(&state.outputs, screen)?;
+        state.transform = Some(state.outputs[output].transform);
         tracing::info!(
             output = screen.device_name,
             mode = ?state.outputs[output].mode,
@@ -258,6 +288,42 @@ impl Grab {
         self.cursor
     }
 
+    /// Lets this grab copy into a DMA-BUF buffer instead of shared memory.
+    ///
+    /// Only worth it when the encoder takes the converted frame straight from
+    /// the GPU: a readback of a device buffer on a discrete GPU is far slower
+    /// than the shared-memory copy it would replace.
+    pub fn enable_dmabuf(&mut self, on: bool) {
+        // Opt-in: replacing the buffer when the output's shape changes drops
+        // the one the compositor may still be drawing into, and the live
+        // session test hits a protocol error there. The shared-memory path
+        // stays the default until that is fixed.
+        self.state.gpu_frames =
+            on && std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value != "0");
+    }
+
+    /// Sets the geometry the encoder wants; the GPU converter then scales
+    /// straight into it instead of the caller scaling on the CPU.
+    pub fn set_target(&mut self, target: Option<(i32, (u32, u32))>) {
+        self.state.target = target;
+    }
+
+    /// What the DMA-BUF path did: the output's transform, how many
+    /// (format, modifier) pairs the compositor advertised, whether the last
+    /// frame offered a buffer, whether one is allocated, and whether the path
+    /// was given up. Read by the live session test.
+    pub fn dmabuf_report(&self) -> (Option<Transform>, u32, usize, usize, bool, bool, bool) {
+        (
+            self.state.transform,
+            self.state.dmabuf_version,
+            self.state.dmabuf_formats_seen,
+            self.state.dmabuf_formats.len(),
+            self.state.offered.is_some(),
+            self.state.dma.is_some(),
+            self.state.dmabuf_failed,
+        )
+    }
+
     pub fn next(&mut self, timeout: Duration) -> Result<Option<Picture>> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -278,11 +344,24 @@ impl Grab {
                 } else {
                     transform
                 };
-                let picture = self
-                    .state
-                    .shm_buffer
-                    .as_ref()
-                    .map(|shm| shm.picture(transform));
+                let picture = if self.state.dmabuf_frame {
+                    match self.state.dmabuf_picture() {
+                        Ok(picture) => Some(picture),
+                        Err(error) => {
+                            // Keep the stream alive: the next frame falls back
+                            // to shared memory.
+                            tracing::warn!(%error, "DMA-BUF 帧转换失败，改用共享内存");
+                            self.state.dmabuf_failed = true;
+                            self.state.dma = None;
+                            None
+                        }
+                    }
+                } else {
+                    self.state
+                        .shm_buffer
+                        .as_ref()
+                        .map(|shm| shm.picture(transform))
+                };
                 // Ask for the next frame before returning. The request is
                 // only buffered: it leaves with the flush in the next `wait`,
                 // and the copy itself follows once `buffer_done` answers it,
@@ -319,6 +398,8 @@ impl Grab {
         let handle = self.queue.handle();
         let manager = self.state.manager.clone().context("采集已关闭")?;
         self.state.wanted = None;
+        self.state.offered = None;
+        self.state.dmabuf_frame = false;
         self.drop_frame();
         let output = self
             .state
@@ -634,6 +715,23 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         (),
                     ));
                 }
+                "zwp_linux_dmabuf_v1" => {
+                    // Version 3 is the last one that announces formats and
+                    // modifiers as events; from 4 the compositor sends a
+                    // feedback object instead, which this backend does not
+                    // read. Binding 3 keeps the list a buffer needs.
+                    if version >= 3 {
+                        state.dmabuf_version = 3;
+                        state.dmabuf = Some(
+                            registry.bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _, _>(
+                                name,
+                                state.dmabuf_version,
+                                handle,
+                                (),
+                            ),
+                        );
+                    }
+                }
                 "wl_output" => state.outputs.push(Output {
                     proxy: registry.bind::<wl_output::WlOutput, _, _>(
                         name,
@@ -647,6 +745,33 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 }),
                 _ => {}
             }
+        }
+    }
+}
+
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        event: zwp_linux_dmabuf_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Only the modifier event matters: it is what says this format can be
+        // imported with this layout, and GBM has to be asked for exactly that.
+        match event {
+            zwp_linux_dmabuf_v1::Event::Format { .. } => state.dmabuf_formats_seen += 1,
+            zwp_linux_dmabuf_v1::Event::Modifier {
+                format,
+                modifier_hi,
+                modifier_lo,
+            } => {
+                state.dmabuf_formats_seen += 1;
+                let modifier = (u64::from(modifier_hi) << 32) | u64::from(modifier_lo);
+                state.dmabuf_formats.push((format, modifier));
+            }
+            _ => {}
         }
     }
 }
@@ -724,6 +849,11 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for State {
                     .into_result()
                     .is_ok_and(|flags| flags.contains(zwlr_screencopy_frame_v1::Flags::YInvert));
             }
+            zwlr_screencopy_frame_v1::Event::LinuxDmabuf {
+                format,
+                width,
+                height,
+            } => state.offered = Some((format, width, height)),
             zwlr_screencopy_frame_v1::Event::Ready { .. } => state.ready = true,
             zwlr_screencopy_frame_v1::Event::Failed => state.failed = true,
             // A dma-buf offer is not taken up: see the module comment.
@@ -736,11 +866,31 @@ wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(State: ignore wl_buffer::WlBuffer);
 wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(State: ignore zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1);
+wayland_client::delegate_noop!(State: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
 
 impl State {
     /// Points the compositor at the shared buffer for this frame, allocating it
     /// on the first frame and whenever the output's shape changes.
     fn copy(&mut self, handle: &QueueHandle<Self>) -> Result<()> {
+        self.dmabuf_frame = false;
+        if self.gpu_frames
+            && !self.dmabuf_failed
+            && let Some((format, width, height)) = self.offered
+        {
+            match self.copy_dmabuf(format, width, height, handle) {
+                Ok(()) => {
+                    self.dmabuf_frame = true;
+                    return Ok(());
+                }
+                Err(error) => {
+                    // One failure is enough: the rest of this grab keeps the
+                    // shared-memory path instead of retrying every frame.
+                    tracing::debug!(%error, "DMA-BUF 采集不可用，改用共享内存");
+                    self.dmabuf_failed = true;
+                    self.dma = None;
+                }
+            }
+        }
         let (format, width, height, stride) = self.wanted.context("帧没有说明缓冲格式")?;
         ensure!(width > 0 && height > 0 && stride > 0, "帧的缓冲尺寸无效");
         let stale = self
@@ -775,6 +925,115 @@ fn swapped_channels(format: u32) -> Result<bool> {
 
 /// The shared memory the compositor writes into: a memfd, mapped here and
 /// exported as a pool with a single buffer over the whole of it.
+impl State {
+    /// Points the compositor at a DMA-BUF buffer for this frame, allocating one
+    /// for the compositor's advertised format and modifier on the first frame
+    /// and whenever the output's shape changes.
+    fn copy_dmabuf(
+        &mut self,
+        format: u32,
+        width: u32,
+        height: u32,
+        handle: &QueueHandle<Self>,
+    ) -> Result<()> {
+        ensure!(width > 0 && height > 0, "帧的 DMA-BUF 尺寸无效");
+        // The GPU conversion does not undo a transform, and the shared-memory
+        // path already handles one, so a rotated output keeps that path.
+        ensure!(
+            self.transform.unwrap_or(Transform::Normal) == Transform::Normal && !self.y_invert,
+            "旋转或翻转的输出不走 DMA-BUF"
+        );
+        let dmabuf = self
+            .dmabuf
+            .as_ref()
+            .context("合成器没有提供 linux-dmabuf")?;
+        let stale = self.dma.as_ref().is_none_or(|(_, buffer, _)| {
+            buffer.format() != format || buffer.width() != width || buffer.height() != height
+        });
+        if stale {
+            let modifiers: Vec<u64> = self
+                .dmabuf_formats
+                .iter()
+                .filter(|(advertised, _)| *advertised == format)
+                .map(|(_, modifier)| *modifier)
+                .collect();
+            ensure!(!modifiers.is_empty(), "合成器没有公布该格式的 modifier");
+            let device = gbm::Device::open()?;
+            let buffer = device.allocate(width, height, format, &modifiers)?;
+            let params = dmabuf.create_params(handle, ());
+            // The protocol carries the modifier as two 32-bit halves.
+            params.add(
+                buffer.fd(),
+                0,
+                buffer.offset(),
+                buffer.stride(),
+                u32::try_from(buffer.modifier() >> 32).unwrap_or(0),
+                buffer.modifier() as u32,
+            );
+            let wl = params.create_immed(
+                i32::try_from(width)?,
+                i32::try_from(height)?,
+                format,
+                zwp_linux_buffer_params_v1::Flags::empty(),
+                handle,
+                (),
+            );
+            params.destroy();
+            self.dma = Some((device, buffer, wl));
+        }
+        let (_, _, wl) = self.dma.as_ref().context("没有 DMA-BUF 缓冲")?;
+        if let Some(frame) = &self.frame {
+            frame.copy(wl);
+        }
+        Ok(())
+    }
+
+    /// The DMA-BUF frame converted on the GPU into the encoder's NV12 surface.
+    fn dmabuf_picture(&self) -> Result<Picture> {
+        let (_, buffer, _) = self.dma.as_ref().context("没有 DMA-BUF 缓冲")?;
+        let (width, height) = (buffer.width(), buffer.height());
+        let target = match self.target {
+            Some((quality, maximum)) => {
+                let size = crate::media::geometry::output_size(width, height, quality);
+                crate::media::geometry::fit_size(size.0, size.1, maximum)
+            }
+            None => (width, height),
+        };
+        let rgb = super::super::gpu_convert::RgbDma {
+            fd: buffer.raw_fd(),
+            width,
+            height,
+            pitch: buffer.stride(),
+            offset: buffer.offset(),
+            fourcc: buffer.format(),
+            modifier: buffer.modifier(),
+        };
+        let frame = CONVERTER.with(|cell| -> Result<_> {
+            let entry = cell.get_or_init(|| {
+                super::super::cuda::initialize_before_va();
+                let display = cros_libva::Display::open()
+                    .ok_or_else(|| "找不到 VA-API render node".to_string())?;
+                super::super::gpu_convert::Converter::new(display)
+                    .map_err(|error| format!("{error:#}"))
+            });
+            let converter = entry.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
+            converter.convert(&rgb, (0, 0, width, height), target)
+        })?;
+        Ok(Picture {
+            width: target.0,
+            height: target.1,
+            pixels: Vec::new(),
+            nv12: Some(frame),
+        })
+    }
+}
+
+thread_local! {
+    static CONVERTER: std::cell::OnceCell<
+        Result<super::super::gpu_convert::Converter, String>,
+    > = const { std::cell::OnceCell::new() };
+}
+
 fn allocate(
     shm: &wl_shm::WlShm,
     format: u32,
