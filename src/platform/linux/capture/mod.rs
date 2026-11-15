@@ -1115,7 +1115,7 @@ mod session_tests {
     fn captures_frames_for_a_few_seconds() {
         let screens = super::screens().unwrap();
         let mut desktop = super::Desktop::open_selected(&screens[0]).unwrap();
-        println!("backend: {}", desktop.backend_name());
+        println!("backend: {} source_fps_cap: {}", desktop.backend_name(), screens[0].fps);
         let started = std::time::Instant::now();
         let (mut frames, mut size) = (0, None);
         let (mut wait, mut copy) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
