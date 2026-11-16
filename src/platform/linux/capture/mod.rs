@@ -324,6 +324,21 @@ impl Kind {
     }
 }
 
+/// Whether the encoder takes frames on the GPU. Only the VA-API encoder does;
+/// the NVENC path has to download a VA-API surface and upload it again, which
+/// costs more than copying shared memory once. Published process-wide because
+/// the portal picks its buffer type while it opens the stream, before the host
+/// loop knows which encoder it will build.
+static GPU_FRAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_gpu_frames_wanted(on: bool) {
+    GPU_FRAMES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn gpu_frames_wanted() -> bool {
+    GPU_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The capture methods to try, best first.
 fn candidates() -> Result<Vec<Kind>> {
     if let Ok(order) = std::env::var("OPENUUYC_CAPTURE") {
@@ -577,6 +592,10 @@ impl Desktop {
     /// switching on only when the encoder reads that surface without a
     /// readback; otherwise the shared-memory copy is far cheaper.
     pub(crate) fn set_gpu_frames(&mut self, on: bool) {
+        // The portal decides its buffer type while it opens the stream, before
+        // this call can reach it, so the choice is published process-wide and
+        // read when a stream connects.
+        set_gpu_frames_wanted(on);
         if let Backend::Wlr(grab) = &mut self.backend {
             grab.enable_dmabuf(on);
         }

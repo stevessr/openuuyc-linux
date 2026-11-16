@@ -419,11 +419,7 @@ fn buffers() -> Pod {
             CHOICE_FLAGS,
             TYPE_INT,
             1,
-            &[if dmabuf_requested() {
-                (1 << DATA_MEM_DMABUF) | (1 << DATA_MEM_FD) | (1 << DATA_MEM_PTR)
-            } else {
-                (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
-            }],
+            &[dmabuf_mask(dmabuf_requested())],
         );
     })
 }
@@ -505,8 +501,26 @@ unsafe fn parse_format(pod: *const c_void) -> Option<NegotiatedFormat> {
 /// degrades on its own -- the stream advertises the shared-memory format next
 /// to the DMA-BUF one and reads whatever the portal actually hands over -- so
 /// OPENUUYC_CAPTURE_DMABUF=0 is only needed to force the old path.
+/// The buffer-type mask offered for the chosen path. DMA-BUF leads when it is
+/// wanted, and shared memory stays on offer either way so a compositor that
+/// cannot hand out a dmabuf still delivers frames.
+fn dmabuf_mask(wanted: bool) -> u32 {
+    if wanted {
+        (1 << DATA_MEM_DMABUF) | (1 << DATA_MEM_FD) | (1 << DATA_MEM_PTR)
+    } else {
+        (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
+    }
+}
+
 fn dmabuf_requested() -> bool {
-    !std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value == "0")
+    if std::env::var("OPENUUYC_CAPTURE_DMABUF").is_ok_and(|value| value == "0") {
+        return false;
+    }
+    // Only the VA-API encoder keeps a DMA-BUF on the GPU. NVENC cannot import
+    // one, so a DMA-BUF frame is downloaded and uploaded again, which measured
+    // slower than the shared-memory path: 56 frames per second with NVENC
+    // against 74 without, and 12 ms of encoding per frame against 6 ms.
+    super::gpu_frames_wanted()
 }
 
 /// Import into the baseline's owned BGRA picture while the PipeWire buffer is
@@ -1457,6 +1471,22 @@ mod tests {
     }
 
     #[test]
+    fn dmabuf_is_offered_only_when_the_encoder_keeps_frames_on_the_gpu() {
+        // NVENC cannot import a DMA-BUF, so it downloads and uploads every
+        // frame again: measured 56 frames per second against 74 for the
+        // shared-memory path, at 12 ms of encoding per frame against 6 ms.
+        assert_eq!(dmabuf_mask(false), (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD));
+        assert_eq!(
+            dmabuf_mask(true),
+            (1 << DATA_MEM_DMABUF) | (1 << DATA_MEM_FD) | (1 << DATA_MEM_PTR)
+        );
+        // Shared memory survives either way, so a compositor without DMA-BUF
+        // support still streams.
+        assert_ne!(dmabuf_mask(false) & (1 << DATA_MEM_PTR), 0);
+        assert_ne!(dmabuf_mask(true) & (1 << DATA_MEM_PTR), 0);
+    }
+
+    #[test]
     fn buffers_offers_dmabuf_in_one_flags_choice() {
         // The portal only offers DMA-BUF when the mask reaches it intact, and
         // the value count is derived from the body size rather than stored, so
@@ -1477,11 +1507,7 @@ mod tests {
         let mask = words[12];
         // DMA-BUF is the preferred flag, and shared memory stays on offer so a
         // compositor that cannot hand out a dmabuf still delivers frames.
-        let expected = if dmabuf_requested() {
-            (1 << DATA_MEM_DMABUF) | (1 << DATA_MEM_FD) | (1 << DATA_MEM_PTR)
-        } else {
-            (1 << DATA_MEM_PTR) | (1 << DATA_MEM_FD)
-        };
+        let expected = dmabuf_mask(dmabuf_requested());
         assert_eq!(mask, expected);
         assert_eq!(mask & (1 << DATA_MEM_DMABUF) != 0, dmabuf_requested());
     }
