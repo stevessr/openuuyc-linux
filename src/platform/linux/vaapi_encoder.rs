@@ -304,7 +304,7 @@ impl Encoder {
 
     /// The accumulated upload and encode time, and resets them.
     #[cfg(test)]
-    fn take_stage_totals(&mut self) -> (std::time::Duration, std::time::Duration) {
+    pub(crate) fn take_stage_totals(&mut self) -> (std::time::Duration, std::time::Duration) {
         (
             std::mem::take(&mut self.upload_time),
             std::mem::take(&mut self.encode_time),

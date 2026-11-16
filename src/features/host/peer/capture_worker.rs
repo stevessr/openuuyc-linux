@@ -164,12 +164,14 @@ mod capture_pump_tests {
         assert_eq!(slot.take(), Some(3));
     }
 
-    /// Capture and NVENC together on the live Wayland desktop. Keep a native,
+    /// Capture and a hardware encoder together on the live Wayland desktop.
+    /// OPENUUYC_TEST_ENCODER=intel/amd selects VA-API; the default is NVENC.
+    /// Keep a native,
     /// focused animation visible on the selected output during this test; idle
     /// and unfocused surfaces are throttled by the compositor and are not a
     /// useful source-FPS benchmark. This separates capture from encoder limits.
     #[test]
-    #[ignore = "requires a Wayland session and NVIDIA NVENC"]
+    #[ignore = "requires a Wayland session and a hardware encoder"]
     fn live_capture_and_nvenc_rate_at_144hz() {
         use crate::features::host::format::{Backend, Color, Format};
         use crate::media::encoding::{QualityTarget, Rate};
@@ -184,24 +186,35 @@ mod capture_pump_tests {
                 )
             })
             .unwrap();
+        let capture_only = std::env::var_os("OPENUUYC_TEST_CAPTURE_ONLY").is_some();
+        // Which hardware encoder to measure. The VA-API encoder keeps a DMA-BUF
+        // on the GPU, so it is the only one that can skip the per-frame copy
+        // into the encoder; NVENC cannot import one.
+        let backend = match std::env::var("OPENUUYC_TEST_ENCODER").as_deref() {
+            Ok("intel") => Backend::Intel,
+            Ok("amd") => Backend::Amd,
+            _ => Backend::Nvidia,
+        };
+        let gpu_frames = matches!(backend, Backend::Intel | Backend::Amd);
+        capture::set_gpu_frames_wanted(gpu_frames);
         let desktop = capture::Desktop::open_selected(&screen).unwrap();
         eprintln!(
-            "144Hz test source name={} identity={:?} size={}x{} fps_cap={} backend={}",
+            "144Hz test source name={} identity={:?} size={}x{} fps_cap={} backend={} encoder={:?} gpu_frames={gpu_frames}",
             screen.device_name,
             screen.identity,
             screen.width,
             screen.height,
             screen.fps,
             desktop.backend_name(),
+            backend,
         );
         let size = crate::media::geometry::output_size(screen.width, screen.height, 4);
-        let capture_only = std::env::var_os("OPENUUYC_TEST_CAPTURE_ONLY").is_some();
         let device = desktop.device.clone();
         let mut encoder = (!capture_only)
             .then(|| {
                 encoder::Encoder::hardware_format(
                     &device,
-                    Backend::Nvidia,
+                    backend,
                     size,
                     Format::AVC,
                     Rate {
@@ -228,19 +241,23 @@ mod capture_pump_tests {
             fps: 144,
             cursor: false,
             hdr: false,
-            gpu_frames: false,
+            gpu_frames,
             epoch: 0,
         });
         let started = std::time::Instant::now();
         let mut frames = 0u64;
         let mut encoded = 0u64;
         let mut distinct_images = 0u64;
+        let mut gpu_images = 0u64;
         let mut previous_hash = None::<u64>;
         let mut encode_time = Duration::ZERO;
         while started.elapsed() < Duration::from_secs(4) {
             if let Some(packet) = pump.take_latest().filter(|p| p.revision == 1) {
                 frames += 1;
-                if let Ok(pixels) = packet.frame.image.pixels() {
+                gpu_images += u64::from(matches!(packet.frame.image, capture::Image::Nv12(_)));
+                if !matches!(packet.frame.image, capture::Image::Nv12(_))
+                    && let Ok(pixels) = packet.frame.image.pixels()
+                {
                     // Sample a 32x32 grid instead of scanning the whole
                     // 16 MiB image: this test must measure capture cadence, not
                     // make the debug-build consumer CPU-bound doing its hash.
@@ -287,7 +304,7 @@ mod capture_pump_tests {
             stage_b,
         ) = pump.stats();
         println!(
-            "live 144Hz pipeline source_fps_cap={} polls={attempts} captured={frames} encoded={encoded} capture_only={capture_only} distinct_images={distinct_images} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} wlr_frames={wlr_frames} wlr_wait_avg_ms={:.2} wlr_wait_max_ms={:.2} wlr_copy_avg_ms={:.2} wlr_copy_max_ms={:.2} stage_request_ms={:.2} stage_copy_ms={:.2} encode_avg_ms={:.2}",
+            "live 144Hz pipeline source_fps_cap={} polls={attempts} captured={frames} encoded={encoded} capture_only={capture_only} gpu_images={gpu_images} distinct_images={distinct_images} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} wlr_frames={wlr_frames} wlr_wait_avg_ms={:.2} wlr_wait_max_ms={:.2} wlr_copy_avg_ms={:.2} wlr_copy_max_ms={:.2} stage_request_ms={:.2} stage_copy_ms={:.2} encode_avg_ms={:.2}",
             screen.fps,
             frames as f64 / elapsed,
             encoded as f64 / elapsed,
@@ -301,6 +318,14 @@ mod capture_pump_tests {
             stage_b.as_secs_f64() * 1000.0,
             encode_time.as_secs_f64() * 1000.0 / encoded.max(1) as f64,
         );
+        if let Some(encoder::Encoder::Vaapi(encoder, _)) = encoder.as_mut() {
+            let (import_or_upload, driver_encode) = encoder.take_stage_totals();
+            println!(
+                "VA-API stages import_or_upload_avg_ms={:.2} driver_encode_avg_ms={:.2}",
+                import_or_upload.as_secs_f64() * 1000.0 / encoded.max(1) as f64,
+                driver_encode.as_secs_f64() * 1000.0 / encoded.max(1) as f64,
+            );
+        }
         assert!(frames > 0 && (capture_only || encoded > 0));
     }
 
@@ -440,8 +465,10 @@ impl CapturePump {
                             // A damage-gated request answered, so something
                             // changed: switch to immediate copies.
                             last_change = Some(Instant::now());
-                        } else if let Ok(pixels) = frame.image.pixels()
-                            && sampled_change(&mut sample, &pixels, frame.width, frame.height)
+                        } else if let capture::Image::Cpu { pixels, .. } = &frame.image
+                            // A GPU frame stays on the GPU: reading it back here
+                            // would cost more than the sampling decides.
+                            && sampled_change(&mut sample, pixels, frame.width, frame.height)
                         {
                             last_change = Some(Instant::now());
                         }
