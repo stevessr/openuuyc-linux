@@ -42,6 +42,7 @@ pub(crate) enum SelectionReason {
     GpuFormat,
     CodecFormat,
     FailedCandidate,
+    PerformanceFallback,
 }
 impl SelectionReason {
     pub fn label(self) -> &'static str {
@@ -52,6 +53,7 @@ impl SelectionReason {
             Self::GpuFormat => "首选显卡不满足本次格式或输出要求，已回退",
             Self::CodecFormat => "首选格式不满足双方能力或输出要求，已回退",
             Self::FailedCandidate => "原候选失败，已切换可用候选",
+            Self::PerformanceFallback => "编码耗时持续超出帧预算，已按实测性能切换",
         }
     }
 }

@@ -18,6 +18,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod adaptive;
 mod metrics;
 
 #[cfg(target_os = "linux")]
@@ -648,6 +649,8 @@ pub(super) fn capture_loop(
     let mut last_frame = None::<Instant>;
     let mut failed = std::collections::HashSet::new();
     let mut encode_errors = 0u32;
+    let mut adaptive_encoder = adaptive::Adaptive::default();
+    let mut adaptive_workload = None;
     let mut requested = None;
     let mut automatic = None::<crate::features::host::parameters::AutoQuality>;
     let mut initial_auto = true;
@@ -748,6 +751,7 @@ pub(super) fn capture_loop(
         );
         let changed = requested != Some(settings);
         if changed {
+            adaptive_encoder = adaptive::Adaptive::default();
             cached = None;
             automatic = (wanted.quality == 5).then(|| {
                 crate::features::host::parameters::AutoQuality::new(
@@ -758,13 +762,78 @@ pub(super) fn capture_loop(
             initial_auto = true;
             requested = Some(settings);
         }
-        let candidate = negotiated
+        let candidate_ids = || {
+            negotiated.choices.iter().map(|choice| {
+                (
+                    choice.capability.adapter,
+                    choice.capability.backend,
+                    choice.capability.format,
+                )
+            })
+        };
+        let source_adapter = screen.render_adapter.unwrap_or(screen.adapter);
+        let baseline = negotiated
             .candidate(
                 &wanted,
                 (screen.width, screen.height),
-                screen.render_adapter.unwrap_or(screen.adapter),
+                source_adapter,
                 &failed,
             )
+            .context("本会话的协商编码候选已全部失败")?;
+        let desired =
+            crate::media::geometry::output_size(screen.width, screen.height, wanted.quality);
+        let baseline_size = crate::media::geometry::fit_size(
+            desired.0,
+            desired.1,
+            baseline.maximum_for(wanted.requested_maximum),
+        );
+        let mut compatible_failed = failed.clone();
+        for choice in &negotiated.choices {
+            let size = crate::media::geometry::fit_size(
+                desired.0,
+                desired.1,
+                choice.maximum_for(wanted.requested_maximum),
+            );
+            if choice.capability.format != baseline.capability.format
+                || size != baseline_size
+                || choice.fps < wanted.fps.min(baseline.fps).min(screen.fps)
+                || (baseline.capability.backend != Backend::Software
+                    && choice.capability.backend == Backend::Software)
+            {
+                compatible_failed.insert((
+                    choice.capability.adapter,
+                    choice.capability.backend,
+                    choice.capability.format,
+                ));
+            }
+        }
+        let excluded = adaptive_encoder.exclusions(candidate_ids(), &compatible_failed);
+        let trial = negotiated.candidate(
+            &wanted,
+            (screen.width, screen.height),
+            source_adapter,
+            &excluded,
+        );
+        // Performance trials must never turn a slow encoder into a failed track.
+        let candidate = trial
+            .or_else(|| {
+                adaptive_encoder.finish_trials(Instant::now());
+                let excluded = adaptive_encoder.exclusions(candidate_ids(), &compatible_failed);
+                negotiated.candidate(
+                    &wanted,
+                    (screen.width, screen.height),
+                    source_adapter,
+                    &excluded,
+                )
+            })
+            .or_else(|| {
+                negotiated.candidate(
+                    &wanted,
+                    (screen.width, screen.height),
+                    source_adapter,
+                    &failed,
+                )
+            })
             .context("本会话的协商编码候选已全部失败")?;
         let hardware =
             candidate.capability.backend != crate::features::host::format::Backend::Software;
@@ -1057,6 +1126,7 @@ pub(super) fn capture_loop(
         };
         *lock(&pointer) = capture_state.cursor.clone();
         if generation != capture_state.generation {
+            adaptive_encoder = adaptive::Adaptive::default();
             generation = capture_state.generation;
             encoder = None;
             cached = None;
@@ -1140,6 +1210,11 @@ pub(super) fn capture_loop(
             continue;
         }
         let size = output_size(frame.width, frame.height, wanted.quality);
+        let workload = (size, wanted.fps, wanted.format, wanted.color);
+        if adaptive_workload != Some(workload) {
+            adaptive_encoder = adaptive::Adaptive::default();
+            adaptive_workload = Some(workload);
+        }
         let source_device = &capture_state.device;
         // NVENC owns a separate D3D11 context even on the capture adapter.
         // Transfer explicitly orders capture/preprocessing before encoding,
@@ -1340,7 +1415,8 @@ pub(super) fn capture_loop(
                 force,
                 &encode_cancel,
             );
-            metrics.encode.record(encode_started.elapsed());
+            let encode_elapsed = encode_started.elapsed();
+            metrics.encode.record(encode_elapsed);
             let encoded = encoded?;
             for output in &encoded {
                 if let Some(actual) = crate::media::video_format::parse_stream_format(
@@ -1353,6 +1429,18 @@ pub(super) fn capture_loop(
                             && actual.bit_depth_chroma == output.format.depth
                             && (actual.visible_width, actual.visible_height) == size,
                         "编码器实际输出偏离协商格式"
+                    );
+                }
+            }
+            if frame.is_new && !force && !encoded.is_empty() {
+                if let Some(average) =
+                    adaptive_encoder.observe(candidate_id, Instant::now(), encode_elapsed, period)
+                {
+                    tracing::info!(
+                        ?candidate_id,
+                        average_ms = average.as_secs_f64() * 1000.0,
+                        budget_ms = period.as_secs_f64() * 1000.0,
+                        "host encoder performance trial updated"
                     );
                 }
             }
@@ -1416,7 +1504,16 @@ pub(super) fn capture_loop(
             let diagnostics = super::super::ActiveEncoding {
                 preferred_gpu: negotiated.preference().0,
                 preferred_codec: negotiated.preference().1,
-                selection: negotiated.selection_reason(&candidate.capability, !failed.is_empty()),
+                selection: if candidate_id
+                    != (
+                        baseline.capability.adapter,
+                        baseline.capability.backend,
+                        baseline.capability.format,
+                    ) {
+                    crate::media::selection::SelectionReason::PerformanceFallback
+                } else {
+                    negotiated.selection_reason(&candidate.capability, !failed.is_empty())
+                },
                 backend: candidate.capability.backend,
                 adapter: candidate.capability.adapter,
                 format: wanted.format,
