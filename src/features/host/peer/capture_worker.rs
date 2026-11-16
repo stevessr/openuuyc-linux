@@ -79,6 +79,9 @@ struct CaptureSlot {
     wlr_copy_max: Duration,
     wlr_stage_a: Duration,
     wlr_stage_b: Duration,
+    /// Source-side delivery counters, for portal streams only.
+    delivered: u64,
+    drained: u64,
 }
 
 /// Whether a frame differs from the previous one, judged from a strided
@@ -304,8 +307,9 @@ mod capture_pump_tests {
             stage_a,
             stage_b,
         ) = pump.stats();
+        let (source_delivered, source_drained) = pump.source_delivery();
         println!(
-            "live 144Hz pipeline source_fps_cap={} polls={attempts} captured={frames} encoded={encoded} capture_only={capture_only} gpu_images={gpu_images} distinct_images={distinct_images} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} wlr_frames={wlr_frames} wlr_wait_avg_ms={:.2} wlr_wait_max_ms={:.2} wlr_copy_avg_ms={:.2} wlr_copy_max_ms={:.2} stage_request_ms={:.2} stage_copy_ms={:.2} encode_avg_ms={:.2}",
+            "live 144Hz pipeline source_fps_cap={} polls={attempts} captured={frames} encoded={encoded} capture_only={capture_only} gpu_images={gpu_images} source_delivered={source_delivered} source_drained={source_drained} distinct_images={distinct_images} capture_fps={:.1} encoded_fps={:.1} capture_avg_ms={:.2} capture_max_ms={:.2} wlr_frames={wlr_frames} wlr_wait_avg_ms={:.2} wlr_wait_max_ms={:.2} wlr_copy_avg_ms={:.2} wlr_copy_max_ms={:.2} stage_request_ms={:.2} stage_copy_ms={:.2} encode_avg_ms={:.2}",
             screen.fps,
             frames as f64 / elapsed,
             encoded as f64 / elapsed,
@@ -393,6 +397,8 @@ impl CapturePump {
             wlr_copy_max: Duration::ZERO,
             wlr_stage_a: Duration::ZERO,
             wlr_stage_b: Duration::ZERO,
+            delivered: 0,
+            drained: 0,
         }));
         let control = Arc::new(Mutex::new(CaptureConfig {
             enabled: false,
@@ -476,6 +482,8 @@ impl CapturePump {
                         plain_copy =
                             last_change.is_some_and(|at| at.elapsed() < Duration::from_millis(500));
                     }
+                    let (source_delivered, source_drained) =
+                        (desktop.delivered(), desktop.drained());
                     let frame = match result {
                         Ok(frame) => frame,
                         Err(error) => {
@@ -513,6 +521,8 @@ impl CapturePump {
                         guard.wlr_copy_max = guard.wlr_copy_max.max(timings.1);
                         guard.wlr_frames = guard.wlr_frames.saturating_add(1);
                     }
+                    guard.delivered = source_delivered;
+                    guard.drained = source_drained;
                     guard.state = state.clone();
                     if publish && let Some(frame) = frame {
                         if replace_latest(
@@ -572,6 +582,13 @@ impl CapturePump {
 
     fn replaced(&self) -> u64 {
         lock(&self.slot).replaced
+    }
+
+    /// If the source produced more buffers than it turned into pictures, the
+    /// loss is in the stream, not in this producer.
+    fn source_delivery(&self) -> (u64, u64) {
+        let slot = lock(&self.slot);
+        (slot.delivered, slot.drained)
     }
 
     fn stats(

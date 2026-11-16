@@ -738,6 +738,10 @@ impl cros_libva::SurfaceMemoryDescriptor for CaptureImport {
 struct State {
     picture: Option<Picture>,
     sequence: u64,
+    /// Buffers taken off the stream, including the older ones dropped in favour
+    /// of the newest. Compared with `delivered` this shows how much the
+    /// compositor produced versus how much reached a picture.
+    drained: u64,
     format: Option<NegotiatedFormat>,
     streaming: bool,
     error: Option<String>,
@@ -846,6 +850,7 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         if buffer.is_null() {
             break;
         }
+        lock(&callbacks.shared.state).drained += 1;
         if !newest.is_null() {
             unsafe { (api.stream_queue_buffer)(callbacks.stream, newest) };
         }
@@ -1246,6 +1251,19 @@ impl Stream {
     pub fn set_target(&self, target: Option<(i32, (u32, u32))>) {
         let mut state = lock(&self.shared.state);
         state.target = target;
+    }
+
+    /// Buffers the compositor delivered to this stream, readable or not. A
+    /// delivered count far above what the caller receives means the loss is on
+    /// this side of the stream, not in the compositor.
+    pub fn delivered(&self) -> u64 {
+        lock(&self.shared.state).delivered
+    }
+
+    /// Buffers taken off the stream, including ones replaced by a newer buffer
+    /// in the same callback.
+    pub fn drained(&self) -> u64 {
+        lock(&self.shared.state).drained
     }
 
     /// How far the stream got, for a first picture that never arrived: the

@@ -549,6 +549,24 @@ impl Desktop {
         })
     }
 
+    /// Buffers the compositor delivered to a portal stream. Zero for backends
+    /// that pull frames themselves, where the caller already sees every frame.
+    pub fn delivered(&self) -> u64 {
+        match &self.backend {
+            Backend::Portal(grab) => grab.delivered(),
+            _ => 0,
+        }
+    }
+
+    /// Buffers taken off a portal stream, including ones a newer buffer
+    /// replaced. Zero for backends that pull frames themselves.
+    pub fn drained(&self) -> u64 {
+        match &self.backend {
+            Backend::Portal(grab) => grab.drained(),
+            _ => 0,
+        }
+    }
+
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
     }

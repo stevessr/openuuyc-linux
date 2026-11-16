@@ -327,6 +327,16 @@ impl Grab {
     pub fn stage(&self) -> String {
         self.stream.stage()
     }
+
+    /// Buffers the compositor delivered, whether or not a picture came of them.
+    pub fn delivered(&self) -> u64 {
+        self.stream.delivered()
+    }
+
+    /// Buffers taken off the stream, including ones a newer buffer replaced.
+    pub fn drained(&self) -> u64 {
+        self.stream.drained()
+    }
 }
 
 #[cfg(test)]
