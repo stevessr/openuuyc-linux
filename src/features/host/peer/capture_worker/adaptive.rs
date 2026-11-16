@@ -3,6 +3,21 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
+/// Everything that decides which candidates may stand in for the baseline.
+/// When this is unchanged the exclusion set is unchanged too, so the host loop
+/// can reuse it instead of rebuilding a set on every frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Workload {
+    pub adapter: u64,
+    pub backend: crate::features::host::format::Backend,
+    pub format: crate::features::host::format::Format,
+    pub desired: (u32, u32),
+    pub fps: u32,
+    pub requested_maximum: Option<(u32, u32)>,
+    /// Candidates only ever join the failed set during a session.
+    pub failed: usize,
+}
+
 pub(super) struct Adaptive<K> {
     scores: HashMap<K, Duration>,
     exploring: bool,

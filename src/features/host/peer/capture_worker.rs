@@ -31,7 +31,7 @@ fn capture_backend_name(state: &capture::Desktop) -> String {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct CaptureConfig {
     enabled: bool,
     revision: u64,
@@ -651,6 +651,11 @@ pub(super) fn capture_loop(
     let mut encode_errors = 0u32;
     let mut adaptive_encoder = adaptive::Adaptive::default();
     let mut adaptive_workload = None;
+    let mut exclusions_cache = None::<(
+        adaptive::Workload,
+        std::collections::HashSet<(u64, Backend, Format)>,
+    )>;
+    let mut published_capture = None::<CaptureConfig>;
     let mut requested = None;
     let mut automatic = None::<crate::features::host::parameters::AutoQuality>;
     let mut initial_auto = true;
@@ -712,6 +717,7 @@ pub(super) fn capture_loop(
             #[cfg(target_os = "linux")]
             {
                 desktop = Some(CapturePump::new(opened, pointer.clone())?);
+                published_capture = None;
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -787,27 +793,45 @@ pub(super) fn capture_loop(
             desired.1,
             baseline.maximum_for(wanted.requested_maximum),
         );
-        let mut compatible_failed = failed.clone();
-        for choice in &negotiated.choices {
-            let size = crate::media::geometry::fit_size(
-                desired.0,
-                desired.1,
-                choice.maximum_for(wanted.requested_maximum),
-            );
-            if choice.capability.format != baseline.capability.format
-                || size != baseline_size
-                || choice.fps < wanted.fps.min(baseline.fps).min(screen.fps)
-                || (baseline.capability.backend != Backend::Software
-                    && choice.capability.backend == Backend::Software)
-            {
-                compatible_failed.insert((
-                    choice.capability.adapter,
-                    choice.capability.backend,
-                    choice.capability.format,
-                ));
+        // Rebuilding this set on every frame allocates and hashes on the hot
+        // path, so it is keyed on what can actually change it.
+        let signature = adaptive::Workload {
+            adapter: baseline.capability.adapter,
+            backend: baseline.capability.backend,
+            format: baseline.capability.format,
+            desired,
+            fps: wanted.fps.min(baseline.fps).min(screen.fps),
+            requested_maximum: wanted.requested_maximum,
+            failed: failed.len(),
+        };
+        if exclusions_cache
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != signature)
+        {
+            let mut compatible = failed.clone();
+            for choice in &negotiated.choices {
+                let size = crate::media::geometry::fit_size(
+                    desired.0,
+                    desired.1,
+                    choice.maximum_for(wanted.requested_maximum),
+                );
+                if choice.capability.format != baseline.capability.format
+                    || size != baseline_size
+                    || choice.fps < signature.fps
+                    || (baseline.capability.backend != Backend::Software
+                        && choice.capability.backend == Backend::Software)
+                {
+                    compatible.insert((
+                        choice.capability.adapter,
+                        choice.capability.backend,
+                        choice.capability.format,
+                    ));
+                }
             }
+            exclusions_cache = Some((signature, compatible));
         }
-        let excluded = adaptive_encoder.exclusions(candidate_ids(), &compatible_failed);
+        let compatible_failed = &exclusions_cache.as_ref().unwrap().1;
+        let excluded = adaptive_encoder.exclusions(candidate_ids(), compatible_failed);
         let trial = negotiated.candidate(
             &wanted,
             (screen.width, screen.height),
@@ -818,7 +842,7 @@ pub(super) fn capture_loop(
         let candidate = trial
             .or_else(|| {
                 adaptive_encoder.finish_trials(Instant::now());
-                let excluded = adaptive_encoder.exclusions(candidate_ids(), &compatible_failed);
+                let excluded = adaptive_encoder.exclusions(candidate_ids(), compatible_failed);
                 negotiated.candidate(
                     &wanted,
                     (screen.width, screen.height),
@@ -947,6 +971,9 @@ pub(super) fn capture_loop(
                     gpu_frames: false,
                     epoch: 0,
                 });
+                // Any configure outside the hot path invalidates the record,
+                // or the next frame could mistake this pause for no change.
+                published_capture = None;
             }
             if !wanted.capturing {
                 if last_diagnostics.take().is_some() {
@@ -996,6 +1023,7 @@ pub(super) fn capture_loop(
             #[cfg(target_os = "linux")]
             {
                 desktop = Some(CapturePump::new(opened, pointer.clone())?);
+                published_capture = None;
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -1024,6 +1052,9 @@ pub(super) fn capture_loop(
                     gpu_frames: false,
                     epoch: 0,
                 });
+                // Any configure outside the hot path invalidates the record,
+                // or the next frame could mistake this pause for no change.
+                published_capture = None;
             }
             if paused_capture_at.is_some_and(|at| at.elapsed() < Duration::from_millis(100)) {
                 std::thread::sleep(Duration::from_millis(10));
@@ -1045,7 +1076,9 @@ pub(super) fn capture_loop(
         let (captured, capture_state) = {
             let pump = desktop.as_ref().context("缺少采集源")?;
             let gpu_frames = matches!(encoder.as_ref(), Some(encoder::Encoder::Vaapi(..)));
-            pump.configure(CaptureConfig {
+            // The producer reads this under its own lock every frame. Only a
+            // real change is worth taking that lock for.
+            let requested_capture = CaptureConfig {
                 enabled: true,
                 revision: wanted.revision,
                 quality: wanted.quality,
@@ -1055,7 +1088,11 @@ pub(super) fn capture_loop(
                 hdr: wanted.color.is_hdr(),
                 gpu_frames,
                 epoch: 0,
-            });
+            };
+            if published_capture != Some(requested_capture) {
+                pump.configure(requested_capture);
+                published_capture = Some(requested_capture);
+            }
             let replaced = pump.replaced();
             metrics.capture_replaced += replaced.saturating_sub(observed_replaced);
             observed_replaced = replaced;
