@@ -135,6 +135,7 @@ const FORMAT_VIDEO_FORMAT: u32 = 0x20001;
 const FORMAT_VIDEO_MODIFIER: u32 = 0x20002;
 const FORMAT_VIDEO_SIZE: u32 = 0x20003;
 const FORMAT_VIDEO_FRAMERATE: u32 = 0x20004;
+const FORMAT_VIDEO_MAX_FRAMERATE: u32 = 0x20005;
 const MEDIA_TYPE_VIDEO: u32 = 2;
 const MEDIA_SUBTYPE_RAW: u32 = 1;
 const VIDEO_RGBX: u32 = 7;
@@ -322,8 +323,20 @@ impl Pod {
     }
 }
 
-fn framerate_choice(fps: u32) -> [u32; 6] {
+fn max_framerate_choice(fps: u32) -> [u32; 6] {
     [fps.clamp(1, 1000), 1, 1, 1, 1000, 1]
+}
+
+// A screencast producer announces a variable frame rate: framerate is 0/1 and
+// the cap travels in maxFramerate. Offering a framerate range instead never
+// intersects that 0/1, and the node then rejects every format offered, which
+// PipeWire reports as "no more input formats". niri's stream has this shape,
+// and so does Mutter's.
+fn offer_framerate(p: &mut Pod, fps: u32) {
+    p.key(FORMAT_VIDEO_FRAMERATE);
+    p.value(TYPE_FRACTION, &[0, 1]);
+    p.key(FORMAT_VIDEO_MAX_FRAMERATE);
+    p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &max_framerate_choice(fps));
 }
 
 fn enum_format(fps: u32) -> Pod {
@@ -364,8 +377,7 @@ fn enum_format(fps: u32) -> Pod {
             2,
             &[1920, 1080, 1, 1, 16384, 16384],
         );
-        p.key(FORMAT_VIDEO_FRAMERATE);
-        p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &framerate_choice(fps));
+        offer_framerate(p, fps);
     })
 }
 
@@ -390,8 +402,7 @@ fn enum_format_shm(fps: u32) -> Pod {
             2,
             &[1920, 1080, 1, 1, 16384, 16384],
         );
-        p.key(FORMAT_VIDEO_FRAMERATE);
-        p.choice(CHOICE_RANGE, TYPE_FRACTION, 2, &framerate_choice(fps));
+        offer_framerate(p, fps);
     })
 }
 
@@ -1331,9 +1342,9 @@ mod tests {
 
     #[test]
     fn high_refresh_preference_is_offered_to_pipewire() {
-        assert_eq!(framerate_choice(165), [165, 1, 1, 1, 1000, 1]);
-        assert_eq!(framerate_choice(144), [144, 1, 1, 1, 1000, 1]);
-        assert_eq!(framerate_choice(0), [1, 1, 1, 1, 1000, 1]);
+        assert_eq!(max_framerate_choice(165), [165, 1, 1, 1, 1000, 1]);
+        assert_eq!(max_framerate_choice(144), [144, 1, 1, 1, 1000, 1]);
+        assert_eq!(max_framerate_choice(0), [1, 1, 1, 1, 1000, 1]);
     }
 
     #[test]
