@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import quote
 from aiohttp import WSMsgType, web
+from .compat import Compatibility
 
 MAX_BODY = 1024 * 1024
 MAX_SIGNAL = 1024 * 1024
@@ -36,6 +37,7 @@ class Ticket:
     target: str
     expires: float
     force: bool = False
+    session_token: str = ""
 
 
 @dataclass(eq=False)
@@ -67,7 +69,7 @@ class Peer:
             await self.send("451-" + payload, b"\x04" + attachment)
 
 
-class ControlPlane:
+class ControlPlane(Compatibility):
     def __init__(self, database: str, public_url: str, admin_key: str, ice_urls: list[str]):
         if not public_url.startswith("https://"):
             raise ValueError("OPENUUYC_PUBLIC_URL must be an HTTPS origin")
@@ -81,6 +83,7 @@ class ControlPlane:
         self.ice_servers = [{"urls": u} for u in ice_urls]
         self.db = sqlite3.connect(database, isolation_level=None)
         self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript("""
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS devices(
@@ -96,6 +99,7 @@ class ControlPlane:
               approved INTEGER NOT NULL DEFAULT 0, consumed INTEGER NOT NULL DEFAULT 0
             );
         """)
+        self.init_compat()
         self.tickets: dict[str, Ticket] = {}
         self.peers: set[Peer] = set()
         self.hosts: dict[str, Peer] = {}
@@ -113,7 +117,8 @@ class ControlPlane:
         if row is None:
             raise web.HTTPUnauthorized(text="invalid session")
         device = self.device(row["device_id"])
-        if not device or device["device_id"] != req.headers.get("X-Param-device-id"):
+        if (not device or device["device_id"] != req.headers.get("X-Param-device-id")
+                or device["client_id"] != req.headers.get("X-Param-client-id")):
             raise web.HTTPUnauthorized(text="device mismatch")
         return device
 
@@ -130,9 +135,12 @@ class ControlPlane:
             raise web.HTTPBadRequest(text="expected object")
         return value
 
-    def new_ticket(self, kind, device, target, lifetime=3600, force=False):
+    def new_ticket(self, kind, device, target, lifetime=3600, force=False, session_token=""):
         key = secrets.token_urlsafe(32)
-        self.tickets[key] = Ticket(kind, device, target, time.monotonic() + lifetime, force)
+        if not session_token:
+            raise ValueError("room tickets require an authenticated session")
+        self.tickets[key] = Ticket(kind, device, target, time.monotonic() + lifetime,
+                                   force, session_token)
         return {"token": key, "ws_connect_timeout_ms": 10000,
                 "streamer_retry_delta_ms": 1000, "max_reconnect_delta": 120000,
                 "signaling_list": [self.signal_endpoint],
@@ -140,7 +148,11 @@ class ControlPlane:
 
     def status(self, row):
         did = row["device_id"]
+        metadata = self.metadata(did)
         return {"device_id": did, "alias": row["alias"], "platform": row["platform"],
+                "version_name": metadata["version_name"],
+                "wallpaper_url": metadata["wallpaper_url"],
+                "support_wol": bool(metadata["support_wol"]),
                 "status": "CONNECTED" if did in self.hosts else "DISCONNECTED",
                 "controllable": bool(row["controllable"]),
                 "controlled_support": True,
@@ -156,10 +168,13 @@ class ControlPlane:
         platform = 2 if "android" in req.path else 1
         existing = self.db.execute("SELECT * FROM devices WHERE client_id=?", (cid,)).fetchone()
         if existing:
+            self.update_registered(existing["device_id"],
+                                   req.headers.get("X-Param-VN", ""))
             return envelope({"device_id": existing["device_id"], "alias": existing["alias"]})
         did = secrets.token_hex(8)
         self.db.execute("INSERT INTO devices(device_id,client_id,alias,platform) VALUES(?,?,?,?)",
                         (did, cid, name, platform))
+        self.update_registered(did, req.headers.get("X-Param-VN", ""))
         return envelope({"device_id": did, "alias": name})
 
     async def generate_qr(self, req):
@@ -234,8 +249,15 @@ class ControlPlane:
 
     async def logout(self, req):
         self.caller(req)
-        self.db.execute("DELETE FROM sessions WHERE token=?",
-                        (req.headers["Authorization"][7:],))
+        token = req.headers["Authorization"][7:]
+        self.db.execute("DELETE FROM sessions WHERE token=?", (token,))
+        async with self.guard:
+            invalid = [p for p in self.peers if p.ticket.session_token == token]
+            for key, ticket in list(self.tickets.items()):
+                if ticket.session_token == token:
+                    self.tickets.pop(key, None)
+        for peer in invalid:
+            await peer.socket.close(code=1008, message=b"session revoked")
         return envelope({})
 
     async def list_devices(self, req):
@@ -267,7 +289,8 @@ class ControlPlane:
 
     async def create_room(self, req):
         own = self.caller(req)
-        return envelope(self.new_ticket("host", own["device_id"], own["device_id"]))
+        return envelope(self.new_ticket("host", own["device_id"], own["device_id"],
+                                        session_token=req.headers["Authorization"][7:]))
 
     async def join(self, req):
         own = self.caller(req)
@@ -282,13 +305,17 @@ class ControlPlane:
         force = body.get("force_join") is True
         if target in self.controls and not force:
             return envelope(code=1136, msg="device busy")
-        return envelope(self.new_ticket("controller", own["device_id"], target, 600, force))
+        return envelope(self.new_ticket("controller", own["device_id"], target, 600, force,
+                                        session_token=req.headers["Authorization"][7:]))
 
     async def device_detail(self, req):
         self.caller(req)
         if not self.device(req.match_info["device"]):
             return envelope(code=404, msg="device not found")
-        return envelope({"details": []})
+        info = self.device(req.match_info["device"])
+        return envelope({"details": [["Device ID", info["device_id"]],
+                                     ["Platform", str(info["platform"])],
+                                     ["Version", self.metadata(info["device_id"])["version_name"]]]})
 
     async def configures(self, req):
         self.caller(req)
@@ -417,6 +444,10 @@ class ControlPlane:
         ticket = self.tickets.get(token)
         if ticket is None or ticket.expires <= time.monotonic():
             raise web.HTTPUnauthorized(text="invalid room token")
+        session = self.db.execute("SELECT device_id FROM sessions WHERE token=?",
+                                  (ticket.session_token,)).fetchone()
+        if not session or session["device_id"] != ticket.device or not self.device(ticket.device):
+            raise web.HTTPUnauthorized(text="revoked room session")
         ws = web.WebSocketResponse(heartbeat=None, max_msg_size=MAX_SIGNAL)
         await ws.prepare(req)
         peer = Peer(ws, ticket)
@@ -514,10 +545,10 @@ class ControlPlane:
             web.post("/api/v1/room/create", self.create_room),
             web.post("/api/v1/room/join/by_device/{device}", self.join),
             web.post("/api/v1/tool/configures_with_version", self.configures),
-            web.post("/api/v1/transport/{device}/rpc/request", self.unsupported),
+            web.post("/api/v1/transport/{device}/rpc/request", self.transport_rpc),
             web.get("/socket.io/", self.signal),
             web.get("/healthz", health),
-        ])
+        ] + self.compat_routes())
 
         async def close(_):
             for peer in list(self.peers):
