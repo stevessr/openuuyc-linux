@@ -390,12 +390,17 @@ class ControlPlane:
                 other = host if peer is controller else controller
                 item = args[0]
                 data = item["data"]
-                # The host publishes DeviceCapability with ice_id inside the
-                # nested capability, not on the forward_setting envelope.
+                # UU forward_setting envelopes carry their ICE identity
+                # inside the typed payload. Signal app-data has no ICE field,
+                # but is still restricted to the authenticated active peer pair.
                 declared_ice = data.get("ice_id")
-                if event == "forward_setting" and data.get("type") == "device_capability":
-                    capability = data.get("device_capability")
-                    declared_ice = capability.get("ice_id") if isinstance(capability, dict) else None
+                if event == "forward_setting":
+                    kind = data.get("type")
+                    nested = data.get(kind) if isinstance(kind, str) else None
+                    if kind == "signal_app_data":
+                        declared_ice = ice
+                    elif isinstance(nested, dict):
+                        declared_ice = nested.get("ice_id")
                 if (item.get("client_id") != other.client_id or
                     declared_ice != ice or
                     data.get("app_control_id", app) != app):
