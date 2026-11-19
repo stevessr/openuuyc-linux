@@ -154,6 +154,19 @@ class SelfHostTests(unittest.IsolatedAsyncioTestCase):
                                                      "video_codec_capability": []}}}
         await host.send_str("42" + json.dumps(["forward_setting", capability]))
         self.assertIn("forward_setting", (await controller.receive()).data)
+        sender = {"client_id": forwarded["client_id"],
+                  "data": {"type": "sender_para_info",
+                           "sender_para_info": {"ice_id": info["ice_id"],
+                                                "sender_media_infos": []}}}
+        await host.send_str("42" + json.dumps(["forward_setting", sender]))
+        self.assertIn("sender_para_info", (await controller.receive()).data)
+        app_data = {"client_id": info["client_id"],
+                    "data": {"type": "signal_app_data",
+                             "signal_app_data": {"binary_data": {"_placeholder": True, "num": 0}}}}
+        await controller.send_str("451-" + json.dumps(["forward_setting", app_data]))
+        await controller.send_bytes(b"\x04protobuf-payload")
+        self.assertIn("signal_app_data", (await host.receive()).data)
+        self.assertEqual((await host.receive()).data, b"\x04protobuf-payload")
         await host.send_str('42["clear_out"]')
         self.assertIn("released", (await controller.receive()).data)
 
