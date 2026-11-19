@@ -42,6 +42,7 @@ class Ticket:
     force: bool = False
     session_token: str = ""
     guest: bool = False
+    client_id: str = field(default_factory=lambda: secrets.token_hex(12))
 
 
 @dataclass(eq=False)
@@ -75,7 +76,8 @@ class Peer:
 
 class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
     def __init__(self, database: str, public_url: str, admin_key: str, ice_urls: list[str],
-                 turn_secret: str = "", turn_user: str = "", turn_password: str = ""):
+                 turn_secret: str = "", turn_user: str = "", turn_password: str = "",
+                 reconnect_grace: float = 20.0):
         if not public_url.startswith("https://"):
             raise ValueError("OPENUUYC_PUBLIC_URL must be an HTTPS origin")
         if len(admin_key) < 24:
@@ -89,6 +91,7 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
         self.turn_secret = turn_secret
         self.turn_user = turn_user
         self.turn_password = turn_password
+        self.reconnect_grace = max(0.05, min(120.0, reconnect_grace))
         self.db = sqlite3.connect(database, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
@@ -114,6 +117,7 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
         self.peers: set[Peer] = set()
         self.hosts: dict[str, Peer] = {}
         self.controllers: dict[str, Peer] = {}
+        self.disconnect_tasks: set[asyncio.Task] = set()
         self.controls: dict[str, tuple[Peer, Peer, str, str]] = {}
         self.guard = asyncio.Lock()
 
@@ -278,6 +282,11 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
         self.db.execute("DELETE FROM sessions WHERE token=?", (token,))
         async with self.guard:
             invalid = [p for p in self.peers if p.ticket.session_token == token]
+            affected = [target for target, (controller, host, _, _) in self.controls.items()
+                        if controller.ticket.session_token == token
+                        or host.ticket.session_token == token]
+            for target in affected:
+                await self.release(target)
             for key, ticket in list(self.tickets.items()):
                 if ticket.session_token == token:
                     self.tickets.pop(key, None)
@@ -367,8 +376,26 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
                     await previous.socket.close(code=1008, message=b"host superseded")
                 self.hosts[peer.ticket.device] = peer
             else:
+                previous = self.controllers.get(peer.client_id)
+                if previous and previous is not peer:
+                    await previous.socket.close(code=1008, message=b"controller superseded")
                 self.controllers[peer.client_id] = peer
+            # Physical WebSocket generations may change without changing the
+            # logical UU room, ICE id, app_control_id or controller client_id.
+            for target, (controller, host, ice, app) in list(self.controls.items()):
+                if controller.ticket is peer.ticket:
+                    controller = peer
+                if host.ticket is peer.ticket:
+                    host = peer
+                self.controls[target] = (controller, host, ice, app)
             self.peers.add(peer)
+
+    async def expire_disconnected(self, peer):
+        await asyncio.sleep(self.reconnect_grace)
+        async with self.guard:
+            for target, (controller, host, _, _) in list(self.controls.items()):
+                if peer is controller or peer is host:
+                    await self.release(target)
 
     async def leave(self, peer):
         peer.active = False
@@ -376,10 +403,14 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
             self.peers.discard(peer)
             if self.hosts.get(peer.ticket.device) is peer:
                 self.hosts.pop(peer.ticket.device, None)
-            self.controllers.pop(peer.client_id, None)
-            for target, (controller, host, _, _) in list(self.controls.items()):
-                if peer is controller or peer is host:
-                    await self.release(target)
+            if self.controllers.get(peer.client_id) is peer:
+                self.controllers.pop(peer.client_id, None)
+            if any(peer is c or peer is h for c, h, _, _ in self.controls.values()):
+                # Delay release only for unexpected physical disconnects. Explicit
+                # leave, logout and host clear_out already release immediately.
+                task = asyncio.create_task(self.expire_disconnected(peer))
+                self.disconnect_tasks.add(task)
+                task.add_done_callback(self.disconnect_tasks.discard)
 
     async def handle_event(self, peer, event, args, ack, attachment):
         if event == "room_info":
@@ -488,7 +519,7 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
             raise web.HTTPUnauthorized(text="revoked room session")
         ws = web.WebSocketResponse(heartbeat=None, max_msg_size=MAX_SIGNAL)
         await ws.prepare(req)
-        peer = Peer(ws, ticket)
+        peer = Peer(ws, ticket, client_id=ticket.client_id)
         await self.enter(peer)
         await peer.send("0" + json.dumps(
             {"sid": peer.client_id, "upgrades": [], "pingInterval": 25000,
@@ -591,6 +622,9 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
         async def close(_):
             for peer in list(self.peers):
                 await peer.socket.close()
+            for task in list(self.disconnect_tasks):
+                task.cancel()
+            await asyncio.gather(*self.disconnect_tasks, return_exceptions=True)
             self.db.close()
         app.on_cleanup.append(close)
         return app
