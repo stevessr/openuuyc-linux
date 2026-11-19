@@ -147,6 +147,13 @@ class SelfHostTests(unittest.IsolatedAsyncioTestCase):
         await controller.send_bytes(b"\x04\x1f\x8b")
         self.assertIn("soac", (await host.receive()).data)
         self.assertEqual((await host.receive()).data, b"\x04\x1f\x8b")
+        capability = {"client_id": forwarded["client_id"],
+                      "data": {"type": "device_capability",
+                               "device_capability": {"ice_id": info["ice_id"],
+                                                     "display_info": [],
+                                                     "video_codec_capability": []}}}
+        await host.send_str("42" + json.dumps(["forward_setting", capability]))
+        self.assertIn("forward_setting", (await controller.receive()).data)
         await host.send_str('42["clear_out"]')
         self.assertIn("released", (await controller.receive()).data)
 
