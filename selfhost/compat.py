@@ -6,8 +6,6 @@ target; never report success without an accepted signaling write.
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import re
 import secrets
@@ -149,10 +147,6 @@ class Compatibility:
                 (version, device_id),
             )
 
-    def _assist_hash(self, device_id, value):
-        return hmac.new(self.admin_key.encode(),
-                        (device_id + "\x00" + value).encode(), hashlib.sha256).hexdigest()
-
     def _assist_by_device(self, device_id):
         return self.db.execute(
             "SELECT * FROM assistance WHERE device_id=?", (device_id,)
@@ -164,12 +158,6 @@ class Compatibility:
         return self.db.execute(
             "SELECT * FROM assistance WHERE connect_id=?", (connect_id,)
         ).fetchone()
-
-    def _assist_enabled(self, row):
-        return (row is not None and bool(row["allow_control"])
-                and self.device(row["device_id"]) is not None
-                and row["device_id"] in self.hosts
-                and self.hosts[row["device_id"]].active)
 
     def _save_recent(self, caller_id, target, connect_id):
         self.db.execute("""
@@ -332,133 +320,6 @@ class Compatibility:
             )
             return envelope({"connect_id": connect_id})
         return envelope({"connect_id": existing["connect_id"]})
-
-    async def assist_upload_mode(self, req):
-        caller = self.host_caller(req)
-        body = await self.body(req)
-        row = self._assist_by_device(caller["device_id"])
-        if not row or not isinstance(body.get("allow_control"), bool):
-            return envelope(code=400, msg="invalid assist configuration")
-        if body.get("control_id") != row["connect_id"]:
-            return envelope(code=403, msg="assist identity mismatch")
-        mode = body.get("control_mode")
-        if not isinstance(mode, str) or not (1 <= len(mode) <= 64):
-            return envelope(code=400, msg="invalid assist mode")
-        self.db.execute(
-            "UPDATE assistance SET control_mode=?,allow_control=? WHERE device_id=?",
-            (mode, int(body["allow_control"]), caller["device_id"])
-        )
-        return envelope({})
-
-    async def assist_upload_sign(self, req):
-        caller = self.host_caller(req)
-        body = await self.body(req)
-        row = self._assist_by_device(caller["device_id"])
-        if not row or body.get("control_id") != row["connect_id"]:
-            return envelope(code=403, msg="assist identity mismatch")
-        sign = body.get("sign", "")
-        backup = body.get("backup_sign", "")
-        if (not isinstance(sign, str) or not isinstance(backup, str)
-                or len(sign) > 256 or len(backup) > 256):
-            return envelope(code=400, msg="invalid assist credential")
-        allowed = body.get("can_remote_control")
-        confirmation = body.get("need_confirmation")
-        if not isinstance(allowed, bool) or not isinstance(confirmation, bool):
-            return envelope(code=400, msg="invalid assist policy")
-        mode = body.get("control_mode")
-        if not isinstance(mode, str) or not (1 <= len(mode) <= 64):
-            return envelope(code=400, msg="invalid assist mode")
-        self.db.execute("""
-            UPDATE assistance SET
-              sign_hash=?,backup_hash=?,control_mode=?,allow_control=?,need_confirmation=?
-            WHERE device_id=?
-        """, (self._assist_hash(caller["device_id"], sign) if sign else "",
-              self._assist_hash(caller["device_id"], backup) if backup else "",
-              mode, int(allowed), int(confirmation), caller["device_id"]))
-        return envelope({})
-
-    async def assist_upload_confirmation(self, req):
-        caller = self.host_caller(req)
-        body = await self.body(req)
-        row = self._assist_by_device(caller["device_id"])
-        if not row or body.get("control_id") != row["connect_id"]:
-            return envelope(code=403, msg="assist identity mismatch")
-        if not isinstance(body.get("allow_control"), bool) or not isinstance(body.get("need_password"), bool):
-            return envelope(code=400, msg="invalid assist policy")
-        self.db.execute(
-            "UPDATE assistance SET allow_control=?,need_password=? WHERE device_id=?",
-            (int(body["allow_control"]), int(body["need_password"]), caller["device_id"])
-        )
-        return envelope({})
-
-    async def assist_control_mode(self, req):
-        self.caller(req)
-        body = await self.body(req)
-        row = self._assist_by_connect(body.get("connect_id"))
-        if not self._assist_enabled(row):
-            return envelope(code=404, msg="assist device offline or not allowed")
-        return envelope({"can_remote_control": True, "control_mode": row["control_mode"]})
-
-    def _assist_room(self, caller, row, supplied_code, session_token):
-        if not self._assist_enabled(row):
-            return None, 404
-        if caller["device_id"] == row["device_id"]:
-            return None, 400
-        # Live confirmation requires push challenge/response and is deliberately
-        # not represented by the static password check.
-        if row["need_confirmation"]:
-            return None, 1136
-        if row["need_password"] or row["sign_hash"]:
-            key = (caller["device_id"], row["device_id"])
-            now = time.monotonic()
-            attempts = [t for t in self.assist_failures.get(key, ()) if now - t < 300]
-            if len(attempts) >= 6:
-                return None, 429
-            candidate = self._assist_hash(row["device_id"], supplied_code)
-            if not ((row["sign_hash"] and hmac.compare_digest(candidate, row["sign_hash"])) or
-                    (row["backup_hash"] and hmac.compare_digest(candidate, row["backup_hash"]))):
-                attempts.append(now)
-                self.assist_failures[key] = attempts
-                return None, 403
-            self.assist_failures.pop(key, None)
-        self._save_recent(caller["device_id"], row["device_id"], row["connect_id"])
-        room = self.new_ticket("controller", caller["device_id"], row["device_id"],
-                               lifetime=600, session_token=session_token)
-        room.update({
-            "share_id": row["connect_id"],
-            "device_name": self.device(row["device_id"])["alias"],
-            "publisher_platform": self.device(row["device_id"])["platform"],
-            "publisher_version_name": self.metadata(row["device_id"])["version_name"],
-            "publisher_device_id": row["device_id"],
-            "control_id": row["connect_id"],
-        })
-        return room, 0
-
-    async def assist_join_by_code(self, req):
-        caller = self.caller(req)
-        body = await self.body(req)
-        row = self._assist_by_connect(body.get("connect_id"))
-        code = body.get("connect_code", "")
-        if not isinstance(code, str) or len(code) > 256:
-            return envelope(code=400, msg="invalid assist code")
-        token = req.headers.get("Authorization", "")[7:]
-        room, code_result = self._assist_room(caller, row, code, token)
-        return envelope(room, code_result, "" if code_result == 0 else "assist join rejected")
-
-    async def assist_join_by_confirmation(self, req):
-        self.caller(req)
-        await self.body(req)
-        return envelope(code=501, msg="live host confirmation not implemented")
-
-    async def assist_cancel(self, req):
-        caller = self.caller(req)
-        body = await self.body(req)
-        row = self._assist_by_connect(body.get("connect_id"))
-        if not row or row["device_id"] != caller["device_id"]:
-            return envelope(code=403, msg="assist owner mismatch")
-        async with self.guard:
-            await self.release(row["device_id"])
-        return envelope({})
 
     async def assist_refetch(self, req):
         caller = self.caller(req)
