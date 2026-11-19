@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from urllib.parse import quote
 from aiohttp import WSMsgType, web
 from .compat import Compatibility
+from .ice import ice_servers
 
 MAX_BODY = 1024 * 1024
 MAX_SIGNAL = 1024 * 1024
@@ -70,7 +71,8 @@ class Peer:
 
 
 class ControlPlane(Compatibility):
-    def __init__(self, database: str, public_url: str, admin_key: str, ice_urls: list[str]):
+    def __init__(self, database: str, public_url: str, admin_key: str, ice_urls: list[str],
+                 turn_secret: str = "", turn_user: str = "", turn_password: str = ""):
         if not public_url.startswith("https://"):
             raise ValueError("OPENUUYC_PUBLIC_URL must be an HTTPS origin")
         if len(admin_key) < 24:
@@ -80,7 +82,10 @@ class ControlPlane(Compatibility):
         self.public_url = public_url.rstrip("/")
         self.signal_endpoint = self.public_url.removeprefix("https://")
         self.admin_key = admin_key
-        self.ice_servers = [{"urls": u} for u in ice_urls]
+        self.ice_urls = ice_urls
+        self.turn_secret = turn_secret
+        self.turn_user = turn_user
+        self.turn_password = turn_password
         self.db = sqlite3.connect(database, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
@@ -420,7 +425,11 @@ class ControlPlane(Compatibility):
                              "streamer_data": request.get("streamer_data", "{}")}
                 await host.event("be-controlled", forwarded, attachment)
                 reply = {"code": 0, "client_id": host.client_id, "ice_id": ice,
-                         "iceServers": self.ice_servers, "force_relay": False}
+                         "iceServers": ice_servers(self.ice_urls,
+                                                   shared_secret=self.turn_secret,
+                                                   static_user=self.turn_user,
+                                                   static_password=self.turn_password),
+                         "force_relay": False}
                 await peer.send("43" + ack + json.dumps(["success", reply], separators=(",", ":")))
             return
         if event in ("soac", "forward_setting"):
@@ -586,7 +595,10 @@ def main():
     public_url = os.environ.get("OPENUUYC_PUBLIC_URL", "")
     admin_key = os.environ.get("OPENUUYC_ADMIN_KEY", "")
     ice = [x.strip() for x in os.environ.get("OPENUUYC_ICE_SERVERS", "").split(",") if x.strip()]
-    plane = ControlPlane(args.database, public_url, admin_key, ice)
+    plane = ControlPlane(args.database, public_url, admin_key, ice,
+                         turn_secret=os.environ.get("OPENUUYC_TURN_SECRET", ""),
+                         turn_user=os.environ.get("OPENUUYC_TURN_USER", ""),
+                         turn_password=os.environ.get("OPENUUYC_TURN_PASSWORD", ""))
     web.run_app(plane.application(), host=args.bind, port=args.port, access_log=None)
 
 
