@@ -337,7 +337,7 @@ class Compatibility:
             return envelope(code=404, msg="assist device offline or not allowed")
         return envelope({"can_remote_control": True, "control_mode": row["control_mode"]})
 
-    def _assist_room(self, caller, row, supplied_code):
+    def _assist_room(self, caller, row, supplied_code, session_token):
         if not self._assist_enabled(row):
             return None, 404
         if caller["device_id"] == row["device_id"]:
@@ -353,7 +353,7 @@ class Compatibility:
                 return None, 403
         self._save_recent(caller["device_id"], row["device_id"], row["connect_id"])
         room = self.new_ticket("controller", caller["device_id"], row["device_id"],
-                               lifetime=600, session_token=self._session_token)
+                               lifetime=600, session_token=session_token)
         room.update({
             "share_id": row["connect_id"],
             "device_name": self.device(row["device_id"])["alias"],
@@ -371,12 +371,8 @@ class Compatibility:
         code = body.get("connect_code", "")
         if not isinstance(code, str) or len(code) > 256:
             return envelope(code=400, msg="invalid assist code")
-        # Scoped to this call. No async yield between storing token and ticket.
-        self._session_token = req.headers.get("Authorization", "")[7:]
-        try:
-            room, code_result = self._assist_room(caller, row, code)
-        finally:
-            self._session_token = ""
+        token = req.headers.get("Authorization", "")[7:]
+        room, code_result = self._assist_room(caller, row, code, token)
         return envelope(room, code_result, "" if code_result == 0 else "assist join rejected")
 
     async def assist_join_by_confirmation(self, req):
