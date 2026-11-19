@@ -187,10 +187,12 @@ class Compatibility:
         # helper protocol; acknowledging an unsent magic packet is unsafe.
         return envelope(code=501, msg="no configured local wake helper")
 
-    async def send_to_host(self, target, body):
+    async def send_to_host(self, target, body, require_control=True):
         host = self.hosts.get(target)
         row = self.device(target)
-        if not host or not host.active or not row or not row["controllable"]:
+        if not host or not host.active or not row:
+            return False
+        if require_control and not row["controllable"]:
             return False
         await host.event("bmsg_push", body)
         return host.active and not host.socket.closed
@@ -210,12 +212,15 @@ class Compatibility:
         target = req.match_info["device"]
         if not validated_id(target) or target == caller["device_id"]:
             return envelope(code=400, msg="invalid RPC target")
+        target_row = self.device(target)
+        if target_row is None:
+            return envelope(code=404, msg="RPC target does not exist")
         body = await self.body(req)
         action = body.get("p")
         if action not in {"shutdown", "android_control_request", "android_control_result"}:
             return envelope(code=501, msg="unsupported RPC")
         if action == "shutdown":
-            if self.device(target)["platform"] not in (1, 4):
+            if target_row["platform"] not in (1, 4):
                 return envelope(code=400, msg="not a desktop")
         elif action == "android_control_request":
             details = body.get("data", {})
@@ -224,7 +229,7 @@ class Compatibility:
                 info.get("device_id") != caller["device_id"] or
                 details.get("action") not in ("request_control", "cancel_request")):
                 return envelope(code=400, msg="invalid Android approval request")
-            if self.device(target)["platform"] != 2:
+            if target_row["platform"] != 2:
                 return envelope(code=400, msg="target is not Android")
             key = (target, caller["device_id"])
             if details["action"] == "cancel_request":
@@ -244,7 +249,8 @@ class Compatibility:
                 self.pending_android.get(key, 0) < time.monotonic()):
                 return envelope(code=403, msg="no matching active approval challenge")
             self.pending_android.pop(key, None)
-        delivered = await self.send_to_host(target, {"type": "transport_rpc", "data": body})
+        delivered = await self.send_to_host(target, {"type": "transport_rpc", "data": body},
+                                            require_control=(action == "shutdown"))
         return envelope({} if delivered else None, code=0 if delivered else 404,
                         msg="" if delivered else "target unavailable")
 
