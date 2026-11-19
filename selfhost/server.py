@@ -20,6 +20,7 @@ from aiohttp import WSMsgType, web
 from .compat import Compatibility
 from .ice import ice_servers
 from .media import LocalMedia
+from .assistance_live import LiveAssistance
 
 MAX_BODY = 1024 * 1024
 MAX_SIGNAL = 1024 * 1024
@@ -72,7 +73,7 @@ class Peer:
             await self.send("451-" + payload, b"\x04" + attachment)
 
 
-class ControlPlane(Compatibility, LocalMedia):
+class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
     def __init__(self, database: str, public_url: str, admin_key: str, ice_urls: list[str],
                  turn_secret: str = "", turn_user: str = "", turn_password: str = ""):
         if not public_url.startswith("https://"):
@@ -108,6 +109,7 @@ class ControlPlane(Compatibility, LocalMedia):
         """)
         self.init_compat()
         self.init_media(database)
+        self.init_live_assist()
         self.tickets: dict[str, Ticket] = {}
         self.peers: set[Peer] = set()
         self.hosts: dict[str, Peer] = {}
