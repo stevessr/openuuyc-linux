@@ -119,6 +119,10 @@ class Compatibility:
         guest_id = secrets.token_urlsafe(20)
         token = secrets.token_urlsafe(48)
         self.db.execute("DELETE FROM guest_sessions WHERE expires<?", (int(time.time()),))
+        count = self.db.execute("SELECT COUNT(*) FROM guest_sessions WHERE device_id=?",
+                                (device_id,)).fetchone()[0]
+        if count >= 16:
+            return envelope(code=429, msg="too many active guest sessions")
         self.db.execute(
             "INSERT INTO guest_sessions(token,device_id,guest_id,expires) VALUES(?,?,?,?)",
             (token, device_id, guest_id, int(time.time()) + 24 * 3600))
@@ -186,12 +190,15 @@ class Compatibility:
         if not validated_id(target) or not self.device(target) or target == caller["device_id"]:
             return envelope(code=400, msg="invalid unbind target")
         async with self.guard:
-            await self.release(target)
+            for controlled, (controller, host, _, _) in list(self.controls.items()):
+                if controller.ticket.device == target or host.ticket.device == target:
+                    await self.release(controlled)
             peers = [p for p in self.peers if p.ticket.device == target]
             for token, ticket in list(self.tickets.items()):
                 if ticket.device == target or ticket.target == target:
                     self.tickets.pop(token, None)
             self.db.execute("DELETE FROM sessions WHERE device_id=?", (target,))
+            self.db.execute("DELETE FROM guest_sessions WHERE device_id=?", (target,))
             self.db.execute("DELETE FROM saved_assistance WHERE publisher_device_id=?", (target,))
             self.db.execute("DELETE FROM device_properties WHERE device_id=?", (target,))
             self.db.execute("DELETE FROM assistance WHERE device_id=?", (target,))
@@ -357,7 +364,10 @@ class Compatibility:
             " ORDER BY COALESCE(favorited_at,last_connected_at,0) DESC LIMIT 100",
             (owner,)
         ).fetchall()
-        return [dict(row) for row in rows]
+        saved = [dict(row) for row in rows]
+        for entry in saved:
+            entry["is_favorite"] = bool(entry["is_favorite"])
+        return saved
 
     async def saved_list(self, req):
         caller = self.caller(req)
