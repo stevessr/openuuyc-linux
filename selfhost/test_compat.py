@@ -265,5 +265,56 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
                                 {"connect_id": code, "connect_code": "secret"})
         self.assertEqual(locked["code"], 429)
 
+    async def test_wallpaper_grant_upload_verified_and_bound(self):
+        from urllib.parse import urlparse
+        hd, cd, ht, ct = await self.users()
+        _, granted = await self.request("GET", "/api/v1/tool/fp/token?filetype=1",
+                                        "host", hd, ht)
+        self.assertEqual(granted["code"], 0)
+        upload = granted["data"]
+        image = b"\xff\xd8\xff" + b"sample-fixture" + b"\xff\xd9"
+        async with self.client.post(urlparse(upload["req_url"]).path,
+                      headers={"Authorization": upload["token"]},
+                      data=image) as r:
+            self.assertEqual(r.status, 200)
+            result = await r.json()
+        self.assertEqual(result["fsize"], len(image))
+        self.assertEqual(result["mime"], "image/jpeg")
+        async with self.client.get(urlparse(result["url"]).path) as r:
+            self.assertEqual(r.status, 200)
+            self.assertEqual(await r.read(), image)
+        _, wrong = await self.request("POST", "/api/v1/device/wallpaper",
+                             "controller", cd, ct, {"wallpaper_url": result["url"]})
+        self.assertEqual(wrong["code"], 403)
+        _, ok = await self.request("POST", "/api/v1/device/wallpaper",
+                             "host", hd, ht, {"wallpaper_url": result["url"]})
+        self.assertEqual(ok["code"], 0)
+        _, listing = await self.request("GET", "/api/v1/device/list",
+                                          "controller", cd, ct)
+        listed_host = next(x for x in listing["data"]["my_binded_devices"]
+                           if x["device_id"] == hd)
+        self.assertEqual(listed_host["wallpaper_url"], result["url"])
+        async with self.client.post(urlparse(upload["req_url"]).path,
+                      headers={"Authorization": upload["token"]},
+                      data=image) as r:
+            self.assertEqual(r.status, 401)
+
+    async def test_turn_rest_credentials_have_session_scoped_expiry(self):
+        import base64
+        import hashlib
+        import hmac
+        import time
+        from selfhost.ice import ice_servers
+        servers = ice_servers(["stun:stun.test:3478", "turn:turn.test:3478"],
+                               shared_secret="private-secret")
+        self.assertNotIn("username", servers[0])
+        turn = servers[1]
+        expiry = int(turn["username"].split(":")[0])
+        self.assertTrue(int(time.time()) < expiry <= int(time.time()) + 3601)
+        expected = base64.b64encode(hmac.new(b"private-secret",
+            turn["username"].encode("utf-8"), hashlib.sha1).digest()).decode("ascii")
+        self.assertEqual(turn["credential"], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
