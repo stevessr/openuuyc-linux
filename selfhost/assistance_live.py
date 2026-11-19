@@ -20,6 +20,10 @@ import time
 from .server_utils import envelope
 
 
+class AssistCancelled(Exception):
+    """A pending host challenge was explicitly cancelled by the controller."""
+
+
 @dataclass
 class Challenge:
     host: str
@@ -65,7 +69,7 @@ class LiveAssistance:
             await host.event("bmsg_push", {"type": kind, "data": payload})
             result = await asyncio.wait_for(future, timeout)
             return control_id, result
-        except (asyncio.TimeoutError, ConnectionError):
+        except (asyncio.TimeoutError, ConnectionError, AssistCancelled):
             return None
         finally:
             if self.assist_challenges.get(control_id) is challenge:
@@ -186,8 +190,13 @@ class LiveAssistance:
         if mode == "password_confirmation" or response["need_confirmation"]:
             # Preserve the validated password only for a single subsequent
             # explicit host-confirmation POST and at most 60 seconds.
+            now = time.monotonic()
+            self.assist_verified = {k: v for k, v in self.assist_verified.items()
+                                    if v[2] > now}
+            if len(self.assist_verified) >= 256:
+                return envelope(code=429, msg="too many pending assistance approvals")
             self.assist_verified[control_id] = (
-                row["device_id"], caller["device_id"], time.monotonic() + 60)
+                row["device_id"], caller["device_id"], now + 60)
             return envelope({"control_id": control_id}, code=1136,
                             msg="waiting for local host confirmation")
         token = req.headers["Authorization"][7:]
@@ -238,7 +247,7 @@ class LiveAssistance:
             for key in active:
                 challenge = self.assist_challenges.pop(key, None)
                 if challenge is not None and not challenge.future.done():
-                    challenge.future.cancel()
+                    challenge.future.set_exception(AssistCancelled())
                 if host:
                     await host.event("bmsg_push",
                                      {"type": "remote_control_by_confirmation_cancel",
