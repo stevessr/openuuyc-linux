@@ -22,35 +22,52 @@ internal object PicoScreenMenu {
             elevation=dp(12).toFloat();isOutsideTouchable=true;setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT))
         }
         val screens=session.screenSnapshot()
+        val displays=screens.filter { !it.isWindowDevice }
+        val windows=screens.filter { it.isWindowDevice }
+        val split=displays.isNotEmpty() && windows.isNotEmpty()
         val selectedIndex=screens.indexOfFirst {it.id==session.selectedScreen()}
         val rowHeight=dp(ROW_HEIGHT_DP)
         // Remote hosts can report many screens (displays + virtual displays + window sources);
         // the list scrolls inside a bounded height so title and 刷新列表 stay visible.
-        val listHeight=minOf(screens.size*rowHeight,run {
+        val listHeight=minOf(screens.size*rowHeight + if(split) dp(64) else 0,run {
             val location=IntArray(2);anchor.getLocationOnScreen(location)
             // Leave room for the anchor, the "远端屏幕/窗口" title, the 刷新列表 button and the panel padding.
             val belowAnchor=metrics.heightPixels-location[1]-anchor.height-dp(150)
             minOf(belowAnchor,(metrics.heightPixels*0.62f).toInt()).coerceAtLeast(rowHeight*3)
         })
         root.addView(TextView(activity).apply {
-            text=if(screens.size*rowHeight>listHeight) "远端屏幕/窗口 · 共 ${screens.size} 个，可上下滑动" else "远端屏幕/窗口"
+            text=if(split) "远端设备 · 显示器 (${displays.size}) / 应用窗口 (${windows.size})"
+            else if(screens.size*rowHeight>listHeight) "远端屏幕/窗口 · 共 ${screens.size} 个，可上下滑动"
+            else "远端屏幕/窗口"
             textSize=18f;setTextColor(PicoTheme.TEXT);setPadding(dp(8),0,0,dp(10))
         })
         if(screens.isEmpty()) root.addView(TextView(activity).apply { text="尚未收到屏幕列表";setTextColor(PicoTheme.MUTED) })
         val list=LinearLayout(activity).apply {orientation=LinearLayout.VERTICAL}
         val scroll=ScrollView(activity).apply {isFillViewport=false;addView(list)}
         if(screens.isNotEmpty()) root.addView(scroll,LinearLayout.LayoutParams(-1,listHeight))
-        screens.forEach { screen ->
-            list.addView(Button(activity).apply {
-                isAllCaps=false;gravity=android.view.Gravity.START or android.view.Gravity.CENTER_VERTICAL
-                text="${if(screen.id==session.selectedScreen()) "✓ " else ""}$screen\n${screen.current ?: "等待尺寸"} · ${if(screen.track<0) "未采集" else "视频轨 ${screen.track}"}"
-                setTextColor(PicoTheme.TEXT);textSize=15f
-                setOnClickListener {
-                    beforeSelect()
-                    if(session.switchScreen(screen.id)) popup.dismiss() else report("屏幕已变化或连接尚未就绪，未切换")
-                }
-            },LinearLayout.LayoutParams(-1,rowHeight))
+        fun addSection(title: String, items: List<org.openuuyc.pico.uu.UuRemoteScreen>) {
+            if(items.isEmpty()) return
+            if(split) {
+                list.addView(TextView(activity).apply {
+                    text=title;textSize=13f;setTextColor(PicoTheme.MUTED)
+                    setPadding(dp(8),dp(8),dp(8),dp(4))
+                })
+            }
+            items.forEach { screen ->
+                val label = if(split && screen.isWindowDevice) screen.windowTitle() else screen.toString()
+                list.addView(Button(activity).apply {
+                    isAllCaps=false;gravity=android.view.Gravity.START or android.view.Gravity.CENTER_VERTICAL
+                    text="${if(screen.id==session.selectedScreen()) "✓ " else ""}$label\n${screen.current ?: "等待尺寸"} · ${if(screen.track<0) "未采集" else "视频轨 ${screen.track}"}"
+                    setTextColor(PicoTheme.TEXT);textSize=15f
+                    setOnClickListener {
+                        beforeSelect()
+                        if(session.switchScreen(screen.id)) popup.dismiss() else report("屏幕已变化或连接尚未就绪，未切换")
+                    }
+                },LinearLayout.LayoutParams(-1,rowHeight))
+            }
         }
+        addSection("显示器设备", displays)
+        addSection("应用窗口（模拟设备）", windows)
         root.addView(Button(activity).apply { text="刷新列表";setOnClickListener { popup.dismiss();show(activity,anchor,session,beforeSelect,report) } })
         popup.showAsDropDown(anchor)
         if(selectedIndex>0) scroll.post {

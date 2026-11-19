@@ -178,6 +178,7 @@ impl DisplayTopology {
                         height: old.height,
                         refresh_hz: old.fps,
                         display: old.display.clone(),
+                        device: old.device.clone(),
                     })
                     .collect();
             }

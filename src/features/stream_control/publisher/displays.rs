@@ -48,6 +48,13 @@ pub(crate) fn screen_states(
                             })
                         })
                         .flatten(),
+                    openuuyc_device: (crate::features::host::window_device::enabled()
+                        && screen.is_window_source())
+                    .then(|| super::super::wire::PbScreenDevice {
+                        version: 1,
+                        name: crate::features::host::window_device::DEVICE_NAME.to_owned(),
+                        kind: crate::features::host::window_device::KIND_WINDOW,
+                    }),
                     id: screen.id,
                     fps: screen.fps.min(i32::MAX as u32) as i32,
                     resolutions: sizes.into_iter().map(|(w, h)| rect(w, h)).collect(),

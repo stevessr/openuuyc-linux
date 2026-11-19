@@ -7,6 +7,120 @@ use winit::window::WindowId;
 
 use crate::account::api::DeviceInfo;
 use crate::account::client::AuthenticatedClient;
+use crate::features::stream_control::SimulatedDeviceRole;
+
+#[derive(Clone, Debug)]
+pub(crate) struct SimulatedDevicesMenu {
+    pub alias: String,
+    pub active_role: SimulatedDeviceRole,
+    pub display_count: usize,
+    pub window_count: usize,
+    pub other_role_open_in_window: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SimulatedDeviceAction {
+    SwitchRole(SimulatedDeviceRole),
+    OpenRoleWindow(SimulatedDeviceRole),
+}
+
+pub(super) fn show_simulated_devices_section(
+    ui: &mut egui::Ui,
+    info: &SimulatedDevicesMenu,
+) -> Option<SimulatedDeviceAction> {
+    let mut action = None;
+    ui.label(
+        egui::RichText::new("当前主机 · 模拟设备分离")
+            .size(crate::ui::theme::TINY)
+            .color(crate::ui::theme::MUTED),
+    );
+    ui.add_space(4.0);
+    let row_gap = crate::ui::theme::DEVICE_MENU_ROW_GAP;
+    ui.spacing_mut().item_spacing.y = row_gap;
+    for (role, count) in [
+        (SimulatedDeviceRole::Displays, info.display_count),
+        (SimulatedDeviceRole::Windows, info.window_count),
+    ] {
+        let selected = info.active_role == role;
+        let label = role.device_title(&info.alias, true);
+        let detail = if selected {
+            "当前窗口"
+        } else if info.other_role_open_in_window {
+            "独立窗口已打开"
+        } else if count == 0 {
+            "暂无源"
+        } else {
+            "点击切换"
+        };
+        let response = ui
+            .push_id(("simulated-device-role", role.short_label()), |ui| {
+                crate::ui::controls::device_menu_row(
+                    ui,
+                    &label,
+                    detail,
+                    if count > 0 {
+                        crate::ui::theme::GREEN
+                    } else {
+                        crate::ui::theme::MUTED
+                    },
+                    selected,
+                    !selected && count > 0,
+                )
+            })
+            .inner;
+        if response.clicked() {
+            action = Some(if info.other_role_open_in_window {
+                SimulatedDeviceAction::OpenRoleWindow(role)
+            } else {
+                SimulatedDeviceAction::SwitchRole(role)
+            });
+            ui.close();
+        }
+    }
+    let other = info.active_role.other();
+    let other_count = match other {
+        SimulatedDeviceRole::Displays => info.display_count,
+        SimulatedDeviceRole::Windows => info.window_count,
+    };
+    let open_label = if info.other_role_open_in_window {
+        format!("聚焦独立窗口「{}」", other.short_label())
+    } else {
+        format!("在独立窗口并排打开「{}」", other.short_label())
+    };
+    let open_detail = format!("{other_count} 个");
+    if crate::ui::controls::menu_row(
+        ui,
+        &open_label,
+        &open_detail,
+        None,
+        other_count > 0,
+        false,
+    )
+    .on_hover_text("将显示器与应用窗口作为两个独立设备窗口并排同时查看")
+    .clicked()
+    {
+        action = Some(SimulatedDeviceAction::OpenRoleWindow(other));
+        ui.close();
+    }
+    action
+}
+
+pub(super) fn simulated_only_menu(
+    response: &egui::Response,
+    simulated: &SimulatedDevicesMenu,
+) -> Option<SimulatedDeviceAction> {
+    let mut action = None;
+    egui::Popup::menu(response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .gap(6.0)
+        .width(crate::ui::theme::DEVICE_MENU_WIDTH)
+        .show(|ui| {
+            super::stream_menu::menu_style(ui);
+            ui.set_width(crate::ui::theme::DEVICE_MENU_WIDTH);
+            action = show_simulated_devices_section(ui, simulated);
+        });
+    action
+}
 
 pub(crate) struct SwitchRequest {
     pub from: String,
@@ -146,7 +260,18 @@ impl DeviceSwitcher {
         });
     }
 
+    #[allow(dead_code)]
     pub(super) fn menu(&self, response: &egui::Response, window: WindowId) {
+        let _ = self.menu_with_simulated(response, window, None);
+    }
+
+    pub(super) fn menu_with_simulated(
+        &self,
+        response: &egui::Response,
+        window: WindowId,
+        simulated: Option<&SimulatedDevicesMenu>,
+    ) -> Option<SimulatedDeviceAction> {
+        let mut simulated_action = None;
         let takeover = super::mutex_lock(&self.state).takeover.clone();
         if let Some((owner, device)) = takeover
             && owner == window
@@ -169,6 +294,12 @@ impl DeviceSwitcher {
             .show(|ui| {
                 super::stream_menu::menu_style(ui);
                 ui.set_width(crate::ui::theme::DEVICE_MENU_WIDTH);
+                if let Some(info) = simulated {
+                    simulated_action = show_simulated_devices_section(ui, info);
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                }
                 let state = super::mutex_lock(&self.state).clone();
                 if crate::ui::controls::device_menu_header(ui, state.loading || state.switching) {
                     self.refresh(ui.ctx());
@@ -273,5 +404,6 @@ impl DeviceSwitcher {
                         });
                 }
             });
+        simulated_action
     }
 }

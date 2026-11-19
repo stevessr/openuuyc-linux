@@ -90,9 +90,7 @@ pub(crate) fn is_window_target(id: i32) -> bool {
 
 /// 窗口源是否是这个 identity（两种前缀都算）。
 pub(crate) fn is_window_source(screen: &Screen) -> bool {
-    screen.identity.as_deref().is_some_and(|identity| {
-        identity.starts_with(WINDOW_IDENTITY_PREFIX) || identity.starts_with(WL_WINDOW_PREFIX)
-    })
+    screen.is_window_source()
 }
 
 /// An X11 capture has no GPU device. The one value stands for the CPU path

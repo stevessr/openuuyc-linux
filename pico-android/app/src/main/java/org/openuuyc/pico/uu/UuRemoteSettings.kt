@@ -11,8 +11,10 @@ internal data class UuRemoteScreen(
     // OpenUUYC private screen tag 101: kind == 1 means an independent window device.
     val deviceName: String = "", val deviceKind: Int = 0
 ) {
-    override fun toString() = if (deviceKind == 1 && deviceName.isNotBlank()) {
-        "$deviceName · ${name.ifBlank { "窗口 ${id + 1}" }}"
+    val isWindowDevice: Boolean get() = deviceKind == 1 && deviceName.isNotBlank()
+    fun windowTitle(): String = name.ifBlank { "窗口 ${id + 1}" }
+    override fun toString() = if (isWindowDevice) {
+        "$deviceName · ${windowTitle()}"
     } else name.ifBlank { "屏幕 ${id + 1}" }
 }
 internal data class UuCaptureSettings(

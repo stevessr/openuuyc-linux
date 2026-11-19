@@ -29,6 +29,7 @@ pub(crate) mod terminal;
 mod track;
 mod transport;
 pub(crate) mod update_resume;
+pub(crate) mod window_device;
 pub(crate) mod wol;
 
 use std::sync::{Mutex, MutexGuard};

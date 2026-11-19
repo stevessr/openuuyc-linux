@@ -42,6 +42,12 @@ impl Screen {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("显示器 {}", i64::from(self.id) + 1))
     }
+
+    pub(crate) fn is_window_source(&self) -> bool {
+        self.identity.as_deref().is_some_and(|identity| {
+            identity.starts_with("x11-window/") || identity.starts_with("wl-window/")
+        })
+    }
 }
 
 /// A protocol source ID stays tied to the monitor interface for this process.

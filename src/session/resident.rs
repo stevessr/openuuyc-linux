@@ -54,6 +54,8 @@ pub(crate) enum Request {
         terminal_local: bool,
         remote_power: bool,
         wol: bool,
+        #[serde(default = "window_device_default")]
+        window_device: bool,
     },
     Disconnect {
         account: String,
@@ -96,8 +98,13 @@ pub(crate) struct Snapshot {
     pub remote_power: bool,
     #[serde(default)]
     pub wol: bool,
+    #[serde(default = "window_device_default")]
+    pub window_device: bool,
     pub status: host::Status,
     pub capabilities: Option<host::desktop::Capabilities>,
+}
+fn window_device_default() -> bool {
+    true
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {

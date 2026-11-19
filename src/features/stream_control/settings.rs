@@ -560,6 +560,13 @@ pub(super) fn update_screen_baseline(state: &mut StreamControlState, screens: Pb
             if width == 0 || height == 0 {
                 return None;
             }
+            let device = screen
+                .openuuyc_device
+                .filter(|d| d.kind == super::SCREEN_DEVICE_KIND_WINDOW && !d.name.trim().is_empty())
+                .map(|d| super::ScreenDevice {
+                    name: d.name.trim().to_owned(),
+                    kind: d.kind,
+                });
             Some(ScreenBaseline {
                 id: screen.id,
                 name: screen.display_name,
@@ -576,6 +583,7 @@ pub(super) fn update_screen_baseline(state: &mut StreamControlState, screens: Pb
                     .unwrap_or_default(),
                 resolution_type: screen.resolution_type,
                 display,
+                device,
             })
         })
         .collect();

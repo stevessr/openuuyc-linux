@@ -135,6 +135,7 @@ struct Ownership {
     terminal_local: bool,
     remote_power: bool,
     wol: bool,
+    window_device: bool,
     power_executing: bool,
     port_revision: u64,
     audio_device: watch::Sender<Option<super::audio::Device>>,
@@ -195,6 +196,7 @@ impl Default for Handle {
                 terminal_local: false,
                 remote_power: false,
                 wol: false,
+                window_device: true,
                 power_executing: false,
                 port_revision: 0,
                 audio_device: watch::channel(None).0,
@@ -354,6 +356,8 @@ impl Handle {
         state.terminal_local = snapshot.terminal && snapshot.terminal_local;
         state.remote_power = snapshot.remote_power;
         state.wol = snapshot.wol;
+        state.window_device = snapshot.window_device;
+        super::window_device::set_enabled(snapshot.window_device);
         state.status = snapshot.status;
         self.assistance.replace(snapshot.assistance);
     }
@@ -443,6 +447,7 @@ impl Handle {
                 remote_power,
                 wol,
                 terminal_local,
+                window_device,
             )) => {
                 let _ = handle.assistance.configure(assistance);
                 handle.set_allowed(allowed);
@@ -462,6 +467,8 @@ impl Handle {
                 state.terminal_local = terminal && terminal_local;
                 state.remote_power = remote_power;
                 state.wol = wol;
+                state.window_device = window_device;
+                super::window_device::set_enabled(window_device);
                 state.dirty = false;
                 state.status.saving = false;
             }
@@ -480,6 +487,22 @@ impl Handle {
     }
     pub(crate) fn file_transfer_allowed(&self) -> bool {
         lock(&self.ownership).file_transfer
+    }
+    pub(crate) fn window_device_enabled(&self) -> bool {
+        lock(&self.ownership).window_device
+    }
+    pub(crate) fn set_window_device_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        let mut state = lock(&self.ownership);
+        anyhow::ensure!(state.active, "账号会话已结束");
+        if state.window_device != enabled {
+            state.window_device = enabled;
+            super::window_device::set_enabled(enabled);
+            state.settings_revision = state.settings_revision.wrapping_add(1);
+            state.dirty = true;
+            state.status.saving = true;
+            state.status.settings_error = None;
+        }
+        Ok(())
     }
     pub(crate) fn set_file_transfer_allowed(&self, allowed: bool) -> anyhow::Result<()> {
         let mut state = lock(&self.ownership);
@@ -879,6 +902,7 @@ impl Handle {
                 remote_power,
                 wol,
                 terminal_local,
+                window_device,
             ) = {
                 let state = lock(&self.ownership);
                 if !state.dirty {
@@ -899,6 +923,7 @@ impl Handle {
                     state.remote_power,
                     state.wol,
                     state.terminal_local,
+                    state.window_device,
                 )
             };
             let result = if crate::platform::host_service::resident::managed() {
@@ -918,6 +943,7 @@ impl Handle {
                         terminal_local,
                         remote_power,
                         wol,
+                        window_device,
                     },
                 )
                 .await
@@ -938,6 +964,7 @@ impl Handle {
                         remote_power,
                         wol,
                         terminal_local,
+                        window_device,
                     )
                 })
                 .await

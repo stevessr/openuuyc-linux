@@ -695,6 +695,7 @@ async fn run_authorized_account(
                                     terminal_local: current.host.terminal_local_allowed(),
                                     remote_power: current.host.power_allowed(),
                                     wol: current.host.wol_allowed(),
+                                    window_device: current.host.window_device_enabled(),
                                     status: current.host.status(),
                                     capabilities: current.host.capabilities().map(|v| (*v).clone()),
                                 })))},
@@ -725,6 +726,7 @@ async fn run_authorized_account(
                                     terminal_local,
                                     remote_power,
                                     wol,
+                                    window_device,
                                 } => {
                                     ensure!(expected == account, "账号已改变");
                                     encoding.validate()?;
@@ -741,6 +743,7 @@ async fn run_authorized_account(
                                     current.host.set_terminal_local_allowed(terminal_local)?;
                                     current.host.set_power_allowed(remote_power)?;
                                     current.host.set_wol_allowed(wol)?;
+                                    current.host.set_window_device_enabled(window_device)?;
                                     current.host.set_allowed(allowed);
                                     current.host.persist_settings().await;
                                     if let Some(error) = current.host.status().settings_error {

@@ -292,6 +292,7 @@ internal class PicoXrToolbar(
     private var pressed = false
     private var confirmingVirtual = false
     private var screenPage=false
+    private var screenRoleFilter=0 // 0=全部, 1=显示器, 2=应用窗口
     private var menuScreens=emptyList<org.openuuyc.pico.uu.UuRemoteScreen>()
     private var notice = "悬浮菜单 · 左 X / 右 A 唤起 · 摇杆选择、松开执行"
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -428,11 +429,37 @@ internal class PicoXrToolbar(
         return " · 第 $page/$pages 页"
     }
 
+    private fun hasSplitMenuScreens(): Boolean =
+        menuScreens.any { it.isWindowDevice } && menuScreens.any { !it.isWindowDevice }
+
+    private fun filteredMenuScreens(): List<org.openuuyc.pico.uu.UuRemoteScreen> {
+        if (!hasSplitMenuScreens()) return menuScreens
+        return when (screenRoleFilter) {
+            1 -> menuScreens.filter { !it.isWindowDevice }
+            2 -> menuScreens.filter { it.isWindowDevice }
+            else -> menuScreens.filter { !it.isWindowDevice } + menuScreens.filter { it.isWindowDevice }
+        }
+    }
+
     private fun selectionRows(): List<PicoXrDropdownRow> {
         val rows=if(devicePage) devices.map {device ->
             PicoXrDropdownRow(device.alias,if(device.online && device.controllable) "在线" else "不可连接",selected=device.id in connectedIds(),enabled=device.online && device.controllable)
-        } else menuScreens.map {screen ->
-            PicoXrDropdownRow(screen.name.ifBlank {"屏幕 ${screen.id+1}"},"${screen.current ?: ""}",selected=screen.id==session()?.selectedScreen(),enabled=true)
+        } else {
+            val split = hasSplitMenuScreens()
+            val filterRow = if (split) listOf(PicoXrDropdownRow(
+                "设备分类",
+                when (screenRoleFilter) {
+                    1 -> "仅显示器"
+                    2 -> "仅应用窗口"
+                    else -> "全部（显示器 + 窗口）"
+                }
+            )) else emptyList()
+            val screenRows = filteredMenuScreens().map {screen ->
+                val roleLabel = if (screen.isWindowDevice) "应用窗口" else "显示器"
+                val detail = listOfNotNull(if (split) roleLabel else null, screen.current?.toString()).joinToString(" · ")
+                PicoXrDropdownRow(screen.toString(),detail,selected=screen.id==session()?.selectedScreen(),enabled=true)
+            }
+            filterRow + screenRows
         }
         return rows+if(devicePage) listOf(PicoXrDropdownRow("刷新设备列表",kind=PicoXrDropdownRow.ACTION),PicoXrDropdownRow("返回主菜单",kind=PicoXrDropdownRow.ACTION))
         else listOf(PicoXrDropdownRow("刷新屏幕",kind=PicoXrDropdownRow.ACTION),PicoXrDropdownRow("返回串流设置",kind=PicoXrDropdownRow.ACTION))
@@ -658,6 +685,16 @@ internal class PicoXrToolbar(
                 }
             }
             screenPage->when {
+                label=="设备分类"->{
+                    screenRoleFilter=(screenRoleFilter+1)%3
+                    dropdownOffset=0
+                    notice=when(screenRoleFilter) {
+                        1->"已筛选：仅显示器设备"
+                        2->"已筛选：仅应用窗口（模拟设备）"
+                        else->"已显示全部显示器与应用窗口"
+                    }
+                    return
+                }
                 label=="刷新屏幕"->{
                     menuScreens=session()?.screenSnapshot().orEmpty()
                     screenOffset=PicoXrDropdownLayout.clampOffset(screenOffset,menuScreens.size)
@@ -666,9 +703,12 @@ internal class PicoXrToolbar(
                     return
                 }
                 label=="返回串流设置"->{screenPage=false;closeScreenMenu();notice="已返回串流设置";return}
-                else->menuScreens.firstOrNull {it.name.ifBlank {"屏幕 ${it.id+1}"}==label}?.let {
-                    val direct=session() ?: return
-                    check(direct.switchScreen(it.id)) {"切屏未发送：屏幕已变化或通道未就绪"}
+                else->{
+                    val screenIndex = if(hasSplitMenuScreens()) index-1 else index
+                    filteredMenuScreens().getOrNull(screenIndex)?.let {
+                        val direct=session() ?: return
+                        check(direct.switchScreen(it.id)) {"切屏未发送：屏幕已变化或通道未就绪"}
+                    }
                 }
             }
             targetScreen!=null->screenSettingAction(label)

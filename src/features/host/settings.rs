@@ -39,8 +39,13 @@ struct Record {
     remote_power: bool,
     #[serde(default)]
     wol: bool,
+    #[serde(default = "window_device_default")]
+    window_device: bool,
 }
 fn file_transfer_default() -> bool {
+    true
+}
+fn window_device_default() -> bool {
     true
 }
 
@@ -82,6 +87,7 @@ impl Store {
         bool,
         bool,
         bool,
+        bool,
     )> {
         let bytes = match self.0.get_secret() {
             Ok(bytes) => bytes,
@@ -100,6 +106,7 @@ impl Store {
                     false,
                     false,
                     false,
+                    true,
                 ));
             }
             Err(_) => bail!("无法读取被控设置"),
@@ -126,6 +133,7 @@ impl Store {
             record.remote_power,
             record.wol,
             record.terminal_local,
+            record.window_device,
         ))
     }
     pub fn save(
@@ -143,6 +151,7 @@ impl Store {
         remote_power: bool,
         wol: bool,
         terminal_local: bool,
+        window_device: bool,
     ) -> Result<()> {
         encoding.validate()?;
         audio_quality.validate()?;
@@ -166,6 +175,7 @@ impl Store {
                 terminal_local,
                 remote_power,
                 wol,
+                window_device,
             })?)
             .map_err(|_| anyhow::anyhow!("无法保存被控设置"))
     }

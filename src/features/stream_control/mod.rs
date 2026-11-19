@@ -270,6 +270,63 @@ pub struct RemoteDisplayState {
     pub refresh_hz: u32,
 }
 
+pub const SCREEN_DEVICE_KIND_DISPLAY: i32 = 0;
+pub const SCREEN_DEVICE_KIND_WINDOW: i32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenDevice {
+    pub name: String,
+    pub kind: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SimulatedDeviceRole {
+    #[default]
+    Displays,
+    Windows,
+}
+
+impl SimulatedDeviceRole {
+    pub const fn other(self) -> Self {
+        match self {
+            Self::Displays => Self::Windows,
+            Self::Windows => Self::Displays,
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Displays => "显示器",
+            Self::Windows => "应用窗口",
+        }
+    }
+
+    pub fn device_title(self, alias: &str, split: bool) -> String {
+        if !split {
+            return alias.to_owned();
+        }
+        match self {
+            Self::Displays => format!("{alias}（显示器）"),
+            Self::Windows => format!("{alias} · 应用窗口"),
+        }
+    }
+
+    pub fn matches(self, screen: &RemoteScreen, split: bool) -> bool {
+        if !split {
+            return self == Self::Displays;
+        }
+        match self {
+            Self::Displays => !screen.is_window_device(),
+            Self::Windows => screen.is_window_device(),
+        }
+    }
+}
+
+pub fn catalog_has_split_devices(catalog: &[RemoteScreen]) -> bool {
+    catalog.iter().any(RemoteScreen::is_window_device)
+        && catalog.iter().any(|screen| !screen.is_window_device())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteScreen {
     pub id: i32,
@@ -280,14 +337,48 @@ pub struct RemoteScreen {
     pub height: u32,
     pub refresh_hz: u32,
     pub display: RemoteDisplayInfo,
+    pub device: Option<ScreenDevice>,
 }
 
 impl RemoteScreen {
+    pub fn is_window_device(&self) -> bool {
+        self.device
+            .as_ref()
+            .is_some_and(|d| d.kind == SCREEN_DEVICE_KIND_WINDOW && !d.name.trim().is_empty())
+    }
+
+    pub fn device_name(&self) -> Option<&str> {
+        self.device
+            .as_ref()
+            .filter(|d| d.kind == SCREEN_DEVICE_KIND_WINDOW && !d.name.trim().is_empty())
+            .map(|d| d.name.as_str())
+    }
+
+    pub(crate) fn window_title(&self, catalog: &[Self]) -> String {
+        let number = catalog
+            .iter()
+            .filter(|s| s.is_window_device())
+            .position(|s| s.id == self.id)
+            .unwrap_or(0)
+            + 1;
+        crate::media::capture::monitor_name(&self.name)
+            .or_else(|| {
+                let trimmed = self.name.trim();
+                (!trimmed.is_empty()).then_some(trimmed)
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("窗口 {number}"))
+    }
+
     pub(crate) fn label(&self, catalog: &[Self]) -> String {
+        if let Some(device_name) = self.device_name() {
+            let title = self.window_title(catalog);
+            return format!("{device_name} · {title}");
+        }
         let kind = self.display.screen_type;
         let number = catalog
             .iter()
-            .filter(|s| s.display.screen_type == kind)
+            .filter(|s| !s.is_window_device() && s.display.screen_type == kind)
             .position(|s| s.id == self.id)
             .unwrap_or(0)
             + 1;
@@ -418,6 +509,7 @@ struct ScreenBaseline {
     dpi_scale: u32,
     resolution_type: i32,
     display: RemoteDisplayInfo,
+    device: Option<ScreenDevice>,
 }
 
 struct PendingCapturePreferences {
@@ -766,6 +858,7 @@ impl StreamControlHandle {
                     height: screen.height,
                     refresh_hz: screen.fps,
                     display: screen.display.clone(),
+                    device: screen.device.clone(),
                 })
                 .collect(),
             protocol: active_protocol,
@@ -1077,5 +1170,69 @@ mod tests {
         assert_eq!(action.action, ACTION_TYPE_SCREEN_REFRESH);
         assert!(action.args.is_empty());
         assert!(action.params.is_none());
+    }
+
+    #[test]
+    fn screen_device_tag_separates_windows_and_displays() {
+        let mode = RemoteDisplayMode {
+            width: 1920,
+            height: 1080,
+            pixel_width: 1920,
+            pixel_height: 1080,
+        };
+        let display = RemoteScreen {
+            id: 0,
+            name: "DP-1".into(),
+            primary: true,
+            video_track_index: 0,
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            display: RemoteDisplayInfo {
+                preferred: None,
+                current: mode,
+                initial: None,
+                modes: vec![mode],
+                current_dpi: 96,
+                recommended_dpi: 96,
+                dpis: vec![96],
+                screen_type: 0,
+                builtin_screen_type: 0,
+                dpr: 1.0,
+                resolution_type: 0,
+                left: 0,
+                top: 0,
+            },
+            device: None,
+        };
+        let window = RemoteScreen {
+            id: 1,
+            name: "Editor".into(),
+            primary: false,
+            video_track_index: 1,
+            device: Some(ScreenDevice {
+                name: "应用窗口".into(),
+                kind: SCREEN_DEVICE_KIND_WINDOW,
+            }),
+            ..display.clone()
+        };
+        let catalog = vec![display.clone(), window.clone()];
+        assert!(!display.is_window_device());
+        assert!(window.is_window_device());
+        assert!(catalog_has_split_devices(&catalog));
+        assert_eq!(display.label(&catalog), "显示屏 1（DP-1）");
+        assert_eq!(window.label(&catalog), "应用窗口 · Editor");
+        assert!(SimulatedDeviceRole::Displays.matches(&display, true));
+        assert!(!SimulatedDeviceRole::Displays.matches(&window, true));
+        assert!(SimulatedDeviceRole::Windows.matches(&window, true));
+        assert!(!SimulatedDeviceRole::Windows.matches(&display, true));
+        assert_eq!(
+            SimulatedDeviceRole::Displays.device_title("PC-1", true),
+            "PC-1（显示器）"
+        );
+        assert_eq!(
+            SimulatedDeviceRole::Windows.device_title("PC-1", true),
+            "PC-1 · 应用窗口"
+        );
     }
 }

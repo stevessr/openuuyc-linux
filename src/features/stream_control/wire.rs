@@ -533,6 +533,10 @@ pub(super) struct PbScreen {
     /// Never repurpose init_resolution: it is a connection snapshot, not the panel mode.
     #[prost(message, optional, tag = "100")]
     pub(super) openuuyc_geometry: Option<PbDisplayGeometry>,
+    /// OpenUUYC screen_device v1: identifies window sources as an independent simulated
+    /// device so OpenUUYC controllers can separate displays and application windows.
+    #[prost(message, optional, tag = "101")]
+    pub(super) openuuyc_device: Option<PbScreenDevice>,
     #[prost(int32, tag = "1")]
     pub(super) id: i32,
     #[prost(int32, tag = "2")]
@@ -569,6 +573,16 @@ pub(super) struct PbDisplayGeometry {
     pub width: u32,
     #[prost(uint32, tag = "3")]
     pub height: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(super) struct PbScreenDevice {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(int32, tag = "3")]
+    pub kind: i32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

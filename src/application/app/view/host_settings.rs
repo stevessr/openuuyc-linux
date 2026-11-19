@@ -294,6 +294,23 @@ impl DeviceCenterApp {
             },
         );
         if let Some(host) = host.as_ref() {
+            #[cfg(target_os = "linux")]
+            {
+                let mut window_device = host.window_device_enabled();
+                form_row(
+                    ui,
+                    "窗口独立设备",
+                    "将应用窗口与显示器分离为两个模拟设备上报，方便主控分类查看与并排打开；仅影响 OpenUUYC 主控",
+                    |ui| {
+                        if crate::ui::controls::switch(ui, &mut window_device).changed() {
+                            match host.set_window_device_enabled(window_device) {
+                                Ok(()) => self.save_host_settings(),
+                                Err(error) => self.status = StatusMessage::error(error.to_string()),
+                            }
+                        }
+                    },
+                );
+            }
             if host.request_audio_devices()
                 && self
                     .worker
