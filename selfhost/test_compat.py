@@ -345,5 +345,55 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn["credential"], expected)
 
 
+    async def test_host_confirmation_requires_explicit_callback(self):
+        hd, cd, ht, ct = await self.users()
+        host = await self.room("host", hd, ht)
+        await self.request("POST", "/api/v1/device/controllable", "host", hd, ht,
+                           {"controllable": True})
+        _, identity = await self.request("POST", "/api/v1/device/share/info/refresh",
+                                        "host", hd, ht)
+        aid = identity["data"]["connect_id"]
+        waiting = await self.assist_call(host, "host", hd, ht, "hostpass",
+                         "controller", cd, ct, "/api/v2/room/join/share/by_code",
+                         {"connect_id": aid, "connect_code": "hostpass"},
+                         mode="password_confirmation")
+        self.assertEqual(waiting["code"], 1136)
+        control_id = waiting["data"]["control_id"]
+        import asyncio
+        answer = asyncio.create_task(self.respond_assistance(
+            host, "host", hd, ht, "hostpass", mode="password_confirmation",
+            approve=True))
+        _, granted = await self.request("POST", "/api/v2/room/join/share/by_confirmation",
+                              "controller", cd, ct,
+                              {"connect_id": aid, "control_id": control_id})
+        await answer
+        self.assertEqual(granted["code"], 0)
+        self.assertEqual(granted["data"]["publisher_device_id"], hd)
+        # The confirmation token is a one-shot, not reusable for another room.
+        _, replay = await self.request("POST", "/api/v2/room/join/share/by_confirmation",
+                               "controller", cd, ct,
+                               {"connect_id": aid, "control_id": control_id})
+        self.assertEqual(replay["code"], 403)
+
+    async def test_no_code_confirmation_asks_host_twice_and_waits_for_consent(self):
+        hd, cd, ht, ct = await self.users()
+        host = await self.room("host", hd, ht)
+        _, identity = await self.request("POST", "/api/v1/device/share/info/refresh",
+                                        "host", hd, ht)
+        aid = identity["data"]["connect_id"]
+        import asyncio
+        async def respond_both():
+            self.assertEqual(await self.respond_assistance(
+                host, "host", hd, ht, "", mode="by_confirmation"), "get_control_mode")
+            self.assertEqual(await self.respond_assistance(
+                host, "host", hd, ht, "", mode="by_confirmation"), "remote_control_by_confirmation")
+        task = asyncio.create_task(respond_both())
+        _, confirmed = await self.request("POST", "/api/v2/room/join/share/by_confirmation",
+                                  "controller", cd, ct,
+                                  {"connect_id": aid, "control_id": ""})
+        await task
+        self.assertEqual(confirmed["code"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
