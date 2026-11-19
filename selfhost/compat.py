@@ -51,11 +51,23 @@ class Compatibility:
               PRIMARY KEY(owner_id,publisher_device_id)
             );
         """)
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS guest_sessions(
+              token TEXT PRIMARY KEY, device_id TEXT NOT NULL,
+              guest_id TEXT NOT NULL, expires INTEGER NOT NULL
+            );
+        """)
         self.pending_android = {}
         self.assist_failures = {}
 
     def compat_routes(self):
         return [
+            web.post("/api/v1/guest/create", self.guest_create),
+            web.post("/api/v1/guest/room/create", self.guest_room),
+            web.post("/api/v1/guest/share/info", self.assist_identity),
+            web.post("/api/v1/guest/room/share/upload_control_mode", self.assist_upload_mode),
+            web.post("/api/v1/guest/room/share/upload/sign", self.assist_upload_sign),
+            web.post("/api/v1/guest/room/share/confirmation", self.assist_upload_confirmation),
             web.put("/api/v1/device/{device}", self.rename_device),
             web.post("/api/v1/device/{device}/unbind", self.unbind_device),
             web.post("/api/v1/device/set_support_wol", self.set_wol),
@@ -77,6 +89,49 @@ class Compatibility:
             web.delete("/api/v1/device/share/saved/{kind}/{device}", self.delete_saved),
             web.delete("/api/v1/device/share/saved/recent", self.clear_recent),
         ]
+
+    def guest_caller(self, req):
+        token = req.headers.get("Authorization", "")
+        if not token.startswith("Bearer "):
+            raise web.HTTPUnauthorized(text="missing guest bearer token")
+        row = self.db.execute(
+            "SELECT * FROM guest_sessions WHERE token=? AND expires>?",
+            (token[7:], int(time.time()))
+        ).fetchone()
+        if (not row or row["guest_id"] != req.headers.get("X-Param-Guest-ID")
+                or row["device_id"] != req.headers.get("X-Param-device-id")):
+            raise web.HTTPUnauthorized(text="invalid guest session")
+        device = self.device(row["device_id"])
+        if not device or device["client_id"] != req.headers.get("X-Param-client-id"):
+            raise web.HTTPUnauthorized(text="guest device identity mismatch")
+        return device
+
+    def host_caller(self, req):
+        if req.headers.get("X-Param-Guest-ID"):
+            return self.guest_caller(req)
+        return self.caller(req)
+
+    async def guest_create(self, req):
+        client_id = req.headers.get("X-Param-client-id")
+        device_id = req.headers.get("X-Param-device-id")
+        row = self.device(device_id)
+        if not row or row["client_id"] != client_id:
+            raise web.HTTPUnauthorized(text="guest device not registered")
+        await self.body(req)
+        guest_id = secrets.token_urlsafe(20)
+        token = secrets.token_urlsafe(48)
+        self.db.execute("DELETE FROM guest_sessions WHERE expires<?", (int(time.time()),))
+        self.db.execute(
+            "INSERT INTO guest_sessions(token,device_id,guest_id,expires) VALUES(?,?,?,?)",
+            (token, device_id, guest_id, int(time.time()) + 24 * 3600))
+        return envelope({"guest_id": guest_id, "token": token})
+
+    async def guest_room(self, req):
+        own = self.guest_caller(req)
+        await self.body(req)
+        return envelope(self.new_ticket("host", own["device_id"], own["device_id"],
+                                        lifetime=3600, guest=True,
+                                        session_token=req.headers["Authorization"][7:]))
 
     def metadata(self, device_id: str):
         row = self.db.execute(
@@ -261,7 +316,7 @@ class Compatibility:
         return envelope({})
 
     async def assist_identity(self, req):
-        caller = self.caller(req)
+        caller = self.host_caller(req)
         device_id = caller["device_id"]
         existing = self._assist_by_device(device_id)
         if not existing:
@@ -279,7 +334,7 @@ class Compatibility:
         return envelope({"connect_id": existing["connect_id"]})
 
     async def assist_upload_mode(self, req):
-        caller = self.caller(req)
+        caller = self.host_caller(req)
         body = await self.body(req)
         row = self._assist_by_device(caller["device_id"])
         if not row or not isinstance(body.get("allow_control"), bool):
@@ -296,7 +351,7 @@ class Compatibility:
         return envelope({})
 
     async def assist_upload_sign(self, req):
-        caller = self.caller(req)
+        caller = self.host_caller(req)
         body = await self.body(req)
         row = self._assist_by_device(caller["device_id"])
         if not row or body.get("control_id") != row["connect_id"]:
@@ -323,7 +378,7 @@ class Compatibility:
         return envelope({})
 
     async def assist_upload_confirmation(self, req):
-        caller = self.caller(req)
+        caller = self.host_caller(req)
         body = await self.body(req)
         row = self._assist_by_device(caller["device_id"])
         if not row or body.get("control_id") != row["connect_id"]:
