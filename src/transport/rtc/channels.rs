@@ -29,6 +29,7 @@ pub const DATA_CHANNEL_LABELS: [&str; 5] = [
 #[derive(Clone)]
 pub(super) struct DataChannels {
     pub(super) port_mapping: Arc<crate::features::port_mapping::Transport>,
+    pub(super) terminal: Arc<crate::features::terminal::client::Transport>,
     pub(super) _local_channels: Arc<Vec<Arc<RTCDataChannel>>>,
     pub(super) incoming_channels: Arc<std::sync::Mutex<Vec<Arc<RTCDataChannel>>>>,
     pub(super) performance: PerformanceMonitor,
@@ -48,6 +49,7 @@ impl DataChannels {
         profile: ConnectionMediaProfile,
         uu_kcp: UuKcpControl,
         connection: Weak<RTCPeerConnection>,
+        terminal: bool,
     ) -> Self {
         let workers = SessionWorkers::new("RTC peer");
         let streamer_sender_started = Arc::new(AtomicBool::new(false));
@@ -55,6 +57,7 @@ impl DataChannels {
             StreamControlHandle::new(profile, performance.clone());
         let port_mapping = Arc::new(crate::features::port_mapping::Transport::default());
         let (terminal_inbound, _) = broadcast::channel(256);
+        let terminal_transport = Arc::new(crate::features::terminal::client::Transport::default());
         for channel in &local_channels {
             if channel.label() == crate::features::remote_terminal::CHANNEL {
                 stream_control.terminal().bind(channel);
@@ -63,11 +66,16 @@ impl DataChannels {
             if channel.label() == crate::diagnostics::remote::CHANNEL {
                 uu_kcp.bind_stream(channel.id(), false);
                 // BINARY is shared with the official kind=8 terminal. The
-                // diagnostics handler forwards TERM frames to the terminal
-                // receiver instead of dropping them.
-                stream_control
-                    .diagnostics()
-                    .bind(channel, terminal_inbound.clone());
+                // terminal transport (or the diagnostics handler on a desktop
+                // session) forwards TERM frames to the raw terminal receiver
+                // instead of dropping them as unrelated binary data.
+                if terminal {
+                    terminal_transport.bind(channel, terminal_inbound.clone());
+                } else {
+                    stream_control
+                        .diagnostics()
+                        .bind(channel, terminal_inbound.clone());
+                }
                 continue;
             }
             stream_control.file_transfer().bind(channel);
@@ -134,6 +142,7 @@ impl DataChannels {
         Self {
             _local_channels: Arc::new(local_channels),
             port_mapping,
+            terminal: terminal_transport,
             incoming_channels: Arc::new(std::sync::Mutex::new(Vec::new())),
             performance,
             streamer_sender_started,

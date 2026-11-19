@@ -458,7 +458,7 @@ async fn connect_terminal(
 async fn terminal_channel(
     connection: &ControllerConnection,
 ) -> Result<(Arc<RTCDataChannel>, broadcast::Receiver<Vec<u8>>)> {
-    let (channel, rx) = connection.peer.terminal_transport()?;
+    let (channel, rx) = connection.peer.binary_terminal_transport()?;
     tokio::time::timeout(Duration::from_secs(12), async {
         while channel.ready_state() != RTCDataChannelState::Open {
             ensure!(channel.ready_state() != RTCDataChannelState::Closed, "terminal channel closed");

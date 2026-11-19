@@ -173,9 +173,9 @@ enum Commands {
         #[arg(long)]
         uninstall: bool,
     },
-    /// 列出或接上本机正在运行的被控终端会话
+    /// 列出或接上本机正在运行的被控终端会话，或指定远端设备上的终端
     Terminal {
-        /// 会话名或编号；省略时列出
+        /// 本机会话名或编号；远端会话使用 `--list` 显示的编号
         session: Option<String>,
         /// 只列出会话，不接入
         #[arg(long)]
@@ -183,6 +183,15 @@ enum Commands {
         /// 新建一个会话并直接接上；位置参数作为名字
         #[arg(long)]
         new: bool,
+        /// 对端设备名称（必须唯一且完全匹配）
+        #[arg(long, conflicts_with = "device_id")]
+        device: Option<String>,
+        /// 对端设备 ID，适合脚本和 GUI 调用
+        #[arg(long)]
+        device_id: Option<String>,
+        /// 只经正在运行的控制中心连接，不自己新建对端会话
+        #[arg(long, hide = true)]
+        via_gui: bool,
     },
     #[cfg(target_os = "linux")]
     /// PICO VR 头显支持（WiVRn + WayVR 桌面模式）
@@ -258,6 +267,33 @@ enum WindowExtensionAction {
     Enable,
     Disable,
     Status,
+}
+
+/// panic 也写进日志文件。默认钩子只打到 stderr，而桌面会话里 stderr 进
+/// journal，常被别的程序刷屏限流吞掉，进程突然消失就查不到原因。默认钩子
+/// 照样运行，终端里看到的输出不变。
+fn log_panics() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<非文本 panic>");
+        let thread = std::thread::current();
+        tracing::error!(
+            target: "openuuyc",
+            thread = thread.name().unwrap_or("<unnamed>"),
+            location = %info
+                .location()
+                .map_or_else(|| "<unknown>".to_owned(), ToString::to_string),
+            message,
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "thread panicked"
+        );
+        default_hook(info);
+    }));
 }
 
 fn main() -> Result<()> {
@@ -349,6 +385,7 @@ fn main() -> Result<()> {
         )?)
     };
     tracing::info!(target: "openuuyc", version = env!("CARGO_PKG_VERSION"), "application started");
+    log_panics();
 
     #[cfg(windows)]
     if let Commands::Update { silent, no_elevate } = command {
@@ -447,8 +484,26 @@ fn main() -> Result<()> {
                 controller::terminal::run_saved(device, list, attach, handle, pick)
             )
         }
-        Commands::Terminal { session, list, new } => {
-            openuuyc::application::terminal_attach(session.as_deref(), list, new)
+        Commands::Terminal {
+            session,
+            list,
+            new,
+            device,
+            device_id,
+            via_gui,
+        } => {
+            if device.is_some() || device_id.is_some() {
+                openuuyc::application::terminal_controller(
+                    session.as_deref(),
+                    list,
+                    new,
+                    device,
+                    device_id,
+                    via_gui,
+                )
+            } else {
+                openuuyc::application::terminal_attach(session.as_deref(), list, new)
+            }
         }
         Commands::WindowExtension { action } => {
             match action {
@@ -607,8 +662,11 @@ fn main() -> Result<()> {
             ))
         }
     };
-    if let Err(error) = &result {
-        tracing::error!(target: "openuuyc", error = %format_args!("{error:#}"), "application stopped with an error");
+    match &result {
+        Ok(()) => tracing::info!(target: "openuuyc", "application exited"),
+        Err(error) => {
+            tracing::error!(target: "openuuyc", error = %format_args!("{error:#}"), "application stopped with an error");
+        }
     }
     drop(_instance);
     #[cfg(windows)]

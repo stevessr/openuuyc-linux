@@ -39,6 +39,18 @@ pub fn install_to_system(uninstall: bool) -> anyhow::Result<bool> {
     Ok(status.installed)
 }
 
+/// 列出、新建或接入指定对端设备上的终端（命令行入口）。
+pub fn terminal_controller(
+    session: Option<&str>,
+    list: bool,
+    new: bool,
+    device: Option<String>,
+    device_id: Option<String>,
+    via_gui: bool,
+) -> anyhow::Result<()> {
+    crate::features::terminal::cli::run(session, list, new, device, device_id, via_gui)
+}
+
 /// Hand the GUI to the installed copy when one exists. Linux has no
 /// installed copy: the built binary is the application.
 pub fn route_installed_gui() -> anyhow::Result<bool> {

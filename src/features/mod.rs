@@ -11,6 +11,7 @@ pub(crate) mod remote_cursor;
 pub(crate) mod remote_input;
 pub(crate) mod remote_upgrade;
 pub mod stream_control;
+pub(crate) mod terminal;
 pub(crate) mod viewing_settings;
 
 pub(crate) mod remote_terminal;

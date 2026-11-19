@@ -108,7 +108,12 @@ pub struct NativePeer {
 impl NativePeer {
     /// UU terminal connections use the official reliable binary data channel.
     /// Subscribe before the first request so an immediate OPEN_RESP is not lost.
-    pub(crate) fn terminal_transport(
+    ///
+    /// This is the raw-frame view used by the fork's `remote-terminal` client.
+    /// `terminal_transport` below returns the frame-parsed transport used by
+    /// the upstream controller terminal service; both are fed by the same
+    /// BINARY channel handler.
+    pub(crate) fn binary_terminal_transport(
         &self,
     ) -> anyhow::Result<(Arc<webrtc::data_channel::RTCDataChannel>, tokio::sync::broadcast::Receiver<Vec<u8>>)> {
         let channel = self.data_channels._local_channels.iter()
@@ -124,13 +129,14 @@ impl NativePeer {
     pub async fn new(ice_servers: Vec<IceServer>, transport: TransportChoice) -> Result<Self> {
         let profile = crate::media::ConnectionMediaOptions::default()
             .resolve(crate::media::LocalDisplayInfo::FALLBACK)?;
-        Self::new_with_profile(ice_servers, transport, profile).await
+        Self::new_with_profile(ice_servers, transport, profile, false).await
     }
 
     pub(crate) async fn new_with_profile(
         mut ice_servers: Vec<IceServer>,
         transport: TransportChoice,
         profile: ConnectionMediaProfile,
+        terminal: bool,
     ) -> Result<Self> {
         let configured_ice_servers = ice_servers.clone();
         let mut ice_url_schemes = BTreeMap::<String, usize>::new();
@@ -267,6 +273,7 @@ impl NativePeer {
             profile,
             core.control.clone(),
             Arc::downgrade(&connection),
+            terminal,
         );
         if let (Some(audio_track), Some(audio_transceiver)) = (audio_track, audio_transceiver) {
             let microphone = data_channels.stream_control.microphone().clone();
@@ -385,6 +392,10 @@ impl NativePeer {
 
     pub(crate) fn stream_control_handle(&self) -> StreamControlHandle {
         self.data_channels.stream_control.clone()
+    }
+
+    pub(crate) fn terminal_transport(&self) -> Arc<crate::features::terminal::client::Transport> {
+        Arc::clone(&self.data_channels.terminal)
     }
 
     pub(crate) fn set_stream_video_stream(&self, codec: VideoCodec, video_track_index: i32) {
@@ -981,6 +992,7 @@ impl NativePeer {
         self.data_channels.stream_control.diagnostics().close();
         self.data_channels.stream_control.clipboard().suspend();
         self.data_channels.port_mapping.close();
+        self.data_channels.terminal.close();
         self.data_channels.stream_control.mouse().close().await;
         self.data_channels.workers.close().await;
         self.data_channels.stream_control.audio().close().await;
@@ -993,6 +1005,7 @@ impl Drop for NativePeer {
         self.data_channels.stream_control.microphone().stop();
         self.data_channels.stream_control.terminal().disconnected();
         self.data_channels.stream_control.diagnostics().close();
+        self.data_channels.terminal.close();
         self.data_channels.stream_control.clipboard().suspend();
         self.data_channels.stream_control.mouse().set_ready(false);
         // Normal paths await close(). This also retires application tasks on
@@ -1017,7 +1030,7 @@ mod tests {
             .resolve(crate::media::LocalDisplayInfo::FALLBACK)
             .unwrap();
         profile.data_only = true;
-        let peer = NativePeer::new_with_profile(Vec::new(), TransportChoice::P2p, profile)
+        let peer = NativePeer::new_with_profile(Vec::new(), TransportChoice::P2p, profile, true)
             .await
             .expect("create data-only peer");
         let offer = peer.create_offer().await.expect("create offer");
