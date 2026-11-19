@@ -52,6 +52,7 @@ class Compatibility:
             );
         """)
         self.pending_android = {}
+        self.assist_failures = {}
 
     def compat_routes(self):
         return [
@@ -353,10 +354,18 @@ class Compatibility:
         if row["need_confirmation"]:
             return None, 1136
         if row["need_password"] or row["sign_hash"]:
+            key = (caller["device_id"], row["device_id"])
+            now = time.monotonic()
+            attempts = [t for t in self.assist_failures.get(key, ()) if now - t < 300]
+            if len(attempts) >= 6:
+                return None, 429
             candidate = self._assist_hash(row["device_id"], supplied_code)
-            if not (row["sign_hash"] and hmac.compare_digest(candidate, row["sign_hash"]) or
-                    row["backup_hash"] and hmac.compare_digest(candidate, row["backup_hash"])):
+            if not ((row["sign_hash"] and hmac.compare_digest(candidate, row["sign_hash"])) or
+                    (row["backup_hash"] and hmac.compare_digest(candidate, row["backup_hash"]))):
+                attempts.append(now)
+                self.assist_failures[key] = attempts
                 return None, 403
+            self.assist_failures.pop(key, None)
         self._save_recent(caller["device_id"], row["device_id"], row["connect_id"])
         room = self.new_ticket("controller", caller["device_id"], row["device_id"],
                                lifetime=600, session_token=session_token)
@@ -387,8 +396,13 @@ class Compatibility:
         return envelope(code=501, msg="live host confirmation not implemented")
 
     async def assist_cancel(self, req):
-        self.caller(req)
-        await self.body(req)
+        caller = self.caller(req)
+        body = await self.body(req)
+        row = self._assist_by_connect(body.get("connect_id"))
+        if not row or row["device_id"] != caller["device_id"]:
+            return envelope(code=403, msg="assist owner mismatch")
+        async with self.guard:
+            await self.release(row["device_id"])
         return envelope({})
 
     async def assist_refetch(self, req):
