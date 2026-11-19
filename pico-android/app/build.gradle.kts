@@ -22,7 +22,7 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
-        buildConfigField("String", "SELFHOST_NRD_BASE", "\\\"" + selfHostNrdBase.trimEnd('/') + "\\\"")
+        buildConfigField("String", "SELFHOST_NRD_BASE", "\"" + selfHostNrdBase.trimEnd('/') + "\"")
         ndk { abiFilters.add("arm64-v8a") }
         externalNativeBuild { cmake { cppFlags += listOf("-std=c++17", "-Wall", "-Wextra") } }
     }
