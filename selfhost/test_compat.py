@@ -198,5 +198,72 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("android_control_result", (await host.receive()).data)
 
 
+    async def test_guest_host_isolated_from_account_management(self):
+        hd, cd, ht, ct = await self.users()
+        # Independent, device-scoped guest registration. No UU account login.
+        status, reply = await self.request("POST", "/api/v1/guest/create",
+                                           "host", hd, data={})
+        self.assertEqual(status, 200)
+        self.assertEqual(reply["code"], 0)
+        guest = reply["data"]
+        headers = self.headers("host", hd, guest["token"])
+        headers["X-Param-Guest-ID"] = guest["guest_id"]
+        async with self.client.get("/api/v1/device/list", headers=headers) as r:
+            self.assertEqual(r.status, 401)
+        async with self.client.post("/api/v1/guest/room/create",
+                                    headers=headers, json={}) as r:
+            self.assertEqual(r.status, 200)
+            room = (await r.json())["data"]
+        socket = await self.client.ws_connect("/socket.io/?EIO=4&transport=websocket",
+                                headers={"X-NRD-AUTH": room["token"]})
+        self.sockets.append(socket)
+        self.assertTrue((await socket.receive()).data.startswith("0"))
+        await socket.send_str("40")
+        await socket.receive()
+        await socket.send_str('421["room_info"]')
+        await socket.receive()
+        async with self.client.post("/api/v1/device/controllable", headers=headers,
+                                    json={"controllable": True}) as r:
+            self.assertEqual((await r.json())["code"], 0)
+        async with self.client.post("/api/v1/guest/share/info", headers=headers, json={}) as r:
+            connect_id = (await r.json())["data"]["connect_id"]
+        async with self.client.post("/api/v1/guest/room/share/upload/sign", headers=headers,
+                                    json={"control_id": connect_id, "can_remote_control": True,
+                                          "sign": "guestpass", "backup_sign": "",
+                                          "control_mode": "password",
+                                          "need_confirmation": False}) as r:
+            self.assertEqual((await r.json())["code"], 0)
+        async with self.client.post("/api/v1/guest/room/share/confirmation", headers=headers,
+                                    json={"control_id": connect_id,
+                                          "allow_control": True, "need_password": True}) as r:
+            self.assertEqual((await r.json())["code"], 0)
+        _, join = await self.request("POST", "/api/v2/room/join/share/by_code",
+                                     "controller", cd, ct,
+                                     {"connect_id": connect_id, "connect_code": "guestpass"})
+        self.assertEqual(join["code"], 0)
+        self.assertEqual(join["data"]["publisher_device_id"], hd)
+
+    async def test_assistance_password_locks_after_repeated_failures(self):
+        hd, cd, ht, ct = await self.users()
+        await self.room("host", hd, ht)
+        await self.request("POST", "/api/v1/device/controllable", "host", hd, ht,
+                           {"controllable": True})
+        _, aid = await self.request("POST", "/api/v1/device/share/info/refresh",
+                                    "host", hd, ht)
+        code = aid["data"]["connect_id"]
+        await self.request("POST", "/api/v2/room/share/upload_sign", "host", hd, ht,
+                           {"control_id": code, "sign": "secret",
+                            "backup_sign": "", "control_mode": "password",
+                            "can_remote_control": True, "need_confirmation": False})
+        for _ in range(6):
+            _, denied = await self.request("POST", "/api/v2/room/join/share/by_code",
+                                "controller", cd, ct,
+                                {"connect_id": code, "connect_code": "wrong"})
+            self.assertEqual(denied["code"], 403)
+        _, locked = await self.request("POST", "/api/v2/room/join/share/by_code",
+                                "controller", cd, ct,
+                                {"connect_id": code, "connect_code": "secret"})
+        self.assertEqual(locked["code"], 429)
+
 if __name__ == "__main__":
     unittest.main()
