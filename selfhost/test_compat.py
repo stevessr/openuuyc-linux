@@ -73,6 +73,57 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
         ht, ct = await self.login("host", hd), await self.login("controller", cd)
         return hd, cd, ht, ct
 
+    async def respond_assistance(self, socket, identity, device, token, password,
+                                 guest_id=None, mode="by_password", approve=True):
+        import hashlib
+        frame = (await socket.receive()).data
+        self.assertTrue(frame.startswith("42"))
+        event, push = json.loads(frame[2:])
+        self.assertEqual(event, "bmsg_push")
+        kind = push["type"]
+        data = push["data"]
+        prefix = "/api/v1/guest" if guest_id else "/api/v2"
+        paths = {
+            "get_control_mode": (
+                "/api/v1/guest/room/share/upload_control_mode" if guest_id
+                else "/api/v2/room/share/upload_control_mode"),
+            "remote_control": (
+                "/api/v1/guest/room/share/upload/sign" if guest_id
+                else "/api/v2/room/share/upload_sign"),
+            "remote_control_by_confirmation": (
+                "/api/v1/guest/room/share/confirmation" if guest_id
+                else "/api/v2/room/share/confirmation")
+        }
+        self.assertIn(kind, paths)
+        payload = {"control_id": data["control_id"]}
+        if kind == "get_control_mode":
+            payload.update(allow_control=True, control_mode=mode)
+        elif kind == "remote_control":
+            salt = data["salt"]
+            payload.update(can_remote_control=True,
+                           sign=hashlib.sha256((salt + password).encode()).hexdigest(),
+                           backup_sign="", control_mode=mode,
+                           need_confirmation=(mode == "password_confirmation"))
+        elif kind == "remote_control_by_confirmation":
+            payload.update(allow_control=approve, need_password=False)
+        headers = self.headers(identity, device, token)
+        if guest_id:
+            headers["X-Param-Guest-ID"] = guest_id
+        async with self.client.post(paths[kind], json=payload, headers=headers) as reply:
+            self.assertEqual((await reply.json())["code"], 0)
+        return kind
+
+    async def assist_call(self, host, identity, device, host_token, password,
+                          controller, controller_device, controller_token,
+                          path, body, guest_id=None, mode="by_password"):
+        import asyncio
+        job = asyncio.create_task(self.respond_assistance(
+            host, identity, device, host_token, password, guest_id, mode))
+        _, result = await self.request("POST", path, controller,
+                                       controller_device, controller_token, body)
+        await job
+        return result
+
     async def test_device_rename_unbind_and_revoke(self):
         hd, cd, ht, ct = await self.users()
         status, rename = await self.request("PUT", "/api/v1/device/" + hd,
@@ -131,27 +182,17 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
                                         "host", hd, ht)
         assist_id = identity["data"]["connect_id"]
         self.assertRegex(assist_id, r"^\d{9}$")
-        _, upload = await self.request("POST", "/api/v2/room/share/upload_sign",
-                                       "host", hd, ht,
-                                       {"control_id": assist_id, "sign": "123456",
-                                        "backup_sign": "", "control_mode": "password",
-                                        "can_remote_control": True, "need_confirmation": False})
-        self.assertEqual(upload["code"], 0)
-        _, confirm = await self.request("POST", "/api/v2/room/share/confirmation",
-                                         "host", hd, ht, {
-                                          "control_id": assist_id, "allow_control": True,
-                                          "need_password": True})
-        self.assertEqual(confirm["code"], 0)
-        _, mode = await self.request("POST", "/api/v2/room/share/control_mode",
-                                      "controller", cd, ct, {"connect_id": assist_id})
-        self.assertEqual(mode["data"]["control_mode"], "password")
-        _, bad = await self.request("POST", "/api/v2/room/join/share/by_code",
-                                     "controller", cd, ct,
-                                     {"connect_id": assist_id, "connect_code": "bad"})
-        self.assertEqual(bad["code"], 403)
-        _, ok = await self.request("POST", "/api/v2/room/join/share/by_code",
-                                     "controller", cd, ct,
-                                     {"connect_id": assist_id, "connect_code": "123456"})
+        mode = await self.assist_call(host, "host", hd, ht, "123456",
+                  "controller", cd, ct, "/api/v2/room/share/control_mode",
+                  {"connect_id": assist_id})
+        self.assertEqual(mode["data"]["control_mode"], "by_password")
+        bad = await self.assist_call(host, "host", hd, ht, "123456",
+                  "controller", cd, ct, "/api/v2/room/join/share/by_code",
+                  {"connect_id": assist_id, "connect_code": "bad"})
+        self.assertEqual(bad["code"], 1131)
+        ok = await self.assist_call(host, "host", hd, ht, "123456",
+                  "controller", cd, ct, "/api/v2/room/join/share/by_code",
+                  {"connect_id": assist_id, "connect_code": "123456"})
         self.assertEqual(ok["code"], 0)
         self.assertEqual(ok["data"]["publisher_device_id"], hd)
         _, refetched = await self.request("POST", "/api/v1/room/join/refetch",
@@ -200,7 +241,6 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_guest_host_isolated_from_account_management(self):
         hd, cd, ht, ct = await self.users()
-        # Independent, device-scoped guest registration. No UU account login.
         status, reply = await self.request("POST", "/api/v1/guest/create",
                                            "host", hd, data={})
         self.assertEqual(status, 200)
@@ -227,39 +267,28 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await r.json())["code"], 0)
         async with self.client.post("/api/v1/guest/share/info", headers=headers, json={}) as r:
             connect_id = (await r.json())["data"]["connect_id"]
-        async with self.client.post("/api/v1/guest/room/share/upload/sign", headers=headers,
-                                    json={"control_id": connect_id, "can_remote_control": True,
-                                          "sign": "guestpass", "backup_sign": "",
-                                          "control_mode": "password",
-                                          "need_confirmation": False}) as r:
-            self.assertEqual((await r.json())["code"], 0)
-        async with self.client.post("/api/v1/guest/room/share/confirmation", headers=headers,
-                                    json={"control_id": connect_id,
-                                          "allow_control": True, "need_password": True}) as r:
-            self.assertEqual((await r.json())["code"], 0)
-        _, join = await self.request("POST", "/api/v2/room/join/share/by_code",
-                                     "controller", cd, ct,
-                                     {"connect_id": connect_id, "connect_code": "guestpass"})
+        # Live guest host responds to salted verifier challenge over its own
+        # bearer session; an account cannot forge this callback.
+        join = await self.assist_call(socket, "host", hd, guest["token"], "guestpass",
+                      "controller", cd, ct, "/api/v2/room/join/share/by_code",
+                      {"connect_id": connect_id, "connect_code": "guestpass"},
+                      guest_id=guest["guest_id"])
         self.assertEqual(join["code"], 0)
         self.assertEqual(join["data"]["publisher_device_id"], hd)
 
     async def test_assistance_password_locks_after_repeated_failures(self):
         hd, cd, ht, ct = await self.users()
-        await self.room("host", hd, ht)
+        host = await self.room("host", hd, ht)
         await self.request("POST", "/api/v1/device/controllable", "host", hd, ht,
                            {"controllable": True})
         _, aid = await self.request("POST", "/api/v1/device/share/info/refresh",
                                     "host", hd, ht)
         code = aid["data"]["connect_id"]
-        await self.request("POST", "/api/v2/room/share/upload_sign", "host", hd, ht,
-                           {"control_id": code, "sign": "secret",
-                            "backup_sign": "", "control_mode": "password",
-                            "can_remote_control": True, "need_confirmation": False})
         for _ in range(6):
-            _, denied = await self.request("POST", "/api/v2/room/join/share/by_code",
-                                "controller", cd, ct,
-                                {"connect_id": code, "connect_code": "wrong"})
-            self.assertEqual(denied["code"], 403)
+            denied = await self.assist_call(host, "host", hd, ht, "secret",
+                     "controller", cd, ct, "/api/v2/room/join/share/by_code",
+                     {"connect_id": code, "connect_code": "wrong"})
+            self.assertEqual(denied["code"], 1131)
         _, locked = await self.request("POST", "/api/v2/room/join/share/by_code",
                                 "controller", cd, ct,
                                 {"connect_id": code, "connect_code": "secret"})
