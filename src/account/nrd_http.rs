@@ -52,6 +52,25 @@ impl NrdHttp {
         // Only routing values are process-wide. The HTTP client/connection pool
         // is owned by the API caller, not leaked through a global client.
         static ROUTE: OnceLock<Arc<Mutex<Route>>> = OnceLock::new();
+        // Self-host mode never falls back to official UU infrastructure.
+        let endpoints = match std::env::var_os("OPENUUYC_NRD_BASE_URL") {
+            Some(value) if !value.is_empty() => {
+                let raw = value.into_string().map_err(|_| anyhow::anyhow!("invalid self-host URL encoding"))?;
+                let url = reqwest::Url::parse(&raw).context("invalid OPENUUYC_NRD_BASE_URL")?;
+                anyhow::ensure!(
+                    url.scheme() == "https"
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.path() == "/"
+                        && url.query().is_none()
+                        && url.fragment().is_none(),
+                    "self-host NRD URL must be an HTTPS origin without credentials or a path"
+                );
+                vec![raw.trim_end_matches('/').to_owned()]
+            }
+            _ => vec![PRIMARY.to_owned(), SECONDARY.to_owned()],
+        };
         Ok(Self {
             client: crate::transport::http_client()
                 .https_only(true)
@@ -65,7 +84,7 @@ impl NrdHttp {
                 .user_agent(concat!("OpenUUYC/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .context("build NRD HTTPS client")?,
-            endpoints: vec![PRIMARY.to_owned(), SECONDARY.to_owned()],
+            endpoints,
             route: Arc::clone(ROUTE.get_or_init(Default::default)),
         })
     }
@@ -73,7 +92,12 @@ impl NrdHttp {
     pub(crate) fn ipv4_route(&self) -> Self {
         Self {
             client: self.client.clone(),
-            endpoints: vec!["https://api-ipv4.nrd.nie.163.com".into()],
+            // Device registration must use the private endpoint too.
+            endpoints: if self.endpoints.len() == 1 {
+                self.endpoints.clone()
+            } else {
+                vec!["https://api-ipv4.nrd.nie.163.com".into()]
+            },
             route: Arc::new(Mutex::new(Route::default())),
         }
     }
