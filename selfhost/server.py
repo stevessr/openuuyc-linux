@@ -39,6 +39,7 @@ class Ticket:
     expires: float
     force: bool = False
     session_token: str = ""
+    guest: bool = False
 
 
 @dataclass(eq=False)
@@ -140,7 +141,7 @@ class ControlPlane(Compatibility):
             raise web.HTTPBadRequest(text="expected object")
         return value
 
-    def new_ticket(self, kind, device, target, lifetime=3600, force=False, session_token=""):
+    def new_ticket(self, kind, device, target, lifetime=3600, force=False, session_token="", guest=False):
         if len(self.tickets) >= 8192:
             now = time.monotonic()
             self.tickets = {k: t for k, t in self.tickets.items() if t.expires > now}
@@ -150,7 +151,7 @@ class ControlPlane(Compatibility):
         if not session_token:
             raise ValueError("room tickets require an authenticated session")
         self.tickets[key] = Ticket(kind, device, target, time.monotonic() + lifetime,
-                                   force, session_token)
+                                   force, session_token, guest)
         return {"token": key, "ws_connect_timeout_ms": 10000,
                 "streamer_retry_delta_ms": 1000, "max_reconnect_delta": 120000,
                 "signaling_list": [self.signal_endpoint],
@@ -296,7 +297,7 @@ class ControlPlane(Compatibility):
                          "tv_devices": []})
 
     async def controllable(self, req):
-        own = self.caller(req)
+        own = self.host_caller(req)
         body = await self.body(req)
         if not isinstance(body.get("controllable"), bool):
             raise web.HTTPBadRequest(text="controllable must be boolean")
@@ -472,8 +473,13 @@ class ControlPlane(Compatibility):
         ticket = self.tickets.get(token)
         if ticket is None or ticket.expires <= time.monotonic():
             raise web.HTTPUnauthorized(text="invalid room token")
-        session = self.db.execute("SELECT device_id FROM sessions WHERE token=?",
-                                  (ticket.session_token,)).fetchone()
+        if ticket.guest:
+            session = self.db.execute(
+                "SELECT device_id FROM guest_sessions WHERE token=? AND expires>?",
+                (ticket.session_token, int(time.time()))).fetchone()
+        else:
+            session = self.db.execute("SELECT device_id FROM sessions WHERE token=?",
+                                      (ticket.session_token,)).fetchone()
         if not session or session["device_id"] != ticket.device or not self.device(ticket.device):
             raise web.HTTPUnauthorized(text="revoked room session")
         ws = web.WebSocketResponse(heartbeat=None, max_msg_size=MAX_SIGNAL)
