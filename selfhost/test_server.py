@@ -201,5 +201,51 @@ class SelfHostTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(host.closed)
 
 
+    async def test_logical_control_survives_websocket_reconnect(self):
+        import asyncio
+        hd, cd, ht, ct, host, controller = await self.pair()
+        request = {"app_control_id": "app-reconnect",
+                   "app_data": {"_placeholder": True, "num": 0},
+                   "streamer_data": "{}"}
+        await controller.send_str("451-2" + json.dumps(["control", request]))
+        await controller.send_bytes(b"\x04\x08\x01")
+        await host.receive()
+        await host.receive()
+        ack = json.loads((await controller.receive()).data[3:])[1]
+        controller_ticket = next(token for token, t in self.plane.tickets.items()
+                                 if t.kind == "controller" and t.device == cd)
+        before = self.plane.controls[hd][0].client_id
+        self.plane.reconnect_grace = 0.15
+        await controller.close()
+        reconnected = await self.socket(controller_ticket)
+        self.assertEqual(self.plane.controls[hd][0].client_id, before)
+        await asyncio.sleep(0.25)
+        self.assertIn(hd, self.plane.controls)
+        # The old connection must no longer own the forwarding slot.
+        capability = {"client_id": before, "data": {
+            "type": "device_capability",
+            "device_capability": {"ice_id": ack["ice_id"], "display_info": [],
+                                  "video_codec_capability": []}}}
+        await host.send_str("42" + json.dumps(["forward_setting", capability]))
+        frame = await asyncio.wait_for(reconnected.receive(), timeout=2)
+        self.assertIn("forward_setting", frame.data)
+
+    async def test_disconnected_control_expires_after_reconnect_grace(self):
+        import asyncio
+        hd, cd, ht, ct, host, controller = await self.pair()
+        request = {"app_control_id": "app-expiry",
+                   "app_data": {"_placeholder": True, "num": 0}}
+        await controller.send_str("451-2" + json.dumps(["control", request]))
+        await controller.send_bytes(b"\x04\x01")
+        await host.receive()
+        await host.receive()
+        await controller.receive()
+        self.plane.reconnect_grace = 0.1
+        await controller.close()
+        await asyncio.sleep(0.25)
+        self.assertNotIn(hd, self.plane.controls)
+        self.assertIn("left", (await host.receive()).data)
+
+
 if __name__ == "__main__":
     unittest.main()
