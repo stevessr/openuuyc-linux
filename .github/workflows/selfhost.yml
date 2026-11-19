@@ -18,3 +18,4 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r selfhost/requirements.txt
       - run: python -m unittest discover -s selfhost -p 'test_*.py' -v
+      - run: docker build -t openuuyc-selfhost:ci selfhost
