@@ -58,12 +58,30 @@ pub(crate) async fn upload_wallpaper(
 ) -> Result<UploadedWallpaper> {
     let url = reqwest::Url::parse(&grant.req_url)
         .map_err(|_| anyhow::anyhow!("invalid wallpaper upload URL"))?;
+    // The official Filepicker host remains the default. In explicit
+    // self-host mode, accept only a same-origin HTTPS upload grant; never
+    // follow arbitrary servers named in a compromised grant.
+    let selfhost_origin = std::env::var("OPENUUYC_NRD_BASE_URL")
+        .ok()
+        .and_then(|raw| reqwest::Url::parse(&raw).ok())
+        .filter(|base| {
+            base.scheme() == "https"
+                && base.path() == "/"
+                && base.query().is_none()
+                && base.fragment().is_none()
+                && base.username().is_empty()
+                && base.password().is_none()
+        })
+        .map(|base| base.origin().ascii_serialization());
+    let upload_origin = url.origin().ascii_serialization();
+    let allowed = url.host_str() == Some("fp.ps.netease.com")
+        || selfhost_origin.as_deref() == Some(upload_origin.as_str());
     if url.scheme() != "https"
-        || url.host_str() != Some("fp.ps.netease.com")
+        || !allowed
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        bail!("wallpaper upload requires an HTTPS URL without credentials");
+        bail!("wallpaper upload requires a trusted HTTPS server without credentials");
     }
     if grant.ttl == 0 || grant.token.is_empty() {
         bail!("wallpaper upload grant is empty or expired");
@@ -121,6 +139,11 @@ pub(crate) async fn upload_wallpaper(
         mime_length = uploaded.mime.len(),
         "wallpaper upload metadata received"
     );
+    if selfhost_origin.is_some()
+        && url.origin().ascii_serialization() != upload_origin
+    {
+        bail!("self-host wallpaper publication changed HTTPS origin");
+    }
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
