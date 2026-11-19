@@ -136,6 +136,11 @@ class ControlPlane(Compatibility):
         return value
 
     def new_ticket(self, kind, device, target, lifetime=3600, force=False, session_token=""):
+        if len(self.tickets) >= 8192:
+            now = time.monotonic()
+            self.tickets = {k: t for k, t in self.tickets.items() if t.expires > now}
+            if len(self.tickets) >= 8192:
+                raise web.HTTPServiceUnavailable(text="room ticket capacity exceeded")
         key = secrets.token_urlsafe(32)
         if not session_token:
             raise ValueError("room tickets require an authenticated session")
@@ -172,6 +177,9 @@ class ControlPlane(Compatibility):
                                    req.headers.get("X-Param-VN", ""))
             return envelope({"device_id": existing["device_id"], "alias": existing["alias"]})
         did = secrets.token_hex(8)
+        count = self.db.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        if count >= 1024:
+            raise web.HTTPServiceUnavailable(text="device capacity exceeded")
         self.db.execute("INSERT INTO devices(device_id,client_id,alias,platform) VALUES(?,?,?,?)",
                         (did, cid, name, platform))
         self.update_registered(did, req.headers.get("X-Param-VN", ""))
@@ -181,6 +189,13 @@ class ControlPlane(Compatibility):
         cid = req.headers.get("X-Param-client-id", "")
         if not cid or not self.db.execute("SELECT 1 FROM devices WHERE client_id=?", (cid,)).fetchone():
             return envelope(code=401, msg="device not registered")
+        # Bound QR storage and ensure expired grants cannot accumulate.
+        self.db.execute("DELETE FROM qrs WHERE expires<? OR consumed=1",
+                        (int(time.time()) - 300,))
+        pending = self.db.execute("SELECT COUNT(*) FROM qrs WHERE client_id=? AND consumed=0 AND expires>?",
+                                  (cid, int(time.time()))).fetchone()[0]
+        if pending >= 8:
+            return envelope(code=429, msg="too many pending QR requests")
         ticket = secrets.token_urlsafe(24)
         self.db.execute("INSERT INTO qrs(ticket,client_id,expires) VALUES(?,?,?)",
                         (ticket, cid, int(time.time()) + 300))
@@ -367,7 +382,11 @@ class ControlPlane(Compatibility):
             return
         if event in ("leave", "clear_out"):
             async with self.guard:
-                await self.release(peer.ticket.target)
+                active = self.controls.get(peer.ticket.target)
+                # A stale controller's LEAVE must not release another
+                # controller's live session after a takeover.
+                if active and (peer is active[0] or peer is active[1]):
+                    await self.release(peer.ticket.target)
             if ack:
                 await peer.send("43" + ack + "[]")
             return
