@@ -19,6 +19,7 @@ from urllib.parse import quote
 from aiohttp import WSMsgType, web
 from .compat import Compatibility
 from .ice import ice_servers
+from .media import LocalMedia
 
 MAX_BODY = 1024 * 1024
 MAX_SIGNAL = 1024 * 1024
@@ -71,7 +72,7 @@ class Peer:
             await self.send("451-" + payload, b"\x04" + attachment)
 
 
-class ControlPlane(Compatibility):
+class ControlPlane(Compatibility, LocalMedia):
     def __init__(self, database: str, public_url: str, admin_key: str, ice_urls: list[str],
                  turn_secret: str = "", turn_user: str = "", turn_password: str = ""):
         if not public_url.startswith("https://"):
@@ -106,6 +107,7 @@ class ControlPlane(Compatibility):
             );
         """)
         self.init_compat()
+        self.init_media(database)
         self.tickets: dict[str, Ticket] = {}
         self.peers: set[Peer] = set()
         self.hosts: dict[str, Peer] = {}
@@ -582,7 +584,7 @@ class ControlPlane(Compatibility):
             web.post("/api/v1/transport/{device}/rpc/request", self.transport_rpc),
             web.get("/socket.io/", self.signal),
             web.get("/healthz", health),
-        ] + self.compat_routes())
+        ] + self.compat_routes() + self.media_routes())
 
         async def close(_):
             for peer in list(self.peers):
