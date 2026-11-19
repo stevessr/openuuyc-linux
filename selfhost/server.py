@@ -390,8 +390,14 @@ class ControlPlane:
                 other = host if peer is controller else controller
                 item = args[0]
                 data = item["data"]
+                # The host publishes DeviceCapability with ice_id inside the
+                # nested capability, not on the forward_setting envelope.
+                declared_ice = data.get("ice_id")
+                if event == "forward_setting" and data.get("type") == "device_capability":
+                    capability = data.get("device_capability")
+                    declared_ice = capability.get("ice_id") if isinstance(capability, dict) else None
                 if (item.get("client_id") != other.client_id or
-                    data.get("ice_id") != ice or
+                    declared_ice != ice or
                     data.get("app_control_id", app) != app):
                     return
                 await other.event(event, item, attachment)
