@@ -21,6 +21,7 @@ from .compat import Compatibility
 from .ice import ice_servers
 from .media import LocalMedia
 from .assistance_live import LiveAssistance
+from .server_utils import validated_id
 
 MAX_BODY = 1024 * 1024
 MAX_SIGNAL = 1024 * 1024
@@ -120,6 +121,7 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
         self.disconnect_tasks: set[asyncio.Task] = set()
         self.controls: dict[str, tuple[Peer, Peer, str, str]] = {}
         self.guard = asyncio.Lock()
+        self.admin_failures: dict[str, list[float]] = {}
 
     def device(self, did):
         return self.db.execute("SELECT * FROM devices WHERE device_id=?", (did,)).fetchone()
@@ -175,7 +177,9 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
                 "status": "CONNECTED" if did in self.hosts else "DISCONNECTED",
                 "controllable": bool(row["controllable"]),
                 "controlled_support": True,
-                "participants_info": ([{"device_id": self.controls[did][0].ticket.device}]
+                "participants_info": ([self.participant(
+                                          self.controls[did][0].ticket.device,
+                                          self.controls[did][0])]
                                       if did in self.controls else [])}
 
     async def init(self, req):
@@ -187,15 +191,27 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
         platform = 2 if "android" in req.path else 1
         existing = self.db.execute("SELECT * FROM devices WHERE client_id=?", (cid,)).fetchone()
         if existing:
-            self.update_registered(existing["device_id"],
-                                   req.headers.get("X-Param-VN", ""))
+            version = req.headers.get("X-Param-VN", "")
+            self.update_registered(existing["device_id"], version)
+            fields = {}
+            if version and version != self.metadata(existing["device_id"])["version_name"]:
+                fields["version_name"] = version
+            await self.push_device_change(existing["device_id"], fields=fields or None)
             return envelope({"device_id": existing["device_id"], "alias": existing["alias"]})
         did = secrets.token_hex(8)
         count = self.db.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
         if count >= 1024:
             raise web.HTTPServiceUnavailable(text="device capacity exceeded")
-        self.db.execute("INSERT INTO devices(device_id,client_id,alias,platform) VALUES(?,?,?,?)",
-                        (did, cid, name, platform))
+        try:
+            self.db.execute("INSERT INTO devices(device_id,client_id,alias,platform) VALUES(?,?,?,?)",
+                            (did, cid, name, platform))
+        except sqlite3.IntegrityError:
+            # A concurrent init with the same client_id won the race; return its
+            # stable identity instead of failing the retried registration.
+            winner = self.db.execute("SELECT * FROM devices WHERE client_id=?", (cid,)).fetchone()
+            if winner:
+                return envelope({"device_id": winner["device_id"], "alias": winner["alias"]})
+            raise
         self.update_registered(did, req.headers.get("X-Param-VN", ""))
         return envelope({"device_id": did, "alias": name})
 
@@ -243,15 +259,42 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
         return web.Response(text=html, content_type="text/html",
                             headers={"Cache-Control": "no-store"})
 
+    def admin_throttled(self, req):
+        """Bounded per-peer backoff for wrong administrator keys.
+
+        A reverse proxy remains the first line of defense; this keeps an
+        attacker who reaches the Python process directly from guessing the
+        approval key at full speed.
+        """
+        peer = req.remote or ""
+        now = time.monotonic()
+        failures = [t for t in self.admin_failures.get(peer, ()) if now - t < 900]
+        if len(failures) >= 5:
+            self.admin_failures[peer] = failures
+            return True
+        if len(self.admin_failures) > 4096:
+            self.admin_failures = {peer: entries for peer, entries
+                                   in self.admin_failures.items()
+                                   if any(now - t < 900 for t in entries)}
+        self.admin_failures[peer] = failures
+        return False
+
     async def approve_post(self, req):
+        if self.admin_throttled(req):
+            raise web.HTTPTooManyRequests(text="too many approval attempts")
         form = await req.post()
         if not hmac.compare_digest(str(form.get("admin_key", "")), self.admin_key):
+            now = time.monotonic()
+            failures = self.admin_failures.get(req.remote or "", [])
+            failures.append(now)
+            self.admin_failures[req.remote or ""] = failures
             raise web.HTTPForbidden(text="invalid administrator key")
         cursor = self.db.execute(
             "UPDATE qrs SET approved=1 WHERE ticket=? AND expires>? AND consumed=0",
             (req.match_info["ticket"], int(time.time())))
         if cursor.rowcount == 0:
             raise web.HTTPNotFound()
+        self.admin_failures.pop(req.remote or "", None)
         return web.Response(text="Approved. Return to OpenUUYC.",
                             headers={"Cache-Control": "no-store"})
 
@@ -266,6 +309,10 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
             raise web.HTTPForbidden(text="QR identity mismatch")
         device = self.db.execute("SELECT device_id FROM devices WHERE client_id=?",
                                  (row["client_id"],)).fetchone()
+        if not device:
+            # The QR's device was unbound while approval was pending.
+            self.db.execute("UPDATE qrs SET consumed=1 WHERE ticket=?", (ticket,))
+            return envelope(code=403, msg="device no longer bound")
         token = secrets.token_urlsafe(48)
         self.db.execute("UPDATE qrs SET consumed=1 WHERE ticket=?", (ticket,))
         self.db.execute("INSERT INTO sessions(token,device_id,created_at) VALUES(?,?,?)",
@@ -319,6 +366,8 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
         if not body["controllable"]:
             async with self.guard:
                 await self.release(own["device_id"])
+        await self.push_device_change(own["device_id"],
+                                      fields={"controllable": bool(body["controllable"])})
         return envelope({})
 
     async def create_room(self, req):
@@ -351,6 +400,23 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
                                      ["Platform", str(info["platform"])],
                                      ["Version", self.metadata(info["device_id"])["version_name"]]]})
 
+    async def release_trigger(self, req):
+        """POST /api/v1/release/trigger/{device}/update (trigger_controlled_update).
+
+        The official server makes the *controlled* device pop its own update
+        dialog; a self-hosted OpenUUYC host cannot be remotely updated through
+        UU, so answer with a typed envelope instead of a bare 404 (the client
+        parses every account reply as an envelope). Validate the target the
+        same way the official caller does first.
+        """
+        caller = self.caller(req)
+        target = req.match_info["device"]
+        if not validated_id(target):
+            return envelope(code=400, msg="invalid device")
+        if not self.device(target):
+            return envelope(code=404, msg="device not found")
+        return envelope(code=501, msg="self-host does not support remote controlled updates")
+
     async def configures(self, req):
         self.caller(req)
         return envelope({})
@@ -358,6 +424,30 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
     async def unsupported(self, req):
         self.caller(req)
         return envelope(code=501, msg="unsupported on self-host")
+
+    async def push_device_change(self, device_id, kind="device_info_changed", fields=None):
+        """Fan one account device delta out to every online host room.
+
+        Mirrors the official bmsg_push shapes consumed by
+        src/session/presence.rs via account/device_change.rs: partial fields
+        are fine, data.device_id is required, and an unbound device learns
+        its own removal through the same channel.
+        """
+        payload = {"device_id": device_id}
+        if fields:
+            payload.update(fields)
+        for peer in list(self.hosts.values()):
+            if peer.active:
+                await peer.event("bmsg_push", {"type": kind, "data": payload})
+
+    def participant(self, device_id, peer=None):
+        row = self.device(device_id)
+        if not row:
+            return {"device_id": device_id}
+        return {"client_id": peer.client_id if peer else row["client_id"],
+                "device_id": device_id, "alias": row["alias"],
+                "platform": row["platform"], "user_join_type": 1,
+                "controlled_time": 0, "app_flag": None}
 
     async def release(self, target):
         session = self.controls.pop(target, None)
@@ -615,6 +705,7 @@ class ControlPlane(Compatibility, LocalMedia, LiveAssistance):
             web.post("/api/v1/room/join/by_device/{device}", self.join),
             web.post("/api/v1/tool/configures_with_version", self.configures),
             web.post("/api/v1/transport/{device}/rpc/request", self.transport_rpc),
+            web.post("/api/v1/release/trigger/{device}/update", self.release_trigger),
             web.get("/socket.io/", self.signal),
             web.get("/healthz", health),
         ] + self.compat_routes() + self.media_routes())

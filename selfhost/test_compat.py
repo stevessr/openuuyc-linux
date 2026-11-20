@@ -76,11 +76,14 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
     async def respond_assistance(self, socket, identity, device, token, password,
                                  guest_id=None, mode="by_password", approve=True):
         import hashlib
-        frame = (await socket.receive()).data
-        self.assertTrue(frame.startswith("42"))
-        event, push = json.loads(frame[2:])
-        self.assertEqual(event, "bmsg_push")
-        kind = push["type"]
+        while True:
+            frame = (await socket.receive()).data
+            self.assertTrue(frame.startswith("42"))
+            event, push = json.loads(frame[2:])
+            self.assertEqual(event, "bmsg_push")
+            kind = push["type"]
+            if kind != "device_info_changed":
+                break
         data = push["data"]
         prefix = "/api/v1/guest" if guest_id else "/api/v2"
         paths = {
@@ -137,6 +140,11 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
         _, unbound = await self.request("POST", "/api/v1/device/" + hd + "/unbind",
                                     "controller", cd, ct)
         self.assertEqual(unbound["code"], 0)
+        # The unbound device sees its own removal before the room is closed.
+        removal = json.loads((await host.receive()).data[2:])
+        self.assertEqual(removal[0], "bmsg_push")
+        self.assertEqual(removal[1]["type"], "device_unbind")
+        self.assertEqual(removal[1]["data"]["device_id"], hd)
         self.assertIn((await host.receive()).type,
                       (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED))
         status, _ = await self.request("GET", "/api/v1/device/list", "host", hd, ht)
@@ -165,6 +173,9 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
         host = await self.room("host", hd, ht)
         await self.request("POST", "/api/v1/device/controllable", "host", hd, ht,
                            {"controllable": True})
+        # Toggling controllable now also fans out a device delta; skip it.
+        delta = json.loads((await host.receive()).data[2:])
+        self.assertEqual(delta[1]["type"], "device_info_changed")
         _, reboot = await self.request("POST", "/api/v1/device/" + hd + "/reboot",
                                        "controller", cd, ct)
         self.assertEqual(reboot["code"], 0)
@@ -215,9 +226,12 @@ class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         phone = reply["data"]["device_id"]
         pt = await self.login("phone", phone)
-        online = await self.room("phone", phone, pt)
         await self.request("POST", "/api/v1/device/controllable", "phone", phone, pt,
                            {"controllable": True})
+        online = await self.room("phone", phone, pt)
+        # The phone's controllable delta reaches the already-online host room.
+        delta = json.loads((await host.receive()).data[2:])
+        self.assertEqual(delta[1]["data"]["device_id"], phone)
         _, unsolicited = await self.request("POST", "/api/v1/transport/" + hd + "/rpc/request",
                                     "phone", phone, pt, {"p": "android_control_result",
                                         "data": {"action": "accept_control",

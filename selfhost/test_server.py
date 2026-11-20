@@ -80,11 +80,13 @@ class SelfHostTests(unittest.IsolatedAsyncioTestCase):
         cd = await self.register("controller")
         ht, _ = await self.login("host", hd)
         ct, _ = await self.login("controller", cd)
-        _, room = await self.post("/api/v1/room/create", "host", hd, ht)
-        host = await self.socket(room["data"]["token"])
+        # Enable controllability before any room exists: the change delta is
+        # fanned out only to online rooms and this one is not online yet.
         _, access = await self.post("/api/v1/device/controllable", "host", hd, ht,
                                     {"controllable": True})
         self.assertEqual(access["code"], 0)
+        _, room = await self.post("/api/v1/room/create", "host", hd, ht)
+        host = await self.socket(room["data"]["token"])
         _, joined = await self.post("/api/v1/room/join/by_device/" + hd,
                                     "controller", cd, ct)
         self.assertEqual(joined["code"], 0)
@@ -245,6 +247,117 @@ class SelfHostTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.25)
         self.assertNotIn(hd, self.plane.controls)
         self.assertIn("left", (await host.receive()).data)
+
+
+    async def test_device_change_pushes_keep_lists_fresh(self):
+        import asyncio as _asyncio
+        hd, cd, ht, ct, host, controller = await self.pair()
+        # controllable toggle reaches every other online room as a delta.
+        await self.post("/api/v1/device/controllable", "host", hd, ht,
+                        {"controllable": False})
+        frame = json.loads((await host.receive()).data[2:])
+        self.assertEqual(frame[0], "bmsg_push")
+        push = frame[1]
+        self.assertEqual(push["type"], "device_info_changed")
+        self.assertEqual(push["data"]["device_id"], hd)
+        self.assertIs(push["data"]["controllable"], False)
+        # The controller's own room must not echo its own writes.
+        await _asyncio.sleep(0.05)
+        with self.assertRaises(_asyncio.TimeoutError):
+            await _asyncio.wait_for(controller.receive(), timeout=0.3)
+
+    async def test_unbind_pushes_removal_before_revoking_rooms(self):
+        import asyncio
+        hd, cd, ht, ct, host, controller = await self.pair()
+        _, unbound = await self.post("/api/v1/device/" + hd + "/unbind",
+                                     "controller", cd, ct)
+        self.assertEqual(unbound["code"], 0)
+        # Device deltas ride the device's own online (host) room; the unbound
+        # device retires on seeing its own ID before its socket closes.
+        removal = json.loads((await host.receive()).data[2:])
+        self.assertEqual(removal[0], "bmsg_push")
+        self.assertEqual(removal[1]["type"], "device_unbind")
+        self.assertEqual(removal[1]["data"]["device_id"], hd)
+        self.assertIn((await host.receive()).type,
+                      (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED))
+        # The controller's room ticket for the removed device is revoked too.
+        async with self.http.get("/api/v1/device/list",
+                                 headers=self.headers("controller", cd, ct)) as response:
+            listing = await response.json()
+        self.assertEqual(listing["data"]["my_binded_devices"], [])
+
+    async def test_release_trigger_answers_envelope_not_html_404(self):
+        hd, cd, ht, ct, host, controller = await self.pair()
+        _, missing = await self.post("/api/v1/release/trigger/" + "0" * 16 + "/update",
+                                     "controller", cd, ct,
+                                     {"type": 1, "scene": "function", "extra": "{}"})
+        self.assertEqual(missing["code"], 404)
+        _, known = await self.post("/api/v1/release/trigger/" + hd + "/update",
+                                   "controller", cd, ct,
+                                   {"type": 1, "scene": "function", "extra": "{}"})
+        self.assertEqual(known["code"], 501)
+        self.assertIn("self-host", known["msg"])
+
+    async def test_login_qr_survives_device_unbound_mid_approval(self):
+        client_id = "vanished"
+        device = await self.register(client_id)
+        # Log in first so the later unbind can authenticate; unbind requires
+        # a *different* authenticated caller, so enroll a second device too.
+        token, _ = await self.login(client_id, device)
+        other = await self.register("remover")
+        other_token, _ = await self.login("remover", other)
+        _, qr = await self.post("/api/v1/qrcode/gen/login", client_id, device)
+        ticket = qr["data"]["token"]
+        async with self.http.post("/enroll/" + ticket,
+                                  data={"admin_key": "z" * 32}) as reply:
+            self.assertEqual(reply.status, 200)
+        # The device disappears before the client exchanges the QR.
+        async with self.http.post("/api/v1/device/" + device + "/unbind",
+                                  json={},
+                                  headers=self.headers("remover", other, other_token)) as r:
+            self.assertEqual((await r.json())["code"], 0)
+        _, result = await self.post("/api/v1/login/by_qrcode", client_id, device,
+                                    data={"token": ticket,
+                                          "qrcode_jump_url": qr["data"]["qrcode_jump_url"]})
+        self.assertEqual(result["code"], 403)
+
+    async def test_admin_key_guessing_is_throttled(self):
+        device = await self.register("throttle")
+        _, qr = await self.post("/api/v1/qrcode/gen/login", "throttle", device)
+        ticket = qr["data"]["token"]
+        for _ in range(5):
+            async with self.http.post("/enroll/" + ticket,
+                                      data={"admin_key": "wrong"}) as reply:
+                self.assertEqual(reply.status, 403)
+        async with self.http.post("/enroll/" + ticket,
+                                  data={"admin_key": "z" * 32}) as reply:
+            self.assertEqual(reply.status, 429)
+
+    async def test_participants_info_matches_official_shape(self):
+        hd, cd, ht, ct, host, controller = await self.pair()
+        request = {"app_control_id": "app-shape",
+                   "app_data": {"_placeholder": True, "num": 0},
+                   "streamer_data": "{}"}
+        await controller.send_str("451-2" + json.dumps(["control", request]))
+        await controller.send_bytes(b"\x04\x01")
+        await host.receive()
+        await host.receive()
+        await controller.receive()
+        async with self.http.get("/api/v1/device/list",
+                                 headers=self.headers("controller", cd, ct)) as response:
+            self.assertEqual(response.status, 200)
+            listing = await response.json()
+        held = next(x for x in listing["data"]["my_binded_devices"]
+                    if x["device_id"] == hd)
+        participants = held["participants_info"]
+        self.assertEqual(len(participants), 1)
+        entry = participants[0]
+        self.assertEqual(entry["device_id"], cd)
+        self.assertEqual(entry["client_id"], self.plane.controls[hd][0].client_id)
+        self.assertEqual(entry["platform"], 2 if False else 1)
+        self.assertIn("user_join_type", entry)
+        self.assertIn("controlled_time", entry)
+        self.assertIn("app_flag", entry)
 
 
 if __name__ == "__main__":

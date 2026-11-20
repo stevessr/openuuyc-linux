@@ -182,6 +182,7 @@ class Compatibility:
                 or len(alias) > MAX_ALIAS or any(ord(c) < 32 or ord(c) == 127 for c in alias)):
             return envelope(code=400, msg="invalid alias")
         self.db.execute("UPDATE devices SET alias=? WHERE device_id=?", (alias, target))
+        await self.push_device_change(target, fields={"alias": alias})
         return envelope({"device_id": target, "alias": alias})
 
     async def unbind_device(self, req):
@@ -203,6 +204,10 @@ class Compatibility:
             self.db.execute("DELETE FROM device_properties WHERE device_id=?", (target,))
             self.db.execute("DELETE FROM assistance WHERE device_id=?", (target,))
             self.db.execute("DELETE FROM devices WHERE device_id=?", (target,))
+            # Deliver the removal while every room is still connected: the
+            # unbound device itself retires on seeing its own ID, and other
+            # devices drop it from their lists (presence.rs DeviceChange).
+            await self.push_device_change(target, "device_unbind")
         for peer in peers:
             await peer.socket.close(code=1008, message=b"device unbound")
         return envelope({})
