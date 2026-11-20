@@ -1,0 +1,47 @@
+[package]
+name = "openuuyc-selfhost"
+version = "1.0.0"
+edition = "2024"
+publish = false
+license-file = "../LICENSE"
+description = "Distributed self-hosted OpenUUYC control plane and signaling (Rust port of selfhost/)"
+
+[lib]
+name = "openuuyc_selfhost"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openuuyc-selfhost"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws", "http2", "query"] }
+bytes = "1"
+futures-util = "0.3"
+gloo-timers = { version = "0.3", optional = true }
+rand = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+base64 = "0.22"
+hmac = "0.12"
+tokio = { version = "1.45", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+arc-swap = "1"
+deadpool-redis = { version = "0.21", features = ["rt_tokio_1"] }
+redis = { version = "0.31", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+urlencoding = "2"
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio-tungstenite = "0.28"
+
+[profile.release]
+lto = "thin"
+strip = true
