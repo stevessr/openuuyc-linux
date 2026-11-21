@@ -30,6 +30,11 @@ pub struct AppState {
     pub wallpaper_dir: std::path::PathBuf,
     pub admin_failures: std::sync::Mutex<std::collections::HashMap<String, Vec<Instant>>>,
     pub started_at: Instant,
+    /// Keycloak/OIDC login provider; None keeps the administrator-key-only
+    /// enrollment flow.
+    pub oidc: Option<Arc<crate::oidc::OidcProvider>>,
+    /// When true, administrator-key enrollment is disabled entirely.
+    pub oidc_require: bool,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -346,7 +351,7 @@ pub async fn login_by_qrcode(
     if consumed_client != client_id {
         return Ok(envelope_err(403, "QR identity mismatch"));
     }
-    let Some(device) = state.runtime.store.device_by_client(&client_id).await? else {
+    let Some(mut device) = state.runtime.store.device_by_client(&client_id).await? else {
         // The QR's device was unbound while approval was pending.
         return Ok(envelope_err(403, "device no longer bound"));
     };
@@ -355,7 +360,25 @@ pub async fn login_by_qrcode(
         .store
         .create_session(&device.device_id, &client_id)
         .await?;
-    Ok(envelope_ok(json!({"token": token, "user_id": "selfhost", "nickname": "OpenUUYC selfhost"})))
+    // Bind the approving identity (Keycloak subject) to the device so the
+    // account layer shows a real owner; admin-key approvals stay blank.
+    let mut user_id = "selfhost".to_owned();
+    let mut nickname = "OpenUUYC selfhost".to_owned();
+    if let Some((sub, name)) = state.runtime.store.qr_approver(&ticket).await? {
+        if !sub.is_empty() {
+            device.owner_sub = sub.clone();
+            device.owner_name = name.clone();
+            state.runtime.store.put_device(&device).await?;
+            user_id = sub;
+            nickname = name;
+            state
+                .runtime
+                .store
+                .audit_enrollment(&device.device_id, &user_id, &nickname, false)
+                .await?;
+        }
+    }
+    Ok(envelope_ok(json!({"token": token, "user_id": user_id, "nickname": nickname})))
 }
 
 // ---------- administrator enrollment ----------
@@ -412,14 +435,26 @@ pub async fn approve_get(
     if state.runtime.store.qr_ticket(&ticket).await?.is_none() {
         return Err(ApiError::not_found());
     }
-    let html = concat!(
-        "<!doctype html><meta charset=\"utf-8\">",
-        "<meta name=\"referrer\" content=\"no-referrer\">",
-        "<title>OpenUUYC self-host login</title><h1>Approve OpenUUYC device</h1>",
-        "<p>Approve only a device you control.</p>",
-        "<form method=\"post\"><label>Administrator key ",
-        "<input type=\"password\" name=\"admin_key\" required autocomplete=\"off\"></label>",
-        "<button type=\"submit\">Approve</button></form>"
+    let keycloak_link = match &state.oidc {
+        Some(_provider) => {
+            let login_path = format!("/enroll/{}/login", ticket);
+            if state.oidc_require {
+                format!("<p><a href=\"{}\">Login with Keycloak to approve</a></p>", login_path)
+            } else {
+                format!("<p><a href=\"{}\">Login with Keycloak to approve</a> or use the administrator key below.</p>", login_path)
+            }
+        }
+        None => String::new(),
+    };
+    let admin_form = if state.oidc_require && state.oidc.is_some() {
+        String::new()
+    } else {
+        "<form method=\"post\"><label>Administrator key <input type=\"password\" name=\"admin_key\" required autocomplete=\"off\"></label> <button type=\"submit\">Approve</button></form>".to_owned()
+    };
+    let html = format!(
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><title>OpenUUYC self-host login</title><h1>Approve OpenUUYC device</h1><p>Approve only a device you control.</p>{}{}",
+        keycloak_link,
+        admin_form
     );
     Ok((
         [(axum::http::header::CACHE_CONTROL, "no-store")],
@@ -440,6 +475,145 @@ fn parse_form(body: &[u8]) -> std::collections::HashMap<String, String> {
             ))
         })
         .collect()
+}
+
+// ---------- OIDC (Keycloak) enrollment login ----------
+
+/// GET /enroll/{ticket}/login — bounce the approver to Keycloak with PKCE.
+pub async fn oidc_login(
+    State(state): State<SharedState>,
+    Path(ticket): Path<String>,
+) -> ApiResult {
+    let Some(provider) = &state.oidc else {
+        return Err(ApiError::Plain(StatusCode::NOT_FOUND, "OIDC login not configured"));
+    };
+    if state.runtime.store.qr_ticket(&ticket).await?.is_none() {
+        return Err(ApiError::not_found());
+    }
+    let endpoints = provider.endpoints().await.map_err(|error| {
+        tracing::error!(%error, "OIDC discovery failed");
+        ApiError::unavailable("identity provider unreachable")
+    })?;
+    let (verifier, challenge) = crate::oidc::OidcProvider::pkce();
+    let state_param = crate::oidc::OidcProvider::nonce();
+    let nonce = crate::oidc::OidcProvider::nonce();
+    // Bind verifier/nonce to (ticket, state) so a forged callback cannot mix
+    // sessions. TTL covers a slow human in the browser.
+    let mut conn = state.runtime.store.pool_clone().await?;
+    let _: Result<(), _> = redis::AsyncCommands::set_ex(
+        &mut conn,
+        format!("ouu:oidc-flow:{}", crate::store::hash_token(&state_param)),
+        format!("{ticket}|{verifier}|{nonce}"),
+        600,
+    )
+    .await;
+    let redirect_uri = format!("{}/enroll/{}/callback", state.public_url, ticket);
+    let url = provider.authorization_url(endpoints.as_ref(), &redirect_uri, &state_param, &nonce, &challenge);
+    Ok((
+        [(axum::http::header::LOCATION, url)],
+        StatusCode::FOUND,
+    )
+        .into_response())
+}
+
+/// GET /enroll/{ticket}/callback?code&state — complete the OIDC code flow,
+/// resolve identity via userinfo, then approve the pending ticket.
+pub async fn oidc_callback(
+    State(state): State<SharedState>,
+    Path(ticket): Path<String>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> ApiResult {
+    let Some(provider) = &state.oidc else {
+        return Err(ApiError::Plain(StatusCode::NOT_FOUND, "OIDC login not configured"));
+    };
+    let code = query.get("code").cloned().unwrap_or_default();
+    let flow_state = query.get("state").cloned().unwrap_or_default();
+    if code.is_empty() || flow_state.is_empty() {
+        return Err(ApiError::bad_request("missing code or state"));
+    }
+    // Flow state must exist and match the ticket it was minted for.
+    let mut conn = state.runtime.store.pool_clone().await?;
+    let flow_key = format!("ouu:oidc-flow:{}", crate::store::hash_token(&flow_state));
+    let flow: Option<String> = redis::AsyncCommands::get_del(&mut conn, &flow_key)
+        .await
+        .unwrap_or(None);
+    let Some(flow) = flow else {
+        return Err(ApiError::forbidden("unknown or expired login flow"));
+    };
+    let Some((flow_ticket, verifier, _nonce)) = flow.split_once('|').and_then(|(t, rest)| {
+        rest.split_once('|').map(|(v, n)| (t, v, n))
+    }) else {
+        return Err(ApiError::forbidden("corrupted login flow"));
+    };
+    if flow_ticket != ticket {
+        return Err(ApiError::forbidden("login flow bound to another ticket"));
+    }
+    // Consume the code at Keycloak (secret stays server-side) and resolve
+    // identity through userinfo.
+    let endpoints = provider.endpoints().await.map_err(|error| {
+        tracing::error!(%error, "OIDC discovery failed during callback");
+        ApiError::unavailable("identity provider unreachable")
+    })?;
+    let redirect_uri = format!("{}/enroll/{}/callback", state.public_url, ticket);
+    let confidential = state
+        .oidc
+        .as_ref()
+        .map(|p| p.client_secret.is_some())
+        .unwrap_or(false);
+    let credential = if confidential {
+        state.oidc.as_ref().unwrap().client_secret.as_deref().unwrap_or("").to_owned()
+    } else {
+        verifier.to_owned()
+    };
+    let tokens = provider
+        .exchange_code(endpoints.as_ref(), &redirect_uri, &code, &credential, confidential)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "OIDC code exchange failed");
+            ApiError::forbidden("identity provider rejected the login")
+        })?;
+    let user = provider
+        .userinfo(endpoints.as_ref(), &tokens.access_token)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "OIDC userinfo failed");
+            ApiError::forbidden("could not resolve the authenticated identity")
+        })?;
+    // Approve and stamp the approving identity.
+    if !state.runtime.store.approve_qr(&ticket).await? {
+        return Err(ApiError::not_found());
+    }
+    let display = user.display();
+    state
+        .runtime
+        .store
+        .stamp_qr_approver(&ticket, &user.sub, &display)
+        .await?;
+    let approver = if user.sub.is_empty() { "unknown" } else { user.sub.as_str() };
+    state
+        .runtime
+        .store
+        .audit_enrollment("(pending)", approver, &display, false)
+        .await?;
+    let html = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>OpenUUYC self-host login</title>\
+         <h1>Approved by {}</h1><p>Return to OpenUUYC to finish signing in.</p>",
+        html_escape(&display)
+    );
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::response::Html(html),
+    )
+        .into_response())
+}
+
+/// Minimal HTML escaping for identity names echoed into the approval page.
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 pub async fn approve_post(
@@ -469,7 +643,13 @@ pub async fn approve_post(
             tracing::error!("approve_post store error: {e:?}");
             return Err(e);
         }
-    }    state.admin_failures.lock().unwrap().remove(&peer);
+    }
+    state
+        .runtime
+        .store
+        .audit_enrollment("(pending)", "admin-key", "administrator", true)
+        .await?;
+    state.admin_failures.lock().unwrap().remove(&peer);
     Ok((
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         "Approved. Return to OpenUUYC.",

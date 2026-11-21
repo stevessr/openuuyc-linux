@@ -34,6 +34,10 @@ struct Config {
     turn_password: String,
     wallpaper_dir: std::path::PathBuf,
     node_id: String,
+    oidc_issuer: Option<String>,
+    oidc_client_id: Option<String>,
+    oidc_client_secret: Option<String>,
+    oidc_require: bool,
 }
 
 fn load_config() -> anyhow::Result<Config> {
@@ -65,6 +69,27 @@ fn load_config() -> anyhow::Result<Config> {
         .ok()
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| format!("node-{}", api::token_bytes(6)));
+    let oidc_issuer = std::env::var("OPENUUYC_OIDC_ISSUER").ok().filter(|s| !s.is_empty());
+    let oidc_client_id = std::env::var("OPENUUYC_OIDC_CLIENT_ID").ok().filter(|s| !s.is_empty());
+    if let Some(issuer) = &oidc_issuer {
+        let local = issuer.starts_with("http://127.0.0.1:")
+            || issuer.starts_with("http://localhost:");
+        anyhow::ensure!(
+            issuer.starts_with("https://") || local,
+            "OPENUUYC_OIDC_ISSUER must be an HTTPS URL (localhost http allowed for testing)"
+        );
+        anyhow::ensure!(
+            oidc_client_id.is_some(),
+            "OPENUUYC_OIDC_CLIENT_ID is required with OPENUUYC_OIDC_ISSUER"
+        );
+    }
+    let oidc_require = matches!(
+        std::env::var("OPENUUYC_OIDC_REQUIRE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    );
+    if oidc_require && oidc_issuer.is_none() {
+        anyhow::bail!("OPENUUYC_OIDC_REQUIRE needs OPENUUYC_OIDC_ISSUER");
+    }
     Ok(Config {
         bind: bind.parse()?,
         redis_url,
@@ -76,6 +101,10 @@ fn load_config() -> anyhow::Result<Config> {
         turn_password: std::env::var("OPENUUYC_TURN_PASSWORD").unwrap_or_default(),
         wallpaper_dir,
         node_id,
+        oidc_issuer,
+        oidc_client_id,
+        oidc_client_secret: std::env::var("OPENUUYC_OIDC_CLIENT_SECRET").ok().filter(|s| !s.is_empty()),
+        oidc_require,
     })
 }
 
@@ -122,6 +151,8 @@ fn app_router(state: SharedState) -> Router {
         .route("/media/wallpaper/{file_id}", get(api::download_wallpaper))
         // enrollment
         .route("/enroll/{ticket}", get(api::approve_get).post(api::approve_post))
+        .route("/enroll/{ticket}/login", get(api::oidc_login))
+        .route("/enroll/{ticket}/callback", get(api::oidc_callback))
         // signaling
         .route("/socket.io/", get(signal::signal_upgrade))
         .route("/healthz", get(api::healthz))
@@ -137,6 +168,14 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config()?;
     let store = store::Store::connect(&config.redis_url).await?;
     let runtime = Runtime::new(config.node_id.clone(), store);
+    let oidc = match (&config.oidc_issuer, &config.oidc_client_id) {
+        (Some(issuer), Some(client_id)) => Some(Arc::new(oidc::OidcProvider::new(
+            issuer,
+            client_id,
+            config.oidc_client_secret.clone(),
+        ))),
+        _ => None,
+    };
     let state: SharedState = Arc::new(AppState {
         runtime: runtime.clone(),
         public_url: config.public_url.clone(),
@@ -149,6 +188,8 @@ async fn main() -> anyhow::Result<()> {
         wallpaper_dir: config.wallpaper_dir,
         admin_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
         started_at: Instant::now(),
+        oidc,
+        oidc_require: config.oidc_require,
     });
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let bus_runtime = runtime.clone();

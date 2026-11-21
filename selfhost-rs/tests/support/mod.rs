@@ -44,6 +44,18 @@ fn admin_key() -> String {
 impl TestHarness {
     /// Spawn `ports.len()` nodes; port 0 lets the OS pick an ephemeral port.
     pub async fn start(redis_url: &str, ports: Vec<u16>) -> Self {
+        Self::start_with(redis_url, ports, None, "", None, false).await
+    }
+
+    /// Variant with an OIDC provider for Keycloak enrollment tests.
+    pub async fn start_with(
+        redis_url: &str,
+        ports: Vec<u16>,
+        oidc_issuer: Option<String>,
+        _client_id: &str,
+        _client_secret: Option<String>,
+        _require: bool,
+    ) -> Self {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             tracing_subscriber::fmt()
@@ -58,6 +70,13 @@ impl TestHarness {
         for (index, port) in ports.into_iter().enumerate() {
             let node_id = format!("test-node-{index}");
             let runtime = Runtime::new(node_id.clone(), store.clone());
+            let oidc = oidc_issuer.as_ref().map(|issuer| {
+                std::sync::Arc::new(openuuyc_selfhost::oidc::OidcProvider::new(
+                    issuer,
+                    "selfhost-client",
+                    None,
+                ))
+            });
             let state: SharedState = Arc::new(AppState {
                 runtime: runtime.clone(),
                 public_url: "https://test.example".into(),
@@ -70,6 +89,8 @@ impl TestHarness {
                 wallpaper_dir: std::env::temp_dir().join(format!("selfhost-test-{index}-{}", token_bytes(6))),
                 admin_failures: std::sync::Mutex::new(Default::default()),
                 started_at: Instant::now(),
+                oidc,
+                oidc_require: _require,
             });
             std::fs::create_dir_all(&state.wallpaper_dir).unwrap();
             let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);

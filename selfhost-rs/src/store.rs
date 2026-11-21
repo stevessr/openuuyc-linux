@@ -15,6 +15,7 @@ use base64::Engine as _;
 use redis::aio::ConnectionLike;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -146,6 +147,8 @@ impl Store {
             support_wol: false,
             wallpaper_url: String::new(),
             lan_info: "{}".to_owned(),
+            owner_sub: String::new(),
+            owner_name: String::new(),
         };
         let mut conn = self.conn().await?;
         let payload = serde_json::to_string(&device).map_err(internal)?;
@@ -417,6 +420,12 @@ pub struct Device {
     pub wallpaper_url: String,
     #[serde(default = "default_lan")]
     pub lan_info: String,
+    /// Keycloak subject of the identity that approved this device (empty
+    /// when enrollment used the administrator key fallback).
+    #[serde(default)]
+    pub owner_sub: String,
+    #[serde(default)]
+    pub owner_name: String,
 }
 
 fn default_lan() -> String {
@@ -828,3 +837,59 @@ pub struct SavedEntry {
     pub is_favorite: bool,
 }
 
+
+impl Store {
+    /// Stamp the Keycloak identity that approved a ticket, consumed by
+    /// login_by_qrcode to bind the device to its owner.
+    pub async fn stamp_qr_approver(&self, ticket: &str, sub: &str, name: &str) -> Result<(), ApiError> {
+        let mut conn = self.conn().await?;
+        let _: Result<(), _> = conn
+            .set_ex(
+                format!("ouu:qr-approver:{}", hash_token(ticket)),
+                format!("{sub}|{name}"),
+                600,
+            )
+            .await;
+        Ok(())
+    }
+
+    pub async fn qr_approver(&self, ticket: &str) -> Result<Option<(String, String)>, ApiError> {
+        let mut conn = self.conn().await?;
+        let raw: Option<String> = conn
+            .get(format!("ouu:qr-approver:{}", hash_token(ticket)))
+            .await
+            .map_err(internal)?;
+        Ok(raw.and_then(|text| {
+            text.split_once(|c| c == '|').map(|(s, n)| (s.to_owned(), n.to_owned()))
+        }))
+    }
+
+    /// Bounded enrollment audit trail: latest 100 approvals with identity.
+    pub async fn audit_enrollment(&self, device_id: &str, sub: &str, name: &str, via_admin_key: bool) -> Result<(), ApiError> {
+        let entry = json!({
+            "device_id": device_id,
+            "sub": sub,
+            "name": name,
+            "via": if via_admin_key { "admin_key" } else { "oidc" },
+            "at": now(),
+        })
+        .to_string();
+        let mut conn = self.conn().await?;
+        redis::pipe()
+            .atomic()
+            .cmd("ZADD")
+            .arg("ouu:audit:enroll")
+            .arg(now() as i64)
+            .arg(&entry)
+            .ignore()
+            // Keep only the latest 100 entries.
+            .cmd("ZREMRANGEBYRANK")
+            .arg("ouu:audit:enroll")
+            .arg(0)
+            .arg(-101)
+            .ignore()
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(internal)
+    }
+}

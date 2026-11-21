@@ -3,6 +3,7 @@
 pub mod api;
 pub mod errors;
 pub mod ice;
+pub mod oidc;
 pub mod proto;
 pub mod runtime;
 pub mod signal;
