@@ -942,7 +942,9 @@ static void process_input(JNIEnv *env, jobject activity, jmethodID method, jmeth
         scroll_query.action = actions.scroll;
         scroll_query.subactionPath = actions.hand_paths[hand];
         XrActionStateFloat scroll_state{XR_TYPE_ACTION_STATE_FLOAT};
-        if (!(menu_host.load()<0 && menu_nav_hand==hand && timestamp<menu_nav_until && controller_menu_layout.load()!=4) && pane < 6 && scroll_method && XR_SUCCEEDED(xrGetActionStateFloat(session, &scroll_query, &scroll_state)) &&
+        if (!(menu_host.load()<0 && menu_nav_hand==hand && timestamp<menu_nav_until && controller_menu_layout.load()!=4) &&
+            (pane < 6 || (pane == 6 && !menu_grab && grabbed_pane < 0 && controller_menu_layout.load() == 0)) &&
+            scroll_method && XR_SUCCEEDED(xrGetActionStateFloat(session, &scroll_query, &scroll_state)) &&
             scroll_state.isActive && std::fabs(scroll_state.currentState) >= 0.45f) {
             constexpr XrTime scroll_period = 120'000'000; // nanoseconds
             if (last_scroll_time == 0 || timestamp - last_scroll_time >= scroll_period) {

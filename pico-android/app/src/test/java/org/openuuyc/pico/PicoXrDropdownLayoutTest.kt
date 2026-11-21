@@ -54,15 +54,59 @@ class PicoXrDropdownLayoutTest {
     }
     @Test fun sliderFractionOnlyInsideOwnTrack() {
         val y=(PicoXrDropdownLayout.ROW_TOP+PicoXrDropdownLayout.ROW_HEIGHT/2)/800f
-        // Track spans ROW_LEFT+380 .. ROW_RIGHT-80 in the 1200-wide panel.
-        val left=(PicoXrDropdownLayout.ROW_LEFT+380f)/1200f
-        val right=(PicoXrDropdownLayout.ROW_RIGHT-80f)/1200f
+        val left=PicoXrDropdownLayout.SLIDER_TRACK_LEFT/1200f
+        val right=PicoXrDropdownLayout.SLIDER_TRACK_RIGHT/1200f
+        assertTrue(PicoXrDropdownLayout.SLIDER_TRACK_RIGHT<=PicoXrDropdownLayout.ROW_RIGHT-220f)
         assertEquals(0f,PicoXrDropdownLayout.sliderFraction(left,y,0,count)!!,1e-4f)
         assertEquals(1f,PicoXrDropdownLayout.sliderFraction(right,y,0,count)!!,1e-4f)
         val mid=(left+right)/2f
         assertEquals(.5f,PicoXrDropdownLayout.sliderFraction(mid,y,0,count)!!,1e-4f)
         assertNull(PicoXrDropdownLayout.sliderFraction(.5f,y,1,count)) // row 1 has no slider
         assertNull(PicoXrDropdownLayout.sliderFraction(Float.NaN,y,0,count))
+    }
+    @Test fun sliderFractionWorksOnScrolledPages() {
+        val offset=6
+        val y=(PicoXrDropdownLayout.ROW_TOP+PicoXrDropdownLayout.ROW_HEIGHT+PicoXrDropdownLayout.ROW_HEIGHT/2)/800f
+        val left=PicoXrDropdownLayout.SLIDER_TRACK_LEFT/1200f
+        val right=PicoXrDropdownLayout.SLIDER_TRACK_RIGHT/1200f
+        val mid=(left+right)/2f
+        assertEquals(.5f,PicoXrDropdownLayout.sliderFraction(mid,y,7,count,offset)!!,1e-4f)
+        assertNull(PicoXrDropdownLayout.sliderFraction(mid,y,6,count,offset))
+        assertNull(PicoXrDropdownLayout.sliderFraction(mid,y,1,count,offset))
+    }
+    @Test fun headerHitDistinguishesBackPrevNextCloseAndRespectsPaging() {
+        fun center(rect: FloatArray)=((rect[0]+rect[2])/2400f) to ((rect[1]+rect[3])/1600f)
+        val (backU,backV)=center(PicoXrDropdownLayout.BACK_RECT)
+        val (prevU,prevV)=center(PicoXrDropdownLayout.PREV_RECT)
+        val (nextU,nextV)=center(PicoXrDropdownLayout.NEXT_RECT)
+        val (closeU,closeV)=center(PicoXrDropdownLayout.CLOSE_RECT)
+        assertEquals(PicoXrDropdownLayout.HEADER_BACK,PicoXrDropdownLayout.headerHit(backU,backV,6))
+        assertEquals(PicoXrDropdownLayout.HEADER_BACK,PicoXrDropdownLayout.headerHit(prevU,prevV,6))
+        assertEquals(PicoXrDropdownLayout.HEADER_BACK,PicoXrDropdownLayout.headerHit(nextU,nextV,6))
+        assertEquals(PicoXrDropdownLayout.HEADER_CLOSE,PicoXrDropdownLayout.headerHit(closeU,closeV,6))
+        assertEquals(PicoXrDropdownLayout.HEADER_BACK,PicoXrDropdownLayout.headerHit(backU,backV,count))
+        assertEquals(PicoXrDropdownLayout.HEADER_PREV,PicoXrDropdownLayout.headerHit(prevU,prevV,count))
+        assertEquals(PicoXrDropdownLayout.HEADER_NEXT,PicoXrDropdownLayout.headerHit(nextU,nextV,count))
+        assertEquals(PicoXrDropdownLayout.HEADER_CLOSE,PicoXrDropdownLayout.headerHit(closeU,closeV,count))
+        assertNull(PicoXrDropdownLayout.headerHit(.5f,.3f,count))
+        assertNull(PicoXrDropdownLayout.headerHit(Float.NaN,backV,count))
+    }
+    @Test fun pagingAndScrollHelpersClampCleanly() {
+        assertEquals(0,PicoXrDropdownLayout.prevPage(0))
+        assertEquals(0,PicoXrDropdownLayout.prevPage(6))
+        assertEquals(6,PicoXrDropdownLayout.prevPage(12))
+        assertEquals(6,PicoXrDropdownLayout.nextPage(0,10))
+        assertEquals(6,PicoXrDropdownLayout.nextPage(6,10))
+        assertEquals(6,PicoXrDropdownLayout.nextPage(0,13))
+        assertEquals(12,PicoXrDropdownLayout.nextPage(6,13))
+        assertEquals(12,PicoXrDropdownLayout.nextPage(12,13))
+        assertEquals(0,PicoXrDropdownLayout.maxScrollOffset(4))
+        assertEquals(0,PicoXrDropdownLayout.maxScrollOffset(6))
+        assertEquals(4,PicoXrDropdownLayout.maxScrollOffset(10))
+        assertEquals(0,PicoXrDropdownLayout.scrollOffset(0,-1,10))
+        assertEquals(1,PicoXrDropdownLayout.scrollOffset(0,1,10))
+        assertEquals(4,PicoXrDropdownLayout.scrollOffset(4,1,10))
+        assertEquals(4,PicoXrDropdownLayout.scrollOffset(6,-1,10))
     }
     @Test fun sliderValuesMapInclusiveIntegerRanges() {
         assertEquals(1,PicoXrDropdownLayout.sliderValue(-1f,1,500))

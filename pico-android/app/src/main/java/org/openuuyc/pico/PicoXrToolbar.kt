@@ -138,15 +138,11 @@ internal class PicoXrToolbar(
             if(confirm) stickBackPendingRelease=false
             return
         }
-        if(!menuVisible || keyboardPage || terminalTarget!=null) return
+        if(!menuVisible || collapsed || keyboardPage || terminalTarget!=null) return
         if(direction>=100 && keyboardPage) return
         if(confirm && !stickSelectionValid) return
         val dropdown=!isRoot() && !keyboardPage
-        val rows=when {
-            optionTitle!=null->optionRows()
-            qualityPage()->qualityRows()
-            else->dropdownRows()
-        }
+        val rows=if(dropdown) activeDropdownRows() else emptyList()
         val selectionDirection=if(dropdown) PicoXrDropdownLayout.navigationStep(direction) else direction
         if(dropdown && !confirm && selectionDirection==PicoXrDropdownLayout.NAVIGATE_BACK) {
             closeDropdownPage()
@@ -154,14 +150,14 @@ internal class PicoXrToolbar(
             draw();return
         }
         if(dropdown && !confirm && selectionDirection in setOf(-1,1)) {
-            val offset=if(optionTitle!=null) optionOffset else dropdownOffset
+            val offset=activeDropdownOffset()
             val next=PicoXrDropdownLayout.navigationOffset(offset,navigationCell,selectionDirection,rows.size)
             if(optionTitle!=null) optionOffset=next else dropdownOffset=next
         }
+        val dropdownOffsetNow=activeDropdownOffset()
         val hit: (Float,Float)->Int? = if(dropdown) {
-            val offset=if(optionTitle!=null) optionOffset else dropdownOffset
-            {u,v->PicoXrDropdownLayout.hit(u,v,rows.size,offset)}
-        } else ::hoverCell
+            {u,v->PicoXrDropdownLayout.hit(u,v,rows.size,dropdownOffsetNow)}
+        } else PicoXrMenuHit::toolbar
         val selected=PicoMenuNavigation.select(navigationCell,selectionDirection,hit) ?: run {stickSelectionValid=false;return}
         if(direction>=100) stickSelectionValid=true
         navigationCell=selected.cell
@@ -219,18 +215,23 @@ internal class PicoXrToolbar(
     }
     private fun optionClick(u: Float,v: Float) {
         try {
+            val rows=if(optionTitle=="自定义码率") optionRows().size else optionLabels.size
+            when(PicoXrDropdownLayout.headerHit(u,v,rows)) {
+                PicoXrDropdownLayout.HEADER_PREV -> {optionOffset=PicoXrDropdownLayout.prevPage(optionOffset);draw();return}
+                PicoXrDropdownLayout.HEADER_NEXT -> {optionOffset=PicoXrDropdownLayout.nextPage(optionOffset,rows);draw();return}
+                PicoXrDropdownLayout.HEADER_BACK,PicoXrDropdownLayout.HEADER_CLOSE -> {optionTitle=null;optionApply=null;draw();return}
+            }
             if(optionTitle=="自定义码率") {
-                val rows=optionRows().size
                 when(PicoXrDropdownLayout.hit(u,v,rows,optionOffset)) {
                     -1 -> {optionTitle=null;optionApply=null}
                     0 -> bitrateDraft=PicoXrDropdownLayout.sliderValue(PicoXrDropdownLayout.sliderFraction(u,v,0,rows,optionOffset) ?: return,1,500)
                     1 -> {optionTitle=null;optionApply=null}
                     2 -> {val apply=optionApply;optionTitle=null;optionApply=null;apply?.invoke(bitrateDraft)}
                 }
-            } else PicoXrDropdownLayout.hit(u,v,optionLabels.size,optionOffset)?.let {i ->
+            } else PicoXrDropdownLayout.hit(u,v,rows,optionOffset)?.let {i ->
                 when(i) {
                     -1 -> {optionTitle=null;optionApply=null}
-                    else -> if(optionOffset+i<optionLabels.size) {val apply=optionApply;optionTitle=null;optionApply=null;apply?.invoke(i);draw();return}
+                    else -> if(i in optionLabels.indices) {val apply=optionApply;optionTitle=null;optionApply=null;apply?.invoke(i);draw();return}
                 }
             }
         } catch(e: Exception) {notice=e.message ?: "设置未完成"}
@@ -296,12 +297,35 @@ internal class PicoXrToolbar(
     private var menuScreens=emptyList<org.openuuyc.pico.uu.UuRemoteScreen>()
     private var notice = "悬浮菜单 · 左 X / 右 A 唤起 · 摇杆选择、松开执行"
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private fun activeDropdownOffset(): Int = if(optionTitle!=null) optionOffset else dropdownOffset
+    private fun activeDropdownRows(): List<PicoXrDropdownRow> = when {
+        optionTitle!=null -> optionRows()
+        (devicePage || screenPage) && pendingTakeover==null -> selectionRows()
+        qualityPage() -> qualityRows()
+        else -> dropdownRows()
+    }
     private fun hoverCell(u: Float,v: Float): Int? = when {
-        terminalTarget!=null -> if(v in .81f.. .89f && u in 0f..<1f) (u*8).toInt() else null
-        optionTitle!=null -> PicoXrDropdownLayout.hit(u,v,optionRows().size,optionOffset)
-        !isRoot() && !keyboardPage -> PicoXrDropdownLayout.hit(u,v,dropdownRows().size,dropdownOffset)
-        isRoot() -> PicoXrMenuHit.toolbar(u,v)
-        else -> PicoXrDropdownLayout.hit(u,v,dropdownRows().size,dropdownOffset)
+        terminalTarget!=null -> when {
+            v in .81f.. .89f && u in 0f..<1f -> (u*8).toInt()
+            controllerHand==2 && u in 0f..1f && v>=0.92f -> -10
+            else -> null
+        }
+        optionTitle!=null -> {
+            val rows=optionRows().size
+            if(controllerHand==2 && u in 0f..1f && v>=0.92f) -10
+            else PicoXrDropdownLayout.headerHit(u,v,rows) ?: PicoXrDropdownLayout.hit(u,v,rows,optionOffset)
+        }
+        !isRoot() && !keyboardPage -> {
+            val rows=activeDropdownRows().size
+            if(controllerHand==2 && u in 0f..1f && v>=0.92f) -10
+            else PicoXrDropdownLayout.headerHit(u,v,rows) ?: PicoXrDropdownLayout.hit(u,v,rows,dropdownOffset)
+        }
+        isRoot() -> {
+            if(collapsed && u in 0f..1f && v in 0f..1f) 0
+            else if(controllerHand==2 && u in 0f..1f && v>=0.92f) -10
+            else PicoXrMenuHit.toolbar(u,v)
+        }
+        else -> null
     }
     fun hover(u: Float,v: Float,down: Boolean) {
         if(stickFocused && !down) return
@@ -326,9 +350,10 @@ internal class PicoXrToolbar(
             // Rising press edge: entering a slider track starts a drag immediately,
             // because the native menu click only reports on release.
             val rows=dropdownRowsForDrag()
+            val activeOffset=activeDropdownOffset()
             if(rows!=null) rows.forEachIndexed {index,row ->
-                if(row.kind==PicoXrDropdownRow.SLIDER && PicoXrDropdownLayout.sliderFraction(u,v,index,rows.size,dropdownOffset)!=null) {
-                    sliderDrag=index;applySlider(index,PicoXrDropdownLayout.sliderFraction(u,v,index,rows.size,dropdownOffset)!!,rows);pressed=true;return
+                if(row.kind==PicoXrDropdownRow.SLIDER && PicoXrDropdownLayout.sliderFraction(u,v,index,rows.size,activeOffset)!=null) {
+                    sliderDrag=index;applySlider(index,PicoXrDropdownLayout.sliderFraction(u,v,index,rows.size,activeOffset)!!,rows);pressed=true;return
                 }
             }
         }
@@ -478,7 +503,7 @@ internal class PicoXrToolbar(
         val source=state.screens.firstOrNull {it.id==state.selected}
         val ceiling=minOf(source?.fps ?: 0,state.profiles.filter {c.codec==0 || it.codec==c.codec}.maxOfOrNull {it.fps} ?: 0)
         return listOf(
-            PicoXrDropdownRow("画质",when(c.quality) {5->"自动（原画）";4->"原画";3->"超清";2->"高清";else->"${c.quality}"}),
+            PicoXrDropdownRow("画质",when(c.quality) {6->"自定义";5->"自动（原画）";4->"原画";3->"超清";2->"高清";else->"${c.quality}"}),
             PicoXrDropdownRow("帧率上限","${c.fps} FPS",enabled=ceiling>0),
             PicoXrDropdownRow("视频码率","${c.bitrateMbps} / 500 Mbps",PicoXrDropdownRow.SLIDER,sliderFraction=c.bitrateMbps/500f),
             PicoXrDropdownRow("编码偏好",when(c.codec) {1->"H.264";2->"H.265";5->"AV1";else->"自动"})
@@ -509,7 +534,7 @@ internal class PicoXrToolbar(
             PicoXrDropdownRow("背景颜色",when(backgroundIndex) {0->"全黑";1->"深灰";else->"深蓝"}),
             PicoXrDropdownRow("背景库 · 更多图案","›"),
             PicoXrDropdownRow("重新生成图案",kind=PicoXrDropdownRow.ACTION),
-            PicoXrDropdownRow("背景亮度","$brightness%",PicoXrDropdownRow.SLIDER,sliderFraction=brightness/100f),
+            PicoXrDropdownRow("背景亮度","$brightness%",PicoXrDropdownRow.SLIDER,sliderFraction=((brightness-25)/75f).coerceIn(0f,1f)),
             PicoXrDropdownRow("背景流动",if(backgroundFlow) "开启" else "关闭",PicoXrDropdownRow.TOGGLE),
             PicoXrDropdownRow("返回主菜单",kind=PicoXrDropdownRow.ACTION)
         )
@@ -539,7 +564,7 @@ internal class PicoXrToolbar(
         val c=state.current
         return listOf(
             PicoXrDropdownRow("帧率上限","${c.fps} FPS"),
-            PicoXrDropdownRow("画质",when(c.quality) {5->"自动（原画）";4->"原画";3->"超清";2->"高清";else->"${c.quality}"}),
+            PicoXrDropdownRow("画质",when(c.quality) {6->"自定义";5->"自动（原画）";4->"原画";3->"超清";2->"高清";else->"${c.quality}"}),
             PicoXrDropdownRow("视频码率","${c.bitrateMbps} / 500 Mbps",PicoXrDropdownRow.SLIDER,sliderFraction=c.bitrateMbps/500f),
             PicoXrDropdownRow("编码偏好",when(c.codec) {1->"H.264";2->"H.265";5->"AV1";else->"自动"}),
             PicoXrDropdownRow("串流尺寸","${c.maxWidth} × ${c.maxHeight}"),
@@ -570,7 +595,7 @@ internal class PicoXrToolbar(
     fun dragSlider(u: Float,v: Float) {
         if(sliderDrag<0) return
         val rows=dropdownRowsForDrag() ?: return
-        val fraction=PicoXrDropdownLayout.sliderFraction(u,v,sliderDrag,rows.size,dropdownOffset) ?: return
+        val fraction=PicoXrDropdownLayout.sliderFraction(u,v,sliderDrag,rows.size,activeDropdownOffset()) ?: return
         applySlider(sliderDrag,fraction,rows)
     }
     fun endSliderDrag() {sliderDrag=-1;draw()}
@@ -593,7 +618,7 @@ internal class PicoXrToolbar(
                 } catch(e: Exception) {notice=e.message ?: "设置未完成"}
             }
             environmentPage && row.label=="透视可见度" -> {mrVisibility=PicoXrDropdownLayout.sliderValue(fraction,0,100);appearance(mr,selectedColor,mrVisibility)}
-            environmentPage && row.label=="背景亮度" -> {brightness=PicoXrDropdownLayout.sliderValue(fraction,0,100);backgroundAction("brightness:$brightness")}
+            environmentPage && row.label=="背景亮度" -> {brightness=PicoXrDropdownLayout.sliderValue(fraction,25,100);backgroundAction("brightness:$brightness")}
         }
         draw()
     }
@@ -602,6 +627,11 @@ internal class PicoXrToolbar(
     private fun dropdownClick(u: Float,v: Float,rows: List<PicoXrDropdownRow>) {
         try {
             if(sliderDrag>=0) return // hover() owns the active slider drag; release already ended it.
+            when(PicoXrDropdownLayout.headerHit(u,v,rows.size)) {
+                PicoXrDropdownLayout.HEADER_PREV -> {dropdownOffset=PicoXrDropdownLayout.prevPage(dropdownOffset);draw();return}
+                PicoXrDropdownLayout.HEADER_NEXT -> {dropdownOffset=PicoXrDropdownLayout.nextPage(dropdownOffset,rows.size);draw();return}
+                PicoXrDropdownLayout.HEADER_BACK,PicoXrDropdownLayout.HEADER_CLOSE -> {closeDropdownPage();draw();return}
+            }
             val hit=PicoXrDropdownLayout.hit(u,v,rows.size,dropdownOffset)
             if(hit==null) return
             if(hit==-1) { // header: back/close
@@ -619,10 +649,10 @@ internal class PicoXrToolbar(
             optionTitle!=null->{optionTitle=null;optionApply=null}
             backgroundPage->{backgroundPage=false}
             pendingTakeover!=null->{pendingTakeover=null;notice="已取消抢占"}
-            confirmingVirtual->confirmingVirtual=false
-            devicePage->{devicePage=false;deviceOffset=0;home()}
+            confirmingVirtual->{confirmingVirtual=false;closeScreenMenu()}
+            devicePage->{devicePage=false;deviceOffset=0;closeScreenMenu();notice="已返回主菜单"}
             screenPage->{screenPage=false;screenOffset=0;closeScreenMenu();notice="已返回串流设置"}
-            qualityPage()->{advanced=false;if(targetScreen!=null) {targetScreen=null;targetPaneHint=null}}
+            qualityPage()->{advanced=false;if(targetScreen!=null) {targetScreen=null;targetPaneHint=null;closeScreenMenu()}}
             targetScreen!=null->{targetScreen=null;targetPaneHint=null;closeScreenMenu();notice="串流设置请从各窗口顶部展开"}
             environmentPage || spacePage->{environmentPage=false;spacePage=false;backgroundPage=false}
             else->{}
@@ -651,7 +681,7 @@ internal class PicoXrToolbar(
                 else PicoBackgroundPattern.presets.firstOrNull {it.label==label}?.let {backgroundAction(it.id);notice="正在准备 ${it.label}…"}
             }
             environmentPage->when(label) {
-                "MR 透视"->mr=!mr
+                "MR 透视"->{mr=!mr;appearance(mr,selectedColor,mrVisibility)}
                 "图片背景"->{customImage=!customImage;useImage(customImage)}
                 "选择图片 / 全景图…"->{pickBackground();notice="请在系统选择器中选择图片"}
                 "背景颜色"->{backgroundIndex=(backgroundIndex+1)%3;backgroundAction(PicoBackgroundPattern.presets.getOrNull(backgroundIndex)?.id ?: "black")}
@@ -677,7 +707,7 @@ internal class PicoXrToolbar(
             qualityPage()->qualityAction(label)
             devicePage->when {
                 label=="刷新设备列表"->{home();return}
-                label=="返回主菜单"->{devicePage=false;deviceOffset=0;return}
+                label=="返回主菜单"->{devicePage=false;deviceOffset=0;closeScreenMenu();return}
                 else->devices.firstOrNull {it.alias==label}?.let {device ->
                     check(device.online && device.controllable) {"设备离线或未开放控制"}
                     if(device.occupants>0) {pendingTakeover=device;notice="抢占 ${device.alias} 会断开现有会话，是否确认？"}
@@ -749,7 +779,7 @@ internal class PicoXrToolbar(
                 val sizes=listOf(1280 to 720,1920 to 1080,2560 to 1440,3840 to 2160).filter {v->state.profiles.any {(current.codec==0 || current.codec==it.codec) && v.first<=it.width && v.second<=it.height}}
                 options("高级设置 · 串流尺寸",sizes.map {"${it.first} × ${it.second}"},sizes.indexOf(current.maxWidth to current.maxHeight)) {val next=sizes[it];set(current.copy(maxWidth=next.first,maxHeight=next.second))}
             }
-            "返回串流设置"->{if(targetScreen!=null) {targetScreen=null;targetPaneHint=null};advanced=false}
+            "返回串流设置"->{if(targetScreen!=null) {targetScreen=null;targetPaneHint=null;closeScreenMenu()};advanced=false}
         }
     }
 
@@ -789,7 +819,7 @@ internal class PicoXrToolbar(
             "重置窗口位置"->{reset();notice="已重置窗口尺寸与位置"}
             "切换屏幕"->openScreens()
             "创建虚拟屏"->confirmVirtualScreen()
-            "MR 透视"->mr=!mr
+            "MR 透视"->{mr=!mr;appearance(mr,selectedColor,mrVisibility)}
             "环境与背景"->{environmentPage=true;dropdownOffset=0;notice="环境 · MR 与背景";return}
             "主页面"->{closeScreenMenu();home()}
             "键盘与输入"->keyboardOptions()
@@ -1038,6 +1068,22 @@ internal class PicoXrToolbar(
         "重置窗口位置",
         if(targetScreen!=null) "返回窗口设置" else "返回主菜单"
     )
+    fun scroll(delta: Int) {
+        if(!menuVisible || collapsed || keyboardPage || terminalTarget!=null || isRoot()) return
+        val step=when {
+            delta>0 -> -1
+            delta<0 -> 1
+            else -> return
+        }
+        if(optionTitle!=null) {
+            val next=PicoXrDropdownLayout.scrollOffset(optionOffset,step,optionRows().size)
+            if(next!=optionOffset) {optionOffset=next;draw()}
+            return
+        }
+        val next=PicoXrDropdownLayout.scrollOffset(dropdownOffset,step,activeDropdownRows().size)
+        if(next!=dropdownOffset) {dropdownOffset=next;draw()}
+    }
+
     fun draw() {
         val nextPortrait=false
         val layout=if(!menuVisible) 4 else if(nextPortrait) 2 else if(isRoot() && collapsed) 3 else if(!keyboardPage) 0 else if(keyboardMode==PicoKeyboardMode.FULL) 5 else 1
@@ -1050,35 +1096,45 @@ internal class PicoXrToolbar(
             canvas.scale(1f,canvas.height/(if(keyboardPage) PicoKeyboardLayout.height(keyboardMode) else if(!collapsed) 800f else 400f)) // Preserve logical hit coordinates on the high-resolution menu Surface.
             terminalTarget?.let {
                 PicoXrMaterial.panel(canvas,1200f,800f)
-                PicoXrMaterial.label(canvas,notice,24f,40f,1152f,24f)
-                val p=Paint(Paint.ANTI_ALIAS_FLAG).apply {color=PicoTheme.TEXT;textSize=21f;typeface=android.graphics.Typeface.MONOSPACE}
-                terminalScreen.text().split('\n').take(24).forEachIndexed {row,text->canvas.drawText(text,20f,75f+row*24f,p)}
+                val dotPaint=Paint(Paint.ANTI_ALIAS_FLAG).apply {color=PicoTheme.GREEN}
+                canvas.drawCircle(36f,36f,6f,dotPaint)
+                PicoXrMaterial.label(canvas,"远端终端",54f,44f,160f,25f,medium=true)
+                PicoXrMaterial.label(canvas,notice,224f,44f,948f,21f,color=Color.rgb(188,200,218))
+                val termRect=RectF(24f,64f,1176f,636f)
+                val termPaint=Paint(Paint.ANTI_ALIAS_FLAG).apply {color=Color.rgb(12,17,24)}
+                canvas.drawRoundRect(termRect,14f,14f,termPaint)
+                termPaint.style=Paint.Style.STROKE;termPaint.strokeWidth=1.4f;termPaint.color=Color.argb(110,88,108,138)
+                canvas.drawRoundRect(termRect,14f,14f,termPaint)
+                canvas.save();canvas.clipRect(28f,68f,1172f,632f)
+                val p=Paint(Paint.ANTI_ALIAS_FLAG).apply {color=Color.rgb(224,234,246);textSize=21f;typeface=android.graphics.Typeface.MONOSPACE}
+                terminalScreen.text().split('\n').take(24).forEachIndexed {row,text->canvas.drawText(text,40f,94f+row*22.5f,p)}
+                canvas.restore()
                 listOf("打开 Shell","输入","Ctrl+C","Tab","↑","↓","Esc","关闭").forEachIndexed {i,label->
                     val box=RectF(i*150+4f,648f,i*150+146f,712f)
-                    PicoXrMaterial.control(canvas,box,false,hoverU*1200 in box.left..box.right && hoverV*800 in box.top..box.bottom,pressed)
-                    PicoXrMaterial.label(canvas,label,box.left+8,690f,box.width()-16,22f)
+                    val hovered=hoverU*1200 in box.left..box.right && hoverV*800 in box.top..box.bottom
+                    PicoXrMaterial.control(canvas,box,i==1,hovered,pressed && hovered,danger=i==7,radius=12f)
+                    val labelColor=when { i==7->if(hovered) Color.WHITE else PicoTheme.RED;hovered->Color.WHITE;else->PicoTheme.TEXT }
+                    PicoXrMaterial.label(canvas,label,box.centerX(),688f,box.width()-12f,22f,medium=hovered || i==1,color=labelColor,align=Paint.Align.CENTER)
+                }
+                if(controllerHand==2) {
+                    PicoXrMaterial.handle(canvas,1200f,800f,hover=(hoverU in 0f..1f && hoverV>=0.92f),pressed=pressed)
                 }
                 return
             }
             if(isRoot()) {
-                if(collapsed) PicoXrControllerCanvas.collapsed(canvas,controllerHand)
-                else PicoXrControllerCanvas.draw(canvas,listOf(if(usingTouch) "触摸" else "鼠标","键盘","屏幕","空间","环境","主页面","应用","断开"),following,followPending,controllerHand,hoverU,hoverV,notice)
+                if(collapsed) PicoXrControllerCanvas.collapsed(canvas,controllerHand,hovered=(hoverU in 0f..1f && hoverV in 0f..1f),pressed=pressed)
+                else PicoXrControllerCanvas.draw(canvas,listOf(if(usingTouch) "触摸" else "鼠标","键盘","屏幕","空间","环境","主页面","应用","断开"),following,followPending,controllerHand,hoverU,hoverV,notice,pressed=pressed,mr=mr)
                 return
             }
             if(!keyboardPage) {
                 // All sub pages are dropdown panels now (except keyboard pages).
-                val rows=when {
-                    optionTitle!=null->optionRows()
-                    (devicePage || screenPage) && pendingTakeover==null->selectionRows()
-                    qualityPage()->qualityRows()
-                    else->dropdownRows()
-                }
+                val rows=activeDropdownRows()
                 val title=if(optionTitle!=null) optionTitle!! else dropdownTitle()
-                PicoXrDropdownCanvas.draw(canvas,title,rows,if(optionTitle!=null) optionOffset else dropdownOffset,hoverU,hoverV,pressed,notice)
+                PicoXrDropdownCanvas.draw(canvas,title,rows,activeDropdownOffset(),hoverU,hoverV,pressed,notice,dragIndex=sliderDrag,floating=(controllerHand==2))
                 return
             }
             // Keyboard pages keep their dedicated full-panel layout.
-            PicoKeyboardCanvas.draw(canvas,keyboardMode,keyboardKeys,hoverU,hoverV,voiceActive)
+            PicoKeyboardCanvas.draw(canvas,keyboardMode,keyboardKeys,hoverU,hoverV,voiceActive,pressed=pressed,notice=notice)
 
         } catch (_: IllegalArgumentException) { /* runtime has destroyed the swapchain */ }
         catch (_: IllegalStateException) { /* Activity teardown */ }

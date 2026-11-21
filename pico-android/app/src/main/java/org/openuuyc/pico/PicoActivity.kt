@@ -1078,6 +1078,7 @@ open class PicoActivity : Activity() {
 
     @Suppress("unused")
     fun onScroll(pane: Int,delta: Int) {
+        if(pane==6) {ui.post {xrToolbar?.scroll(delta)};return}
         xrActivePane=pane;(xrExtraSessions[pane] ?: session)?.scroll(delta)
     }
 

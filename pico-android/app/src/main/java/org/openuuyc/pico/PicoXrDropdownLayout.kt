@@ -13,66 +13,105 @@ internal object PicoXrDropdownLayout {
     const val ROW_LEFT = 24f
     const val ROW_RIGHT = 1176f
     const val FOOTER_TOP = 720f
+    const val SLIDER_TRACK_LEFT = ROW_LEFT + 380f
+    const val SLIDER_TRACK_RIGHT = ROW_RIGHT - 240f
+    const val HEADER_BACK = -1
+    const val HEADER_PREV = -2
+    const val HEADER_NEXT = -3
+    const val HEADER_CLOSE = -4
+    val BACK_RECT = floatArrayOf(24f, 18f, 156f, 88f)
+    val PREV_RECT = floatArrayOf(770f, 20f, 888f, 86f)
+    val NEXT_RECT = floatArrayOf(980f, 20f, 1098f, 86f)
+    val CLOSE_RECT = floatArrayOf(1112f, 18f, 1176f, 88f)
     val visibleRows = ((FOOTER_TOP - ROW_TOP) / ROW_HEIGHT).toInt()
 
+    private fun inRect(rect: FloatArray, x: Float, y: Float): Boolean =
+        x in rect[0]..rect[2] && y in rect[1]..rect[3]
+
     /** Row index for u,v over the current page; -1 selects the header (back/close). */
-    fun hit(u: Float,v: Float,count: Int,offset: Int=0,sliders: Int=0): Int? {
-        if(!u.isFinite() || !v.isFinite() || u !in 0f..1f || v !in 0f..1f) return null
-        val x=u*1200f;val y=v*800f
-        if(y in 12f..96f) return -1
-        val rows=minOf(count-offset,visibleRows).coerceAtLeast(0)
-        for(i in 0 until rows) {
-            val top=ROW_TOP+i*ROW_HEIGHT
-            if(y in top..(top+ROW_HEIGHT-8) && x in ROW_LEFT..ROW_RIGHT)
-                return if(i+offset<count-sliders) i+offset else i+offset
+    fun hit(u: Float, v: Float, count: Int, offset: Int = 0, sliders: Int = 0): Int? {
+        if (!u.isFinite() || !v.isFinite() || u !in 0f..1f || v !in 0f..1f) return null
+        val x = u * 1200f
+        val y = v * 800f
+        if (y in 12f..96f) return HEADER_BACK
+        val rows = minOf(count - offset, visibleRows).coerceAtLeast(0)
+        for (i in 0 until rows) {
+            val top = ROW_TOP + i * ROW_HEIGHT
+            if (y in top..(top + ROW_HEIGHT - 8) && x in ROW_LEFT..ROW_RIGHT) {
+                return if (i + offset < count - sliders) i + offset else i + offset
+            }
         }
         return null
     }
 
-    /** Slider position 0..1 for a slider row hit; null when u,v is not on row [index]'s track. */
-    fun sliderFraction(u: Float,v: Float,index: Int,count: Int,offset: Int=0): Float? {
-        val row=hit(u,v,count,offset) ?: return null
-        if(row!=index+offset) return null
-        if(!u.isFinite()) return null
-        return ((u*1200f-ROW_LEFT-380f)/ (ROW_RIGHT-ROW_LEFT-460f)).coerceIn(0f,1f)
+    /** Specific header control under (u,v), or null when outside the header band. */
+    fun headerHit(u: Float, v: Float, count: Int): Int? {
+        if (!u.isFinite() || !v.isFinite() || u !in 0f..1f || v !in 0f..1f) return null
+        val x = u * 1200f
+        val y = v * 800f
+        if (y !in 12f..96f) return null
+        if (count > visibleRows) {
+            if (inRect(PREV_RECT, x, y)) return HEADER_PREV
+            if (inRect(NEXT_RECT, x, y)) return HEADER_NEXT
+        }
+        if (inRect(CLOSE_RECT, x, y)) return HEADER_CLOSE
+        if (inRect(BACK_RECT, x, y)) return HEADER_BACK
+        return HEADER_BACK
+    }
+
+    /** Slider position 0..1 for absolute row [index]; null when u,v is not on that row. */
+    fun sliderFraction(u: Float, v: Float, index: Int, count: Int, offset: Int = 0): Float? {
+        val row = hit(u, v, count, offset) ?: return null
+        if (row != index) return null
+        if (!u.isFinite()) return null
+        return ((u * 1200f - SLIDER_TRACK_LEFT) / (SLIDER_TRACK_RIGHT - SLIDER_TRACK_LEFT)).coerceIn(0f, 1f)
     }
 
     /** Value mapped from a slider fraction with inclusive integer range (floor keeps .5 at the mid value). */
-    fun sliderValue(fraction: Float,min: Int,max: Int): Int {
-        if(!fraction.isFinite()) return min
-        val span=(max-min).coerceAtLeast(0)
-        return (min+(fraction*span).toInt()).coerceIn(min,max)
+    fun sliderValue(fraction: Float, min: Int, max: Int): Int {
+        if (!fraction.isFinite()) return min
+        val span = (max - min).coerceAtLeast(0)
+        return (min + (fraction * span).toInt()).coerceIn(min, max)
     }
 
-    fun pageOf(selected: Int): Int = (selected.coerceAtLeast(0)/visibleRows)*visibleRows
+    fun pageOf(selected: Int): Int = (selected.coerceAtLeast(0) / visibleRows) * visibleRows
 
     /** Number of pages needed for [count] rows; 0 for an empty list. */
-    fun pageCount(count: Int): Int = if(count<=0) 0 else (count+visibleRows-1)/visibleRows
+    fun pageCount(count: Int): Int = if (count <= 0) 0 else (count + visibleRows - 1) / visibleRows
 
     /** First row of the last page that can still be shown for [count] rows (0 when empty). */
-    fun lastPage(count: Int): Int = pageOf((count-1).coerceAtLeast(0))
+    fun lastPage(count: Int): Int = pageOf((count - 1).coerceAtLeast(0))
 
     /** Page offset that shows [selected], clamped so it never starts past the last page of [count] rows. */
-    fun pageOfSelection(selected: Int,count: Int): Int = pageOf(selected).coerceAtMost(lastPage(count))
+    fun pageOfSelection(selected: Int, count: Int): Int = pageOf(selected).coerceAtMost(lastPage(count))
 
     /** Keep a scroll offset inside 0..last page, so a refreshed shorter list never leaves an empty page. */
-    fun clampOffset(offset: Int,count: Int): Int = offset.coerceIn(0,lastPage(count))
+    fun clampOffset(offset: Int, count: Int): Int = offset.coerceIn(0, lastPage(count))
+
+    fun prevPage(offset: Int): Int = (offset - visibleRows).coerceAtLeast(0)
+
+    fun nextPage(offset: Int, count: Int): Int = (offset + visibleRows).coerceAtMost(lastPage(count))
+
+    fun maxScrollOffset(count: Int): Int = (count - visibleRows).coerceAtLeast(0)
+
+    fun scrollOffset(offset: Int, step: Int, count: Int): Int = (offset + step).coerceIn(0, maxScrollOffset(count))
 
     const val NAVIGATE_BACK = -2
+
     /** Convert radial controller sectors to previous/next/back for a linear dropdown. */
     fun navigationStep(direction: Int): Int = when {
         direction == 104 -> NAVIGATE_BACK
-        direction in 100..107 -> if(direction-100 in setOf(0,1,6,7)) -1 else 1
+        direction in 100..107 -> if (direction - 100 in setOf(0, 1, 6, 7)) -1 else 1
         else -> direction
     }
 
     /** Advance the visible window when joystick navigation crosses a list edge. */
-    fun navigationOffset(offset: Int,selected: Int,direction: Int,count: Int): Int {
-        val start=offset.coerceAtLeast(0)
-        val end=minOf(count,start+visibleRows)
+    fun navigationOffset(offset: Int, selected: Int, direction: Int, count: Int): Int {
+        val start = offset.coerceAtLeast(0)
+        val end = minOf(count, start + visibleRows)
         return when {
-            direction>0 && end<count && selected==end-1 -> start+1
-            direction<0 && start>0 && selected==start -> start-1
+            direction > 0 && end < count && selected == end - 1 -> start + 1
+            direction < 0 && start > 0 && selected == start -> start - 1
             else -> start
         }
     }
