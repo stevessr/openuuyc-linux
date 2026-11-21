@@ -20,7 +20,9 @@ import javax.crypto.spec.SecretKeySpec
  * No Linux OpenUUYC instance, ADB reverse or localhost relay is involved.
  */
 internal object UuContract {
-    const val BASE = "https://api.nrd.nie.163.com"
+    val BASE: String = org.openuuyc.pico.BuildConfig.SELFHOST_NRD_BASE.ifBlank {
+        "https://api.nrd.nie.163.com"
+    }
     const val VERSION = "4.46.0"
     const val VERSION_CODE = "446000"
     const val ANDROID_INIT = "/api/v1/device/android/init"

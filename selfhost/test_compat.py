@@ -1,0 +1,413 @@
+"""Self-host optional route contract tests."""
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from aiohttp import WSMsgType
+from aiohttp.test_utils import TestClient, TestServer
+from selfhost.server import ControlPlane
+
+
+class CompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.control = ControlPlane(str(Path(self.tmp.name) / "db.sqlite"),
+                                    "https://uu.test", "a" * 32,
+                                    ["stun:stun.test:3478"])
+        self.client = TestClient(TestServer(self.control.application()))
+        await self.client.start_server()
+        self.sockets = []
+
+    async def asyncTearDown(self):
+        for sock in self.sockets:
+            await sock.close()
+        await self.client.close()
+        self.tmp.cleanup()
+
+    def headers(self, client, device="", token=""):
+        h = {"X-Param-client-id": client, "X-Param-device-id": device}
+        if token:
+            h["Authorization"] = "Bearer " + token
+        return h
+
+    async def request(self, method, path, identity, device="", token="", data=None):
+        async with self.client.request(method, path, json=data,
+                headers=self.headers(identity, device, token)) as response:
+            try:
+                return response.status, await response.json()
+            except Exception:
+                return response.status, {}
+
+    async def reg(self, alias):
+        status, reply = await self.request("POST", "/api/v1/device/windows/init",
+                                    alias, data={"client_id": alias, "name": alias})
+        self.assertEqual(status, 200)
+        return reply["data"]["device_id"]
+
+    async def login(self, alias, device):
+        _, qr = await self.request("POST", "/api/v1/qrcode/gen/login", alias, device)
+        ticket = qr["data"]["token"]
+        async with self.client.post("/enroll/" + ticket,
+                          data={"admin_key": "a" * 32}) as r:
+            self.assertEqual(r.status, 200)
+        _, result = await self.request("POST", "/api/v1/login/by_qrcode", alias, device,
+                        data={"token": ticket, "qrcode_jump_url": qr["data"]["qrcode_jump_url"]})
+        self.assertEqual(result["code"], 0)
+        return result["data"]["token"]
+
+    async def room(self, alias, device, token):
+        _, r = await self.request("POST", "/api/v1/room/create", alias, device, token, {})
+        ws = await self.client.ws_connect(
+            "/socket.io/?EIO=4&transport=websocket",
+            headers={"X-NRD-AUTH": r["data"]["token"]})
+        self.sockets.append(ws)
+        await ws.receive()
+        await ws.send_str("40")
+        await ws.receive()
+        await ws.send_str('421["room_info"]')
+        await ws.receive()
+        return ws
+
+    async def users(self):
+        hd, cd = await self.reg("host"), await self.reg("controller")
+        ht, ct = await self.login("host", hd), await self.login("controller", cd)
+        return hd, cd, ht, ct
+
+    async def respond_assistance(self, socket, identity, device, token, password,
+                                 guest_id=None, mode="by_password", approve=True):
+        import hashlib
+        while True:
+            frame = (await socket.receive()).data
+            self.assertTrue(frame.startswith("42"))
+            event, push = json.loads(frame[2:])
+            self.assertEqual(event, "bmsg_push")
+            kind = push["type"]
+            if kind != "device_info_changed":
+                break
+        data = push["data"]
+        prefix = "/api/v1/guest" if guest_id else "/api/v2"
+        paths = {
+            "get_control_mode": (
+                "/api/v1/guest/room/share/upload_control_mode" if guest_id
+                else "/api/v2/room/share/upload_control_mode"),
+            "remote_control": (
+                "/api/v1/guest/room/share/upload/sign" if guest_id
+                else "/api/v2/room/share/upload_sign"),
+            "remote_control_by_confirmation": (
+                "/api/v1/guest/room/share/confirmation" if guest_id
+                else "/api/v2/room/share/confirmation")
+        }
+        self.assertIn(kind, paths)
+        payload = {"control_id": data["control_id"]}
+        if kind == "get_control_mode":
+            payload.update(allow_control=True, control_mode=mode)
+        elif kind == "remote_control":
+            salt = data["salt"]
+            payload.update(can_remote_control=True,
+                           sign=hashlib.sha256((salt + password).encode()).hexdigest(),
+                           backup_sign="", control_mode=mode,
+                           need_confirmation=(mode == "password_confirmation"))
+        elif kind == "remote_control_by_confirmation":
+            payload.update(allow_control=approve, need_password=False)
+        headers = self.headers(identity, device, token)
+        if guest_id:
+            headers["X-Param-Guest-ID"] = guest_id
+        async with self.client.post(paths[kind], json=payload, headers=headers) as reply:
+            self.assertEqual((await reply.json())["code"], 0)
+        return kind
+
+    async def assist_call(self, host, identity, device, host_token, password,
+                          controller, controller_device, controller_token,
+                          path, body, guest_id=None, mode="by_password"):
+        import asyncio
+        job = asyncio.create_task(self.respond_assistance(
+            host, identity, device, host_token, password, guest_id, mode))
+        _, result = await self.request("POST", path, controller,
+                                       controller_device, controller_token, body)
+        await job
+        return result
+
+    async def test_device_rename_unbind_and_revoke(self):
+        hd, cd, ht, ct = await self.users()
+        status, rename = await self.request("PUT", "/api/v1/device/" + hd,
+                                        "controller", cd, ct, {"alias": "Renamed"})
+        self.assertEqual(status, 200)
+        self.assertEqual(rename["data"]["alias"], "Renamed")
+        _, groups = await self.request("GET", "/api/v1/device/groups/of/my",
+                                    "controller", cd, ct)
+        self.assertIn("Renamed", [x["alias"] for x in groups["data"]["desktop_devices"]])
+        host = await self.room("host", hd, ht)
+        _, unbound = await self.request("POST", "/api/v1/device/" + hd + "/unbind",
+                                    "controller", cd, ct)
+        self.assertEqual(unbound["code"], 0)
+        # The unbound device sees its own removal before the room is closed.
+        removal = json.loads((await host.receive()).data[2:])
+        self.assertEqual(removal[0], "bmsg_push")
+        self.assertEqual(removal[1]["type"], "device_unbind")
+        self.assertEqual(removal[1]["data"]["device_id"], hd)
+        self.assertIn((await host.receive()).type,
+                      (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED))
+        status, _ = await self.request("GET", "/api/v1/device/list", "host", hd, ht)
+        self.assertEqual(status, 401)
+
+    async def test_wol_state_persists_without_faking_magic_packet(self):
+        hd, cd, ht, ct = await self.users()
+        _, saved = await self.request("POST", "/api/v1/device/set_support_wol",
+                                   "host", hd, ht, {"support_wol": True})
+        self.assertEqual(saved["code"], 0)
+        _, data = await self.request("POST", "/api/v1/device/wake_on_lan/info",
+                                   "host", hd, ht, {"ip": "192.0.2.1"})
+        self.assertTrue(data["data"]["support_wol"])
+        _, listed = await self.request("GET", "/api/v1/device/list",
+                                      "controller", cd, ct)
+        self.assertTrue(listed["data"]["my_binded_devices"][0]["support_wol"])
+        _, result = await self.request("POST", "/api/v1/device/" + hd + "/wake_on_lan/req",
+                                       "controller", cd, ct)
+        self.assertEqual(result["code"], 501)
+
+    async def test_power_requests_are_delivered_only_to_live_enabled_host(self):
+        hd, cd, ht, ct = await self.users()
+        _, denied = await self.request("POST", "/api/v1/device/" + hd + "/reboot",
+                                       "controller", cd, ct)
+        self.assertNotEqual(denied["code"], 0)
+        host = await self.room("host", hd, ht)
+        await self.request("POST", "/api/v1/device/controllable", "host", hd, ht,
+                           {"controllable": True})
+        # Toggling controllable now also fans out a device delta; skip it.
+        delta = json.loads((await host.receive()).data[2:])
+        self.assertEqual(delta[1]["type"], "device_info_changed")
+        _, reboot = await self.request("POST", "/api/v1/device/" + hd + "/reboot",
+                                       "controller", cd, ct)
+        self.assertEqual(reboot["code"], 0)
+        frame = (await host.receive()).data
+        self.assertTrue(frame.startswith("42"))
+        self.assertEqual(json.loads(frame[2:])[0], "bmsg_push")
+        self.assertEqual(json.loads(frame[2:])[1]["type"], "device_reboot")
+
+    async def test_assistance_code_and_saved_devices(self):
+        hd, cd, ht, ct = await self.users()
+        host = await self.room("host", hd, ht)
+        await self.request("POST", "/api/v1/device/controllable", "host", hd, ht,
+                           {"controllable": True})
+        _, identity = await self.request("POST", "/api/v1/device/share/info/refresh",
+                                        "host", hd, ht)
+        assist_id = identity["data"]["connect_id"]
+        self.assertRegex(assist_id, r"^\d{9}$")
+        mode = await self.assist_call(host, "host", hd, ht, "123456",
+                  "controller", cd, ct, "/api/v2/room/share/control_mode",
+                  {"connect_id": assist_id})
+        self.assertEqual(mode["data"]["control_mode"], "by_password")
+        bad = await self.assist_call(host, "host", hd, ht, "123456",
+                  "controller", cd, ct, "/api/v2/room/join/share/by_code",
+                  {"connect_id": assist_id, "connect_code": "bad"})
+        self.assertEqual(bad["code"], 1131)
+        ok = await self.assist_call(host, "host", hd, ht, "123456",
+                  "controller", cd, ct, "/api/v2/room/join/share/by_code",
+                  {"connect_id": assist_id, "connect_code": "123456"})
+        self.assertEqual(ok["code"], 0)
+        self.assertEqual(ok["data"]["publisher_device_id"], hd)
+        _, refetched = await self.request("POST", "/api/v1/room/join/refetch",
+                                     "controller", cd, ct, {"token": ok["data"]["token"]})
+        self.assertEqual(refetched["data"]["publisher_device_id"], hd)
+        _, fav = await self.request("POST", "/api/v1/device/share/saved/favorites",
+                                    "controller", cd, ct,
+                                    {"favorites": [{"connect_id": assist_id, "remark": "Home", "favorited_at": 1}]})
+        self.assertEqual(fav["code"], 0)
+        _, saved = await self.request("GET", "/api/v1/device/share/saved/favorites",
+                                      "controller", cd, ct)
+        self.assertEqual(saved["data"]["saved"][0]["remark"], "Home")
+
+    async def test_android_share_approval_requires_matching_challenge(self):
+        hd, cd, ht, ct = await self.users()
+        host = await self.room("host", hd, ht)
+        # Registered Android targets exist only after a distinct android init.
+        status, reply = await self.request("POST", "/api/v1/device/android/init", "phone",
+                                data={"name": "Phone", "client_id": "phone"})
+        self.assertEqual(status, 200)
+        phone = reply["data"]["device_id"]
+        pt = await self.login("phone", phone)
+        await self.request("POST", "/api/v1/device/controllable", "phone", phone, pt,
+                           {"controllable": True})
+        online = await self.room("phone", phone, pt)
+        # The phone's controllable delta reaches the already-online host room.
+        delta = json.loads((await host.receive()).data[2:])
+        self.assertEqual(delta[1]["data"]["device_id"], phone)
+        _, unsolicited = await self.request("POST", "/api/v1/transport/" + hd + "/rpc/request",
+                                    "phone", phone, pt, {"p": "android_control_result",
+                                        "data": {"action": "accept_control",
+                                                 "device_info": {"device_id": phone}}})
+        self.assertEqual(unsolicited["code"], 403)
+        _, sent = await self.request("POST", "/api/v1/transport/" + phone + "/rpc/request",
+                                "host", hd, ht,
+                                {"p": "android_control_request", "data": {
+                                    "action": "request_control",
+                                    "device_info": {"device_id": hd}}})
+        self.assertEqual(sent["code"], 0)
+        self.assertIn("android_control_request", (await online.receive()).data)
+        _, response = await self.request("POST", "/api/v1/transport/" + hd + "/rpc/request",
+                                   "phone", phone, pt,
+                                   {"p": "android_control_result", "data": {
+                                       "action": "accept_control",
+                                       "device_info": {"device_id": phone}}})
+        self.assertEqual(response["code"], 0)
+        self.assertIn("android_control_result", (await host.receive()).data)
+
+
+    async def test_guest_host_isolated_from_account_management(self):
+        hd, cd, ht, ct = await self.users()
+        status, reply = await self.request("POST", "/api/v1/guest/create",
+                                           "host", hd, data={})
+        self.assertEqual(status, 200)
+        self.assertEqual(reply["code"], 0)
+        guest = reply["data"]
+        headers = self.headers("host", hd, guest["token"])
+        headers["X-Param-Guest-ID"] = guest["guest_id"]
+        async with self.client.get("/api/v1/device/list", headers=headers) as r:
+            self.assertEqual(r.status, 401)
+        async with self.client.post("/api/v1/guest/room/create",
+                                    headers=headers, json={}) as r:
+            self.assertEqual(r.status, 200)
+            room = (await r.json())["data"]
+        socket = await self.client.ws_connect("/socket.io/?EIO=4&transport=websocket",
+                                headers={"X-NRD-AUTH": room["token"]})
+        self.sockets.append(socket)
+        self.assertTrue((await socket.receive()).data.startswith("0"))
+        await socket.send_str("40")
+        await socket.receive()
+        await socket.send_str('421["room_info"]')
+        await socket.receive()
+        async with self.client.post("/api/v1/device/controllable", headers=headers,
+                                    json={"controllable": True}) as r:
+            self.assertEqual((await r.json())["code"], 0)
+        async with self.client.post("/api/v1/guest/share/info", headers=headers, json={}) as r:
+            connect_id = (await r.json())["data"]["connect_id"]
+        # Live guest host responds to salted verifier challenge over its own
+        # bearer session; an account cannot forge this callback.
+        join = await self.assist_call(socket, "host", hd, guest["token"], "guestpass",
+                      "controller", cd, ct, "/api/v2/room/join/share/by_code",
+                      {"connect_id": connect_id, "connect_code": "guestpass"},
+                      guest_id=guest["guest_id"])
+        self.assertEqual(join["code"], 0)
+        self.assertEqual(join["data"]["publisher_device_id"], hd)
+
+    async def test_assistance_password_locks_after_repeated_failures(self):
+        hd, cd, ht, ct = await self.users()
+        host = await self.room("host", hd, ht)
+        await self.request("POST", "/api/v1/device/controllable", "host", hd, ht,
+                           {"controllable": True})
+        _, aid = await self.request("POST", "/api/v1/device/share/info/refresh",
+                                    "host", hd, ht)
+        code = aid["data"]["connect_id"]
+        for _ in range(6):
+            denied = await self.assist_call(host, "host", hd, ht, "secret",
+                     "controller", cd, ct, "/api/v2/room/join/share/by_code",
+                     {"connect_id": code, "connect_code": "wrong"})
+            self.assertEqual(denied["code"], 1131)
+        _, locked = await self.request("POST", "/api/v2/room/join/share/by_code",
+                                "controller", cd, ct,
+                                {"connect_id": code, "connect_code": "secret"})
+        self.assertEqual(locked["code"], 429)
+
+    async def test_wallpaper_grant_upload_verified_and_bound(self):
+        from urllib.parse import urlparse
+        hd, cd, ht, ct = await self.users()
+        _, granted = await self.request("GET", "/api/v1/tool/fp/token?filetype=1",
+                                        "host", hd, ht)
+        self.assertEqual(granted["code"], 0)
+        upload = granted["data"]
+        image = b"\xff\xd8\xff" + b"sample-fixture" + b"\xff\xd9"
+        async with self.client.post(urlparse(upload["req_url"]).path,
+                      headers={"Authorization": upload["token"]},
+                      data=image) as r:
+            self.assertEqual(r.status, 200)
+            result = await r.json()
+        self.assertEqual(result["fsize"], len(image))
+        self.assertEqual(result["mime"], "image/jpeg")
+        async with self.client.get(urlparse(result["url"]).path) as r:
+            self.assertEqual(r.status, 200)
+            self.assertEqual(await r.read(), image)
+        _, wrong = await self.request("POST", "/api/v1/device/wallpaper",
+                             "controller", cd, ct, {"wallpaper_url": result["url"]})
+        self.assertEqual(wrong["code"], 403)
+        _, ok = await self.request("POST", "/api/v1/device/wallpaper",
+                             "host", hd, ht, {"wallpaper_url": result["url"]})
+        self.assertEqual(ok["code"], 0)
+        _, listing = await self.request("GET", "/api/v1/device/list",
+                                          "controller", cd, ct)
+        listed_host = next(x for x in listing["data"]["my_binded_devices"]
+                           if x["device_id"] == hd)
+        self.assertEqual(listed_host["wallpaper_url"], result["url"])
+        async with self.client.post(urlparse(upload["req_url"]).path,
+                      headers={"Authorization": upload["token"]},
+                      data=image) as r:
+            self.assertEqual(r.status, 401)
+
+    async def test_turn_rest_credentials_have_session_scoped_expiry(self):
+        import base64
+        import hashlib
+        import hmac
+        import time
+        from selfhost.ice import ice_servers
+        servers = ice_servers(["stun:stun.test:3478", "turn:turn.test:3478"],
+                               shared_secret="private-secret")
+        self.assertNotIn("username", servers[0])
+        turn = servers[1]
+        expiry = int(turn["username"].split(":")[0])
+        self.assertTrue(int(time.time()) < expiry <= int(time.time()) + 3601)
+        expected = base64.b64encode(hmac.new(b"private-secret",
+            turn["username"].encode("utf-8"), hashlib.sha1).digest()).decode("ascii")
+        self.assertEqual(turn["credential"], expected)
+
+
+    async def test_host_confirmation_requires_explicit_callback(self):
+        hd, cd, ht, ct = await self.users()
+        host = await self.room("host", hd, ht)
+        await self.request("POST", "/api/v1/device/controllable", "host", hd, ht,
+                           {"controllable": True})
+        _, identity = await self.request("POST", "/api/v1/device/share/info/refresh",
+                                        "host", hd, ht)
+        aid = identity["data"]["connect_id"]
+        waiting = await self.assist_call(host, "host", hd, ht, "hostpass",
+                         "controller", cd, ct, "/api/v2/room/join/share/by_code",
+                         {"connect_id": aid, "connect_code": "hostpass"},
+                         mode="password_confirmation")
+        self.assertEqual(waiting["code"], 1136)
+        control_id = waiting["data"]["control_id"]
+        import asyncio
+        answer = asyncio.create_task(self.respond_assistance(
+            host, "host", hd, ht, "hostpass", mode="password_confirmation",
+            approve=True))
+        _, granted = await self.request("POST", "/api/v2/room/join/share/by_confirmation",
+                              "controller", cd, ct,
+                              {"connect_id": aid, "control_id": control_id})
+        await answer
+        self.assertEqual(granted["code"], 0)
+        self.assertEqual(granted["data"]["publisher_device_id"], hd)
+        # The confirmation token is a one-shot, not reusable for another room.
+        _, replay = await self.request("POST", "/api/v2/room/join/share/by_confirmation",
+                               "controller", cd, ct,
+                               {"connect_id": aid, "control_id": control_id})
+        self.assertEqual(replay["code"], 403)
+
+    async def test_no_code_confirmation_asks_host_twice_and_waits_for_consent(self):
+        hd, cd, ht, ct = await self.users()
+        host = await self.room("host", hd, ht)
+        _, identity = await self.request("POST", "/api/v1/device/share/info/refresh",
+                                        "host", hd, ht)
+        aid = identity["data"]["connect_id"]
+        import asyncio
+        async def respond_both():
+            self.assertEqual(await self.respond_assistance(
+                host, "host", hd, ht, "", mode="by_confirmation"), "get_control_mode")
+            self.assertEqual(await self.respond_assistance(
+                host, "host", hd, ht, "", mode="by_confirmation"), "remote_control_by_confirmation")
+        task = asyncio.create_task(respond_both())
+        _, confirmed = await self.request("POST", "/api/v2/room/join/share/by_confirmation",
+                                  "controller", cd, ct,
+                                  {"connect_id": aid, "control_id": ""})
+        await task
+        self.assertEqual(confirmed["code"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
