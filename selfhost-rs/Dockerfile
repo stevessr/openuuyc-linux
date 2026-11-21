@@ -10,5 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /build/target/release/openuuyc-selfhost /usr/local/bin/openuuyc-selfhost
 RUN useradd -r -u 10001 openuuyc && mkdir -p /data && chown openuuyc /data
 USER openuuyc
+ENV OPENUUYC_DATA_DIR=/data
+ENV OPENUUYC_BIND=0.0.0.0:8844
 EXPOSE 8844
 ENTRYPOINT ["/usr/local/bin/openuuyc-selfhost"]

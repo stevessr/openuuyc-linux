@@ -161,12 +161,17 @@ impl Store {
             .await
             .map_err(internal)?;
         if claimed.is_none() {
-            // Concurrent init with the same client_id won; return its identity.
+            // Same client_id: either a concurrent init won the race, or the
+            // index is stale (pointing at a device that was unbound). A live
+            // winner returns its identity; a stale index is reclaimed.
             let _: Result<(), _> = conn.srem("ouu:devices", &device.device_id).await;
             if let Some(winner) = self.device_by_client(client_id).await? {
                 return Ok(winner);
             }
-            return Err(ApiError::unavailable("device registration raced"));
+            // Stale index: overwrite it with the new registration.
+            self.put_device(&device).await?;
+            let _: Result<(), _> = conn.sadd("ouu:devices", &device.device_id).await;
+            return Ok(device);
         }
         redis::pipe()
             .atomic()

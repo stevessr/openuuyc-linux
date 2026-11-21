@@ -1,0 +1,14 @@
+{$OPENUUYC_PUBLIC_HOST} {
+    # Automatic HTTPS via Let's Encrypt (needs ports 80/443 reachable).
+    reverse_proxy node-a:8844 node-b:8844 {
+        # Socket.IO upgrades ride the same route; Caddy handles WebSocket
+        # pass-through automatically.
+        health_uri /healthz
+        health_interval 10s
+        lb_policy round_robin
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options nosniff
+    }
+}
